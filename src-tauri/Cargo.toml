@@ -1,0 +1,21 @@
+[package]
+name = "code-cartographer"
+version.workspace = true
+edition.workspace = true
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+cc-core = { workspace = true }
+cc-tauri = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+[lib]
+name = "code_cartographer_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]

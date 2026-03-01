@@ -1,0 +1,130 @@
+use std::path::PathBuf;
+
+use cc_core::model::{CodeGraph, CodeNode, EdgeKind, Language, NodeId, SubGraph};
+use cc_core::parser::{Extractor, ParseEvent};
+use cc_core::resolver::SymbolTable;
+use tauri::command;
+use tauri::ipc::Channel;
+
+#[command]
+pub async fn parse_repo(
+    path: String,
+    graph_json: String,
+    on_event: Channel<ParseEvent>,
+) -> Result<CodeGraph, String> {
+    let root = PathBuf::from(&path);
+    let mut graph: CodeGraph =
+        serde_json::from_str(&graph_json).map_err(|e| e.to_string())?;
+
+    let mut all_refs = Vec::new();
+    let mut total_blocks = 0usize;
+    let mut total_files = 0usize;
+
+    // Collect file nodes with languages
+    let file_nodes: Vec<(NodeId, String, Language)> = graph
+        .nodes
+        .iter()
+        .filter_map(|(id, node)| {
+            if let CodeNode::File {
+                path, language: Some(lang), ..
+            } = node
+            {
+                Some((id.clone(), path.clone(), lang.clone()))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    for (file_id, rel_path, language) in &file_nodes {
+        let abs_path = root.join(rel_path);
+
+        let _ = on_event.send(ParseEvent::FileStart {
+            path: rel_path.clone(),
+        });
+
+        let source = match std::fs::read_to_string(&abs_path) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = on_event.send(ParseEvent::Error {
+                    path: rel_path.clone(),
+                    message: e.to_string(),
+                });
+                continue;
+            }
+        };
+
+        match Extractor::extract_file(rel_path, &source, language) {
+            Ok((nodes, refs)) => {
+                let block_count = nodes.len();
+                total_blocks += block_count;
+
+                // Add code block nodes to graph and update file's children
+                for node in nodes {
+                    let block_id = node.id().clone();
+                    graph.add_node(node);
+
+                    if let Some(file_node) = graph.nodes.get_mut(file_id) {
+                        file_node.children_mut().push(block_id);
+                    }
+                }
+
+                all_refs.extend(refs);
+
+                let _ = on_event.send(ParseEvent::FileDone {
+                    path: rel_path.clone(),
+                    blocks: block_count,
+                });
+            }
+            Err(e) => {
+                let _ = on_event.send(ParseEvent::Error {
+                    path: rel_path.clone(),
+                    message: e.to_string(),
+                });
+            }
+        }
+
+        total_files += 1;
+    }
+
+    // Resolve references into edges
+    let symbol_table = SymbolTable::build_from_graph(&graph);
+    let edges = symbol_table.resolve_references(&all_refs);
+    for edge in edges {
+        graph.add_edge(edge);
+    }
+
+    let _ = on_event.send(ParseEvent::Complete {
+        total_files,
+        total_blocks,
+    });
+
+    Ok(graph)
+}
+
+#[command]
+pub async fn get_subgraph(
+    graph_json: String,
+    visible_ids: Vec<String>,
+    edge_kinds: Vec<String>,
+) -> Result<SubGraph, String> {
+    let graph: CodeGraph =
+        serde_json::from_str(&graph_json).map_err(|e| e.to_string())?;
+
+    let visible: Vec<NodeId> = visible_ids.into_iter().map(NodeId).collect();
+    let kinds: Vec<EdgeKind> = edge_kinds
+        .iter()
+        .filter_map(|k| match k.as_str() {
+            "Import" => Some(EdgeKind::Import),
+            "FunctionCall" => Some(EdgeKind::FunctionCall),
+            "MethodCall" => Some(EdgeKind::MethodCall),
+            "TypeReference" => Some(EdgeKind::TypeReference),
+            "Inheritance" => Some(EdgeKind::Inheritance),
+            "TraitImpl" => Some(EdgeKind::TraitImpl),
+            "VariableUsage" => Some(EdgeKind::VariableUsage),
+            _ => None,
+        })
+        .collect();
+
+    Ok(SubGraph::from_graph(&graph, &visible, &kinds))
+}

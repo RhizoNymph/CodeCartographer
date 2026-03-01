@@ -1,0 +1,12 @@
+{
+  "name": "code-cartographer",
+  "private": true,
+  "scripts": {
+    "dev": "pnpm --filter app dev",
+    "build": "pnpm --filter app build",
+    "tauri": "cargo tauri"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": ["esbuild"]
+  }
+}
