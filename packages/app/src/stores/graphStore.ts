@@ -1,5 +1,6 @@
 import { create } from "zustand";
 import type { CodeGraph, CodeNode, EdgeKind, ParseEvent } from "../api/types";
+import { saveFolderState, loadFolderState } from "./persistenceStore";
 
 interface ParseProgress {
   totalFiles: number;
@@ -29,9 +30,13 @@ interface GraphState {
   // Edge filter state
   enabledEdgeKinds: Set<EdgeKind>;
 
+  // Layout state - manual relayout
+  needsRelayout: boolean;
+  layoutVersion: number; // Incremented when relayout should happen
+
   // Actions
   setRepoPath: (path: string) => void;
-  setGraph: (graph: CodeGraph) => void;
+  setGraph: (graph: CodeGraph, restoreState?: boolean) => void;
   setIsParsing: (v: boolean) => void;
   handleParseEvent: (event: ParseEvent) => void;
   toggleExpanded: (nodeId: string) => void;
@@ -41,6 +46,8 @@ interface GraphState {
   setHoveredNode: (nodeId: string | null) => void;
   toggleEdgeKind: (kind: EdgeKind) => void;
   getVisibleNodeIds: () => string[];
+  requestRelayout: () => void;
+  saveCurrentState: () => void;
 }
 
 const ALL_EDGE_KINDS: EdgeKind[] = [
@@ -63,40 +70,66 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   selectedNodeId: null,
   hoveredNodeId: null,
   enabledEdgeKinds: new Set<EdgeKind>(ALL_EDGE_KINDS),
+  needsRelayout: false,
+  layoutVersion: 0,
 
   setRepoPath: (path) => set({ repoPath: path }),
 
-  setGraph: (graph) => {
-    // Auto-expand root + first-level directories, make all visible
-    const expanded = new Set<string>();
-    const visible = new Set<string>();
+  setGraph: (graph, restoreState = true) => {
+    const repoPath = get().repoPath;
+    let expanded = new Set<string>();
+    let visible = new Set<string>();
 
     if (graph) {
-      const root = graph.nodes[graph.root];
-      if (root) {
-        expanded.add(graph.root);
-        visible.add(graph.root);
+      // Try to restore saved state for this folder
+      let restored = false;
+      if (restoreState && repoPath) {
+        const saved = loadFolderState(repoPath);
+        if (saved) {
+          // Filter to only include nodes that still exist in the graph
+          const validExpanded = saved.expandedNodes.filter(id => graph.nodes[id]);
+          const validVisible = saved.visibleNodes.filter(id => graph.nodes[id]);
 
-        // Expand first-level children
-        for (const childId of root.children) {
-          expanded.add(childId);
-          visible.add(childId);
-          const child = graph.nodes[childId];
-          if (child) {
-            for (const grandChildId of child.children) {
-              visible.add(grandChildId);
-            }
+          if (validExpanded.length > 0 || validVisible.length > 0) {
+            expanded = new Set(validExpanded);
+            visible = new Set(validVisible);
+            restored = true;
+            console.log("Restored folder state:", {
+              expanded: expanded.size,
+              visible: visible.size,
+            });
           }
         }
+      }
 
-        // Make all nodes visible initially
-        for (const nodeId of Object.keys(graph.nodes)) {
+      // If no saved state, use defaults
+      if (!restored) {
+        for (const [nodeId, node] of Object.entries(graph.nodes)) {
           visible.add(nodeId);
+          // Expand directories and files (so code blocks are visible)
+          if ((node.type === "Directory" || node.type === "File") && node.children.length > 0) {
+            expanded.add(nodeId);
+          }
         }
       }
+
+      console.log("setGraph:", {
+        nodes: Object.keys(graph.nodes).length,
+        edges: graph.edges.length,
+        expanded: expanded.size,
+        visible: visible.size,
+        restored,
+      });
     }
 
-    set({ graph, expandedNodes: expanded, visibleNodes: visible });
+    // Increment layoutVersion to trigger relayout
+    set({
+      graph,
+      expandedNodes: expanded,
+      visibleNodes: visible,
+      needsRelayout: false,
+      layoutVersion: get().layoutVersion + 1,
+    });
   },
 
   setIsParsing: (v) =>
@@ -163,7 +196,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     } else {
       expanded.add(nodeId);
     }
-    set({ expandedNodes: expanded });
+    set({ expandedNodes: expanded, needsRelayout: true });
   },
 
   setExpanded: (nodeId, isExpanded) => {
@@ -173,7 +206,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     } else {
       expanded.delete(nodeId);
     }
-    set({ expandedNodes: expanded });
+    set({ expandedNodes: expanded, needsRelayout: true });
   },
 
   toggleVisible: (nodeId) => {
@@ -197,7 +230,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
 
     const shouldShow = !visible.has(nodeId);
     toggleRecursive(nodeId, shouldShow);
-    set({ visibleNodes: visible });
+    set({ visibleNodes: visible, needsRelayout: true });
   },
 
   setSelectedNode: (nodeId) => set({ selectedNodeId: nodeId }),
@@ -210,10 +243,37 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     } else {
       kinds.add(kind);
     }
-    set({ enabledEdgeKinds: kinds });
+    // Trigger relayout since edge filtering affects layout
+    set({
+      enabledEdgeKinds: kinds,
+      layoutVersion: get().layoutVersion + 1,
+    });
   },
 
   getVisibleNodeIds: () => {
     return Array.from(get().visibleNodes);
+  },
+
+  requestRelayout: () => {
+    const state = get();
+    if (!state.needsRelayout) return;
+
+    // Save current state before relayout
+    if (state.repoPath) {
+      saveFolderState(state.repoPath, state.expandedNodes, state.visibleNodes);
+    }
+
+    // Increment layoutVersion to trigger relayout in Canvas
+    set({
+      needsRelayout: false,
+      layoutVersion: state.layoutVersion + 1,
+    });
+  },
+
+  saveCurrentState: () => {
+    const state = get();
+    if (state.repoPath) {
+      saveFolderState(state.repoPath, state.expandedNodes, state.visibleNodes);
+    }
   },
 }));

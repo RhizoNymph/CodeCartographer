@@ -319,16 +319,19 @@ impl Extractor {
         from_id: &NodeId,
         refs: &mut Vec<RawReference>,
     ) {
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            let kind = child.kind();
+        // Use a stack-based traversal to avoid issues with cursor invalidation
+        let mut stack = vec![node.clone()];
+
+        while let Some(current) = stack.pop() {
+            let kind = current.kind();
+
             match language {
                 Language::Python => {
                     match kind {
                         "import_statement" | "import_from_statement" => {
-                            if let Some(module) =
-                                child.child_by_field_name("module_name")
-                                    .or_else(|| child.child_by_field_name("name"))
+                            if let Some(module) = current
+                                .child_by_field_name("module_name")
+                                .or_else(|| current.child_by_field_name("name"))
                             {
                                 if let Ok(text) = module.utf8_text(source.as_bytes()) {
                                     refs.push(RawReference {
@@ -337,29 +340,20 @@ impl Extractor {
                                             module_path: text.to_string(),
                                         },
                                         name: text.to_string(),
-                                        span: Span {
-                                            start_line: child.start_position().row + 1,
-                                            start_col: child.start_position().column,
-                                            end_line: child.end_position().row + 1,
-                                            end_col: child.end_position().column,
-                                        },
+                                        span: Self::node_span(&current),
                                     });
                                 }
                             }
                         }
                         "call" => {
-                            if let Some(func) = child.child_by_field_name("function") {
-                                if let Ok(text) = func.utf8_text(source.as_bytes()) {
+                            if let Some(func) = current.child_by_field_name("function") {
+                                let name = Self::extract_function_name(&func, source);
+                                if !name.is_empty() {
                                     refs.push(RawReference {
                                         from_node: from_id.clone(),
                                         kind: RawRefKind::FunctionCall,
-                                        name: text.to_string(),
-                                        span: Span {
-                                            start_line: child.start_position().row + 1,
-                                            start_col: child.start_position().column,
-                                            end_line: child.end_position().row + 1,
-                                            end_col: child.end_position().column,
-                                        },
+                                        name,
+                                        span: Self::node_span(&current),
                                     });
                                 }
                             }
@@ -370,7 +364,7 @@ impl Extractor {
                 Language::TypeScript | Language::JavaScript => {
                     match kind {
                         "import_statement" => {
-                            if let Some(src) = child.child_by_field_name("source") {
+                            if let Some(src) = current.child_by_field_name("source") {
                                 if let Ok(text) = src.utf8_text(source.as_bytes()) {
                                     let clean = text.trim_matches(|c| c == '\'' || c == '"');
                                     refs.push(RawReference {
@@ -379,29 +373,20 @@ impl Extractor {
                                             module_path: clean.to_string(),
                                         },
                                         name: clean.to_string(),
-                                        span: Span {
-                                            start_line: child.start_position().row + 1,
-                                            start_col: child.start_position().column,
-                                            end_line: child.end_position().row + 1,
-                                            end_col: child.end_position().column,
-                                        },
+                                        span: Self::node_span(&current),
                                     });
                                 }
                             }
                         }
                         "call_expression" => {
-                            if let Some(func) = child.child_by_field_name("function") {
-                                if let Ok(text) = func.utf8_text(source.as_bytes()) {
+                            if let Some(func) = current.child_by_field_name("function") {
+                                let name = Self::extract_function_name(&func, source);
+                                if !name.is_empty() {
                                     refs.push(RawReference {
                                         from_node: from_id.clone(),
                                         kind: RawRefKind::FunctionCall,
-                                        name: text.to_string(),
-                                        span: Span {
-                                            start_line: child.start_position().row + 1,
-                                            start_col: child.start_position().column,
-                                            end_line: child.end_position().row + 1,
-                                            end_col: child.end_position().column,
-                                        },
+                                        name,
+                                        span: Self::node_span(&current),
                                     });
                                 }
                             }
@@ -412,35 +397,26 @@ impl Extractor {
                 Language::Rust => {
                     match kind {
                         "use_declaration" => {
-                            if let Ok(text) = child.utf8_text(source.as_bytes()) {
+                            if let Some(name) = Self::extract_use_name(&current, source) {
                                 refs.push(RawReference {
                                     from_node: from_id.clone(),
                                     kind: RawRefKind::Import {
-                                        module_path: text.to_string(),
+                                        module_path: name.clone(),
                                     },
-                                    name: text.to_string(),
-                                    span: Span {
-                                        start_line: child.start_position().row + 1,
-                                        start_col: child.start_position().column,
-                                        end_line: child.end_position().row + 1,
-                                        end_col: child.end_position().column,
-                                    },
+                                    name,
+                                    span: Self::node_span(&current),
                                 });
                             }
                         }
                         "call_expression" => {
-                            if let Some(func) = child.child_by_field_name("function") {
-                                if let Ok(text) = func.utf8_text(source.as_bytes()) {
+                            if let Some(func) = current.child_by_field_name("function") {
+                                let name = Self::extract_function_name(&func, source);
+                                if !name.is_empty() && name != "Self" && name != "self" {
                                     refs.push(RawReference {
                                         from_node: from_id.clone(),
                                         kind: RawRefKind::FunctionCall,
-                                        name: text.to_string(),
-                                        span: Span {
-                                            start_line: child.start_position().row + 1,
-                                            start_col: child.start_position().column,
-                                            end_line: child.end_position().row + 1,
-                                            end_col: child.end_position().column,
-                                        },
+                                        name,
+                                        span: Self::node_span(&current),
                                     });
                                 }
                             }
@@ -449,6 +425,63 @@ impl Extractor {
                     }
                 }
             }
+
+            // Push children onto stack
+            let child_count = current.child_count();
+            for i in 0..child_count {
+                if let Some(child) = current.child(i) {
+                    stack.push(child);
+                }
+            }
         }
+    }
+
+    fn node_span(node: &tree_sitter::Node) -> Span {
+        Span {
+            start_line: node.start_position().row + 1,
+            start_col: node.start_position().column,
+            end_line: node.end_position().row + 1,
+            end_col: node.end_position().column,
+        }
+    }
+
+    /// Extract the actual function name from a call expression.
+    /// Handles: foo(), self.foo(), Self::foo(), module::foo(), obj.method()
+    fn extract_function_name(node: &tree_sitter::Node, source: &str) -> String {
+        let text = match node.utf8_text(source.as_bytes()) {
+            Ok(t) => t,
+            Err(_) => return String::new(),
+        };
+
+        // Handle method calls: take last segment after . or ::
+        if let Some(pos) = text.rfind("::") {
+            return text[pos + 2..].to_string();
+        }
+        if let Some(pos) = text.rfind('.') {
+            return text[pos + 1..].to_string();
+        }
+
+        text.to_string()
+    }
+
+    /// Extract imported name from a use declaration
+    fn extract_use_name(node: &tree_sitter::Node, source: &str) -> Option<String> {
+        // Find the last identifier in the use path
+        fn find_last_ident(n: &tree_sitter::Node, src: &str) -> Option<String> {
+            if n.kind() == "identifier" {
+                return n.utf8_text(src.as_bytes()).ok().map(|s| s.to_string());
+            }
+            let mut last = None;
+            let child_count = n.child_count();
+            for i in 0..child_count {
+                if let Some(child) = n.child(i) {
+                    if let Some(name) = find_last_ident(&child, src) {
+                        last = Some(name);
+                    }
+                }
+            }
+            last
+        }
+        find_last_ident(node, source)
     }
 }

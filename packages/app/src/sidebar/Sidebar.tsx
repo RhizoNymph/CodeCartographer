@@ -200,6 +200,8 @@ export function Sidebar() {
   const graph = useGraphStore((s) => s.graph);
   const parseProgress = useGraphStore((s) => s.parseProgress);
   const isParsing = useGraphStore((s) => s.isParsing);
+  const needsRelayout = useGraphStore((s) => s.needsRelayout);
+  const requestRelayout = useGraphStore((s) => s.requestRelayout);
   const [searchQuery, setSearchQuery] = useState("");
 
   if (!graph) return null;
@@ -221,7 +223,7 @@ export function Sidebar() {
         overflow: "hidden",
       }}
     >
-      {/* Search */}
+      {/* Search and Relayout */}
       <div style={{ padding: "8px 12px", borderBottom: "1px solid #334155" }}>
         <input
           type="text"
@@ -245,6 +247,30 @@ export function Sidebar() {
             (e.currentTarget.style.borderColor = "#334155")
           }
         />
+        {needsRelayout && (
+          <button
+            onClick={requestRelayout}
+            style={{
+              marginTop: 8,
+              width: "100%",
+              padding: "6px 10px",
+              background: "#3b82f6",
+              border: "none",
+              borderRadius: 6,
+              color: "white",
+              fontSize: 12,
+              fontWeight: 500,
+              cursor: "pointer",
+              display: "flex",
+              alignItems: "center",
+              justifyContent: "center",
+              gap: 6,
+            }}
+          >
+            <span style={{ fontSize: 14 }}>&#8635;</span>
+            Apply Layout Changes
+          </button>
+        )}
       </div>
 
       {/* Header */}

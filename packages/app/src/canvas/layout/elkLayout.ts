@@ -1,8 +1,113 @@
 import ELK, { type ElkNode, type ElkExtendedEdge } from "elkjs/lib/elk.bundled.js";
-import type { CodeGraph, CodeNode } from "../../api/types";
+import type { CodeGraph, CodeNode, EdgeKind } from "../../api/types";
 import { EDGE_COLORS } from "../../api/types";
+import { useDebugStore } from "../../stores/debugStore";
+import {
+  anchorEdgePolyline,
+  dedupePolylinePoints,
+  inferEdgeAnchor,
+  type EdgeAnchor,
+  type Point,
+} from "./edgeGeometry";
 
 const elk = new ELK();
+
+/**
+ * Build a map from each node to its parent.
+ */
+function buildParentMap(graph: CodeGraph): Map<string, string> {
+  const parentMap = new Map<string, string>();
+  for (const [nodeId, node] of Object.entries(graph.nodes)) {
+    for (const childId of node.children) {
+      parentMap.set(childId, nodeId);
+    }
+  }
+  return parentMap;
+}
+
+/**
+ * Find the visible ancestor of a node. If the node is in elkNodeIds, return itself.
+ * Otherwise, walk up the parent chain until we find a node in elkNodeIds.
+ * Returns null if no visible ancestor found (shouldn't happen for valid graphs).
+ */
+function findVisibleAncestor(
+  nodeId: string,
+  elkNodeIds: Set<string>,
+  parentMap: Map<string, string>
+): string | null {
+  let current = nodeId;
+  while (current) {
+    if (elkNodeIds.has(current)) {
+      return current;
+    }
+    const parent = parentMap.get(current);
+    if (!parent) {
+      return null;
+    }
+    current = parent;
+  }
+  return null;
+}
+
+/**
+ * Compute aggregated edges for collapsed containers.
+ * When a container is collapsed, edges to/from its children should be
+ * shown as a single edge to/from the container itself.
+ */
+function computeAggregatedEdges(
+  graph: CodeGraph,
+  elkNodeIds: Set<string>,
+  parentMap: Map<string, string>,
+  enabledEdgeKinds?: Set<EdgeKind>
+): Array<{ source: string; target: string; color: string; kind: EdgeKind | null }> {
+  // Use a Map to deduplicate edges by source-target pair
+  // Key: "source->target", Value: { color, kind } (we pick one, could aggregate later)
+  const aggregatedMap = new Map<string, { color: string; kind: EdgeKind }>();
+
+  // Filter edges by enabled kinds
+  const filteredEdges = enabledEdgeKinds
+    ? graph.edges.filter((e) => enabledEdgeKinds.has(e.kind))
+    : graph.edges;
+
+  for (const edge of filteredEdges) {
+    const sourceInTree = elkNodeIds.has(edge.source);
+    const targetInTree = elkNodeIds.has(edge.target);
+
+    // Skip edges that are already fully in the tree - they're handled normally
+    if (sourceInTree && targetInTree) {
+      continue;
+    }
+
+    // Find visible ancestors for both endpoints
+    const visibleSource = findVisibleAncestor(edge.source, elkNodeIds, parentMap);
+    const visibleTarget = findVisibleAncestor(edge.target, elkNodeIds, parentMap);
+
+    // Skip if we can't find visible ancestors (both hidden or disconnected)
+    if (!visibleSource || !visibleTarget) {
+      continue;
+    }
+
+    // Skip self-loops (both endpoints resolve to same collapsed container)
+    if (visibleSource === visibleTarget) {
+      continue;
+    }
+
+    // Create aggregated edge key and store
+    const key = `${visibleSource}->${visibleTarget}`;
+    if (!aggregatedMap.has(key)) {
+      aggregatedMap.set(key, { color: EDGE_COLORS[edge.kind] || "#64748b", kind: edge.kind });
+    }
+  }
+
+  // Convert to array
+  const result: Array<{ source: string; target: string; color: string; kind: EdgeKind | null }> = [];
+  for (const [key, { color, kind }] of aggregatedMap) {
+    const [source, target] = key.split("->");
+    result.push({ source, target, color, kind });
+  }
+
+  return result;
+}
 
 export interface LayoutNodePosition {
   x: number;
@@ -15,7 +120,10 @@ export interface LayoutEdge {
   source: string;
   target: string;
   color: string;
-  points: Array<{ x: number; y: number }>;
+  kind: EdgeKind | null; // null for aggregated edges
+  points: Point[];
+  sourceAnchor: EdgeAnchor;
+  targetAnchor: EdgeAnchor;
 }
 
 export interface LayoutResult {
@@ -89,7 +197,8 @@ function buildElkNode(
 export async function layoutGraph(
   graph: CodeGraph,
   expandedNodes: Set<string>,
-  visibleNodes: Set<string>
+  visibleNodes: Set<string>,
+  enabledEdgeKinds?: Set<EdgeKind>
 ): Promise<LayoutResult> {
   const rootNode = graph.nodes[graph.root];
   if (!rootNode) {
@@ -115,16 +224,64 @@ export async function layoutGraph(
     }
   }
 
-  // Build edges
-  const elkEdges: ElkExtendedEdge[] = graph.edges
-    .filter(
-      (e) => visibleNodes.has(e.source) && visibleNodes.has(e.target)
-    )
-    .map((e, i) => ({
-      id: `edge-${i}`,
-      sources: [e.source],
-      targets: [e.target],
-    }));
+  // Collect all node IDs that are actually in the ELK tree
+  const elkNodeIds = new Set<string>();
+  function collectElkNodeIds(nodes: ElkNode[]) {
+    for (const n of nodes) {
+      elkNodeIds.add(n.id);
+      if (n.children) collectElkNodeIds(n.children);
+    }
+  }
+  collectElkNodeIds(children);
+
+  // Build parent map for finding visible ancestors
+  const parentMap = buildParentMap(graph);
+
+  // Filter edges by enabled edge kinds first
+  const kindFilteredEdges = enabledEdgeKinds
+    ? graph.edges.filter((e) => enabledEdgeKinds.has(e.kind))
+    : graph.edges;
+
+  // Build edges - only include edges where both endpoints are in the ELK tree
+  const edgesInTree = kindFilteredEdges.filter(
+    (e) => elkNodeIds.has(e.source) && elkNodeIds.has(e.target)
+  );
+  const edgesNotInTree = kindFilteredEdges.filter(
+    (e) => !elkNodeIds.has(e.source) || !elkNodeIds.has(e.target)
+  );
+
+  // Compute aggregated edges for collapsed containers
+  const aggregatedEdges = computeAggregatedEdges(graph, elkNodeIds, parentMap, enabledEdgeKinds);
+
+  console.log("Edge filtering:", {
+    totalGraphEdges: graph.edges.length,
+    elkNodeIdsCount: elkNodeIds.size,
+    edgesWithBothEndpointsInTree: edgesInTree.length,
+    edgesMissingEndpoints: edgesNotInTree.length,
+    aggregatedEdges: aggregatedEdges.length,
+    sampleGraphEdge: graph.edges[0],
+    sampleElkNodeIds: Array.from(elkNodeIds).slice(0, 5),
+    sampleMissingEdge: edgesNotInTree[0],
+    sampleEdgeSourceInTree: edgesNotInTree[0] ? elkNodeIds.has(edgesNotInTree[0].source) : "N/A",
+    sampleEdgeTargetInTree: edgesNotInTree[0] ? elkNodeIds.has(edgesNotInTree[0].target) : "N/A",
+  });
+
+  // Create ELK edges from direct edges
+  const elkEdges: ElkExtendedEdge[] = edgesInTree.map((e, i) => ({
+    id: `edge-${i}`,
+    sources: [e.source],
+    targets: [e.target],
+  }));
+
+  // Add aggregated edges for collapsed containers
+  for (let i = 0; i < aggregatedEdges.length; i++) {
+    const ae = aggregatedEdges[i];
+    elkEdges.push({
+      id: `agg-edge-${i}`,
+      sources: [ae.source],
+      targets: [ae.target],
+    });
+  }
 
   const elkGraph: ElkNode = {
     id: "root",
@@ -132,27 +289,101 @@ export async function layoutGraph(
     edges: elkEdges,
     layoutOptions: {
       "elk.algorithm": "layered",
-      "elk.direction": "DOWN",
-      "elk.spacing.nodeNode": "30",
-      "elk.spacing.edgeNode": "20",
-      "elk.layered.spacing.nodeNodeBetweenLayers": "40",
+      "elk.direction": "RIGHT",
+      "elk.spacing.nodeNode": "20",
+      "elk.spacing.edgeNode": "15",
+      "elk.layered.spacing.nodeNodeBetweenLayers": "30",
       "elk.edgeRouting": "ORTHOGONAL",
       "elk.hierarchyHandling": "INCLUDE_CHILDREN",
-      "elk.padding": "[top=40,left=20,bottom=20,right=20]",
+      "elk.padding": "[top=30,left=15,bottom=15,right=15]",
     },
   };
 
+  // Count nested children
+  function countChildren(nodes: ElkNode[]): number {
+    let count = nodes.length;
+    for (const n of nodes) {
+      if (n.children) count += countChildren(n.children);
+    }
+    return count;
+  }
+
+  // Count code blocks in the graph
+  const codeBlocksInGraph = Object.values(graph.nodes).filter(n => n.type === "CodeBlock").length;
+  const filesWithChildren = Object.values(graph.nodes).filter(n => n.type === "File" && n.children.length > 0).length;
+  const expandedFiles = Array.from(expandedNodes).filter(id => graph.nodes[id]?.type === "File").length;
+
+  useDebugStore.getState().addLog(`ELK: codeBlocks=${codeBlocksInGraph}, edges=${graph.edges.length}, aggregated=${aggregatedEdges.length}, elkNodes=${elkNodeIds.size}`);
+
+  console.log("ELK input:", {
+    topLevelChildren: children.length,
+    totalNestedNodes: countChildren(children),
+    elkEdges: elkEdges.length,
+    graphEdges: graph.edges.length,
+    expanded: expandedNodes.size,
+    visible: visibleNodes.size,
+    codeBlocksInGraph,
+    filesWithChildren,
+    expandedFiles,
+  });
+
+  // Build aggregated edge info map for extractLayout
+  const aggregatedEdgeInfo = new Map<string, { color: string; kind: EdgeKind | null }>();
+  for (const ae of aggregatedEdges) {
+    aggregatedEdgeInfo.set(`${ae.source}->${ae.target}`, { color: ae.color, kind: ae.kind });
+  }
+
   try {
+    useDebugStore.getState().addLog(`ELK layout starting...`);
     const laidOut = await elk.layout(elkGraph);
-    return extractLayout(laidOut, graph);
+    useDebugStore.getState().addLog(`ELK layout done, extracting...`);
+    console.log("ELK raw output:", {
+      rootEdgesCount: laidOut.edges?.length ?? 0,
+      rootEdgeSample: laidOut.edges?.[0],
+      hasChildren: !!laidOut.children,
+      childCount: laidOut.children?.length ?? 0,
+    });
+    const result = extractLayout(laidOut, graph, aggregatedEdgeInfo);
+    useDebugStore.getState().addLog(`ELK extracted ${result.edges.length} edges`);
+    console.log("ELK output:", {
+      nodes: Object.keys(result.nodes).length,
+      edges: result.edges.length,
+    });
+
+    // Update debug store
+    useDebugStore.getState().setLayoutInfo({
+      elkNodeIds: elkNodeIds.size,
+      edgesInTree: edgesInTree.length,
+      edgesNotInTree: edgesNotInTree.length,
+      aggregatedEdges: aggregatedEdges.length,
+      elkEdgesInput: elkEdges.length,
+      elkEdgesOutput: result.edges.length,
+      edgesWithSections: result.edges.length, // approximate
+      edgesWithoutSections: elkEdges.length - result.edges.length,
+      sampleGraphEdge: JSON.stringify(graph.edges[0]),
+      sampleElkNodeId: Array.from(elkNodeIds)[0] ?? "none",
+      codeBlocksInGraph,
+      filesWithChildren,
+      expandedFiles,
+    });
+
+    return result;
   } catch (err) {
     console.error("ELK layout failed:", err);
+    useDebugStore.getState().addLog(`ELK FAILED: ${err}`);
     return fallbackLayout(graph, visibleNodes);
   }
 }
 
-function extractLayout(elkNode: ElkNode, graph: CodeGraph): LayoutResult {
+function extractLayout(
+  elkNode: ElkNode,
+  graph: CodeGraph,
+  aggregatedEdgeInfo: Map<string, { color: string; kind: EdgeKind | null }>
+): LayoutResult {
   const result: LayoutResult = { nodes: {}, edges: [] };
+  let edgesWithSections = 0;
+  let edgesWithoutSections = 0;
+  let totalEdgesFound = 0;
 
   function processNode(node: ElkNode, offsetX: number, offsetY: number) {
     if (node.id !== "root") {
@@ -174,18 +405,33 @@ function extractLayout(elkNode: ElkNode, graph: CodeGraph): LayoutResult {
     }
 
     if (node.edges) {
+      totalEdgesFound += node.edges.length;
       for (const edge of node.edges) {
         const sourceId = edge.sources[0];
         const targetId = edge.targets[0];
-        const graphEdge = graph.edges.find(
-          (e) => e.source === sourceId && e.target === targetId
-        );
-        const color = graphEdge
-          ? EDGE_COLORS[graphEdge.kind]
-          : "#64748b";
 
-        const points: Array<{ x: number; y: number }> = [];
+        // Check if this is an aggregated edge first, then fall back to graph edges
+        const aggKey = `${sourceId}->${targetId}`;
+        const aggInfo = aggregatedEdgeInfo.get(aggKey);
+
+        let color: string;
+        let kind: EdgeKind | null;
+        if (aggInfo) {
+          color = aggInfo.color;
+          kind = aggInfo.kind;
+        } else {
+          const graphEdge = graph.edges.find(
+            (e) => e.source === sourceId && e.target === targetId
+          );
+          color = graphEdge
+            ? EDGE_COLORS[graphEdge.kind]
+            : "#64748b";
+          kind = graphEdge?.kind ?? null;
+        }
+
+        const points: Point[] = [];
         if (edge.sections) {
+          edgesWithSections++;
           for (const section of edge.sections) {
             points.push({
               x: nx + section.startPoint.x,
@@ -201,16 +447,166 @@ function extractLayout(elkNode: ElkNode, graph: CodeGraph): LayoutResult {
               y: ny + section.endPoint.y,
             });
           }
+        } else {
+          edgesWithoutSections++;
+          // Fallback: draw straight line between node centers
+          const sourcePos = result.nodes[sourceId];
+          const targetPos = result.nodes[targetId];
+          if (sourcePos && targetPos) {
+            points.push({
+              x: sourcePos.x + sourcePos.width / 2,
+              y: sourcePos.y + sourcePos.height / 2,
+            });
+            points.push({
+              x: targetPos.x + targetPos.width / 2,
+              y: targetPos.y + targetPos.height / 2,
+            });
+          }
         }
 
         if (points.length >= 2) {
-          result.edges.push({ source: sourceId, target: targetId, color, points });
+          const sourcePos = result.nodes[sourceId];
+          const targetPos = result.nodes[targetId];
+          if (!sourcePos || !targetPos) {
+            continue;
+          }
+
+          const normalizedPoints = dedupePolylinePoints(points);
+          if (normalizedPoints.length < 2) {
+            continue;
+          }
+
+          const sourceAnchor = inferEdgeAnchor(
+            sourcePos,
+            normalizedPoints[0],
+            normalizedPoints[1]
+          );
+          const targetAnchor = inferEdgeAnchor(
+            targetPos,
+            normalizedPoints[normalizedPoints.length - 1],
+            normalizedPoints[normalizedPoints.length - 2]
+          );
+
+          result.edges.push({
+            source: sourceId,
+            target: targetId,
+            color,
+            kind,
+            points: anchorEdgePolyline(
+              normalizedPoints,
+              sourcePos,
+              targetPos,
+              sourceAnchor,
+              targetAnchor
+            ),
+            sourceAnchor,
+            targetAnchor,
+          });
         }
       }
     }
   }
 
   processNode(elkNode, 0, 0);
+
+  console.log("extractLayout debug:", {
+    totalEdgesFound,
+    edgesWithSections,
+    edgesWithoutSections,
+    resultEdges: result.edges.length,
+  });
+
+  // If ELK didn't provide edges, generate straight-line fallback edges from graph data
+  if (result.edges.length === 0 && graph.edges.length > 0) {
+    console.log("ELK provided no routed edges, generating fallback edges from graph");
+
+    // Helper to create fallback edge
+    const createFallbackEdge = (
+      source: string,
+      target: string,
+      color: string,
+      kind: EdgeKind | null
+    ): LayoutEdge | null => {
+      const sourcePos = result.nodes[source];
+      const targetPos = result.nodes[target];
+      if (!sourcePos || !targetPos) return null;
+
+      const sourceCx = sourcePos.x + sourcePos.width / 2;
+      const sourceCy = sourcePos.y + sourcePos.height / 2;
+      const targetCx = targetPos.x + targetPos.width / 2;
+      const targetCy = targetPos.y + targetPos.height / 2;
+
+      const dx = targetCx - sourceCx;
+      const dy = targetCy - sourceCy;
+
+      let startPoint: Point;
+      let endPoint: Point;
+
+      if (Math.abs(dx) > Math.abs(dy)) {
+        startPoint = {
+          x: dx > 0 ? sourcePos.x + sourcePos.width : sourcePos.x,
+          y: sourceCy,
+        };
+        endPoint = {
+          x: dx > 0 ? targetPos.x : targetPos.x + targetPos.width,
+          y: targetCy,
+        };
+      } else {
+        startPoint = {
+          x: sourceCx,
+          y: dy > 0 ? sourcePos.y + sourcePos.height : sourcePos.y,
+        };
+        endPoint = {
+          x: targetCx,
+          y: dy > 0 ? targetPos.y : targetPos.y + targetPos.height,
+        };
+      }
+
+      const sourceAnchor = inferEdgeAnchor(sourcePos, startPoint, endPoint);
+      const targetAnchor = inferEdgeAnchor(targetPos, endPoint, startPoint);
+
+      return {
+        source,
+        target,
+        color,
+        kind,
+        points: anchorEdgePolyline(
+          [startPoint, endPoint],
+          sourcePos,
+          targetPos,
+          sourceAnchor,
+          targetAnchor
+        ),
+        sourceAnchor,
+        targetAnchor,
+      };
+    };
+
+    // Generate fallback for direct edges (where both endpoints are visible)
+    for (const edge of graph.edges) {
+      const fallbackEdge = createFallbackEdge(
+        edge.source,
+        edge.target,
+        EDGE_COLORS[edge.kind] || "#64748b",
+        edge.kind
+      );
+      if (fallbackEdge) {
+        result.edges.push(fallbackEdge);
+      }
+    }
+
+    // Generate fallback for aggregated edges
+    for (const [key, info] of aggregatedEdgeInfo) {
+      const [source, target] = key.split("->");
+      const fallbackEdge = createFallbackEdge(source, target, info.color, info.kind);
+      if (fallbackEdge) {
+        result.edges.push(fallbackEdge);
+      }
+    }
+
+    console.log("Generated", result.edges.length, "fallback edges");
+  }
+
   return result;
 }
 

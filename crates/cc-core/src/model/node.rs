@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 /// Stable identifier for a node in the code graph.
 /// Uses the relative file path + optional block path for uniqueness.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct NodeId(pub String);
 
 impl NodeId {

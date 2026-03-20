@@ -1,0 +1,1 @@
+distrobox enter tauri-dev -- bash -c "cd /home/nymph/Code/devtools/CodeCartographer && RUST_LOG=debug cargo tauri dev 2>&1"

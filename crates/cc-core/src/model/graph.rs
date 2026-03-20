@@ -34,6 +34,15 @@ impl CodeGraph {
     }
 
     pub fn add_edge(&mut self, edge: CodeEdge) {
+        if let Some(existing) = self.edges.iter_mut().find(|existing| {
+            existing.source == edge.source
+                && existing.target == edge.target
+                && existing.kind == edge.kind
+        }) {
+            existing.weight = existing.weight.saturating_add(edge.weight);
+            return;
+        }
+
         let idx = self.edges.len();
         self.forward_adj
             .entry(edge.source.clone())
@@ -72,6 +81,46 @@ impl CodeGraph {
                 .or_default()
                 .push((edge.source.clone(), idx));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn add_edge_merges_duplicates_by_kind_and_endpoint_pair() {
+        let mut graph = CodeGraph::new(NodeId("root".into()));
+
+        graph.add_edge(CodeEdge {
+            source: NodeId("a".into()),
+            target: NodeId("b".into()),
+            kind: EdgeKind::FunctionCall,
+            weight: 1,
+        });
+        graph.add_edge(CodeEdge {
+            source: NodeId("a".into()),
+            target: NodeId("b".into()),
+            kind: EdgeKind::FunctionCall,
+            weight: 1,
+        });
+        graph.add_edge(CodeEdge {
+            source: NodeId("a".into()),
+            target: NodeId("b".into()),
+            kind: EdgeKind::MethodCall,
+            weight: 1,
+        });
+
+        assert_eq!(graph.edges.len(), 2);
+        assert_eq!(graph.forward_adj.get(&NodeId("a".into())).unwrap().len(), 2);
+        assert_eq!(graph.reverse_adj.get(&NodeId("b".into())).unwrap().len(), 2);
+
+        let function_call = graph
+            .edges
+            .iter()
+            .find(|edge| edge.kind == EdgeKind::FunctionCall)
+            .unwrap();
+        assert_eq!(function_call.weight, 2);
     }
 }
 

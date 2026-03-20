@@ -89,10 +89,35 @@ pub async fn parse_repo(
 
     // Resolve references into edges
     let symbol_table = SymbolTable::build_from_graph(&graph);
-    let edges = symbol_table.resolve_references(&all_refs);
-    for edge in edges {
-        graph.add_edge(edge);
+
+    // Debug: show some refs and symbols
+    if !all_refs.is_empty() {
+        tracing::info!("Sample refs (first 5):");
+        for r in all_refs.iter().take(5) {
+            tracing::info!("  ref: '{}' from {:?}", r.name, r.from_node);
+        }
     }
+    if !symbol_table.symbols.is_empty() {
+        tracing::info!("Sample symbols (first 5):");
+        for (name, ids) in symbol_table.symbols.iter().take(5) {
+            tracing::info!("  sym: '{}' -> {:?}", name, ids);
+        }
+    }
+
+    let edges = symbol_table.resolve_references(&all_refs);
+    tracing::info!(
+        "Resolved {} refs into {} edges (symbols: {})",
+        all_refs.len(),
+        edges.len(),
+        symbol_table.symbols.len()
+    );
+    for edge in &edges {
+        graph.add_edge(edge.clone());
+    }
+    tracing::info!(
+        "Graph now has {} edges after adding",
+        graph.edges.len()
+    );
 
     let _ = on_event.send(ParseEvent::Complete {
         total_files,

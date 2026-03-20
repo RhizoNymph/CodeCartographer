@@ -1,9 +1,11 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { scanRepo, parseRepo, cloneGithubRepo } from "../api/commands";
 import { useGraphStore } from "../stores/graphStore";
+import { useViewportStore } from "../stores/viewportStore";
 import type { EdgeKind } from "../api/types";
 import { EDGE_COLORS } from "../api/types";
+import { saveLastFolder, getLastFolder } from "../stores/persistenceStore";
 
 const ALL_EDGE_KINDS: EdgeKind[] = [
   "Import",
@@ -26,15 +28,21 @@ export function Toolbar() {
   const handleParseEvent = useGraphStore((s) => s.handleParseEvent);
   const toggleEdgeKind = useGraphStore((s) => s.toggleEdgeKind);
 
+  const edgeLODSettings = useViewportStore((s) => s.edgeLODSettings);
+  const setEdgeLODSettings = useViewportStore((s) => s.setEdgeLODSettings);
+
   const [showUrlInput, setShowUrlInput] = useState(false);
   const [repoUrl, setRepoUrl] = useState("");
   const [isCloning, setIsCloning] = useState(false);
+  const [showLODSettings, setShowLODSettings] = useState(false);
 
   const openAndScan = useCallback(
     async (path: string) => {
       setRepoPath(path);
+      saveLastFolder(path);
       try {
         const scannedGraph = await scanRepo(path);
+        console.log("Scanned graph edges:", scannedGraph.edges.length);
         setGraph(scannedGraph);
 
         setIsParsing(true);
@@ -44,13 +52,30 @@ export function Toolbar() {
           handleParseEvent
         );
         setGraph(parsedGraph);
+        setIsParsing(false);
       } catch (err) {
         console.error("Failed to scan/parse repo:", err);
+        setIsParsing(false);
         alert(`Error: ${err}`);
       }
     },
     [setRepoPath, setGraph, setIsParsing, handleParseEvent]
   );
+
+  // Restore last opened folder on startup
+  const startupRestoredRef = useRef(false);
+  useEffect(() => {
+    if (startupRestoredRef.current) return;
+    startupRestoredRef.current = true;
+
+    const lastFolder = getLastFolder();
+    if (lastFolder) {
+      console.log("Restoring last folder:", lastFolder);
+      openAndScan(lastFolder).catch((err) => {
+        console.warn("Failed to restore last folder:", err);
+      });
+    }
+  }, [openAndScan]);
 
   const handleOpenFolder = async () => {
     const selected = await open({
@@ -93,15 +118,31 @@ export function Toolbar() {
         e.preventDefault();
         setShowUrlInput(true);
       }
-      // Escape: close URL input
+      // Escape: close URL input and LOD settings
       if (e.key === "Escape") {
         setShowUrlInput(false);
+        setShowLODSettings(false);
       }
     };
 
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, []);
+
+  // Close LOD settings when clicking outside
+  const lodSettingsRef = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    if (!showLODSettings) return;
+
+    const handleClickOutside = (e: MouseEvent) => {
+      if (lodSettingsRef.current && !lodSettingsRef.current.contains(e.target as Node)) {
+        setShowLODSettings(false);
+      }
+    };
+
+    document.addEventListener("mousedown", handleClickOutside);
+    return () => document.removeEventListener("mousedown", handleClickOutside);
+  }, [showLODSettings]);
 
   return (
     <div
@@ -248,6 +289,145 @@ export function Toolbar() {
               {shortEdgeLabel(kind)}
             </button>
           ))}
+
+          {/* LOD Settings button */}
+          <div ref={lodSettingsRef} style={{ position: "relative", marginLeft: 8 }}>
+            <button
+              onClick={() => setShowLODSettings(!showLODSettings)}
+              title="Edge visibility settings"
+              style={{
+                padding: "2px 8px",
+                fontSize: 10,
+                border: "1px solid #475569",
+                borderRadius: 4,
+                cursor: "pointer",
+                background: showLODSettings ? "#475569" : "#334155",
+                color: "#e2e8f0",
+              }}
+            >
+              LOD
+            </button>
+
+            {/* LOD Settings dropdown */}
+            {showLODSettings && (
+              <div
+                style={{
+                  position: "absolute",
+                  top: "100%",
+                  right: 0,
+                  marginTop: 4,
+                  background: "#1e293b",
+                  border: "1px solid #334155",
+                  borderRadius: 6,
+                  padding: 12,
+                  zIndex: 100,
+                  minWidth: 220,
+                  boxShadow: "0 4px 12px rgba(0,0,0,0.3)",
+                }}
+              >
+                <div style={{ fontSize: 11, fontWeight: 600, color: "#e2e8f0", marginBottom: 10 }}>
+                  Edge LOD Settings
+                </div>
+
+                {/* Show edges in minimap */}
+                <label
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    fontSize: 11,
+                    color: "#94a3b8",
+                    marginBottom: 10,
+                    cursor: "pointer",
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={edgeLODSettings.showEdgesInMinimap}
+                    onChange={(e) =>
+                      setEdgeLODSettings({ showEdgesInMinimap: e.target.checked })
+                    }
+                    style={{ accentColor: "#3b82f6" }}
+                  />
+                  Show edges at minimap zoom
+                </label>
+
+                {/* Minimap opacity slider */}
+                <div style={{ marginBottom: 10 }}>
+                  <div style={{ fontSize: 10, color: "#64748b", marginBottom: 4 }}>
+                    Minimap opacity: {Math.round(edgeLODSettings.minimapOpacity * 100)}%
+                  </div>
+                  <input
+                    type="range"
+                    min="0"
+                    max="100"
+                    value={edgeLODSettings.minimapOpacity * 100}
+                    onChange={(e) =>
+                      setEdgeLODSettings({ minimapOpacity: parseInt(e.target.value) / 100 })
+                    }
+                    style={{ width: "100%", accentColor: "#3b82f6" }}
+                  />
+                </div>
+
+                {/* Overview opacity slider */}
+                <div style={{ marginBottom: 10 }}>
+                  <div style={{ fontSize: 10, color: "#64748b", marginBottom: 4 }}>
+                    Overview opacity: {Math.round(edgeLODSettings.overviewOpacity * 100)}%
+                  </div>
+                  <input
+                    type="range"
+                    min="0"
+                    max="100"
+                    value={edgeLODSettings.overviewOpacity * 100}
+                    onChange={(e) =>
+                      setEdgeLODSettings({ overviewOpacity: parseInt(e.target.value) / 100 })
+                    }
+                    style={{ width: "100%", accentColor: "#3b82f6" }}
+                  />
+                </div>
+
+                {/* Hide at overview */}
+                <div>
+                  <div style={{ fontSize: 10, color: "#64748b", marginBottom: 6 }}>
+                    Hide at overview zoom:
+                  </div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
+                    {ALL_EDGE_KINDS.map((kind) => (
+                      <button
+                        key={kind}
+                        onClick={() => {
+                          const newSet = new Set(edgeLODSettings.hideAtOverview);
+                          if (newSet.has(kind)) {
+                            newSet.delete(kind);
+                          } else {
+                            newSet.add(kind);
+                          }
+                          setEdgeLODSettings({ hideAtOverview: newSet });
+                        }}
+                        title={`${edgeLODSettings.hideAtOverview.has(kind) ? "Show" : "Hide"} ${kind} at overview`}
+                        style={{
+                          padding: "2px 5px",
+                          fontSize: 9,
+                          border: `1px solid ${EDGE_COLORS[kind]}`,
+                          borderRadius: 3,
+                          cursor: "pointer",
+                          background: edgeLODSettings.hideAtOverview.has(kind)
+                            ? EDGE_COLORS[kind]
+                            : "transparent",
+                          color: edgeLODSettings.hideAtOverview.has(kind)
+                            ? "white"
+                            : EDGE_COLORS[kind],
+                          opacity: edgeLODSettings.hideAtOverview.has(kind) ? 0.7 : 0.4,
+                        }}
+                      >
+                        {shortEdgeLabel(kind)}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              </div>
+            )}
+          </div>
         </div>
       )}
     </div>

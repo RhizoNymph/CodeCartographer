@@ -7,3 +7,4 @@ dist/
 src-tauri/gen/
 .claude
 .pnpm-store
+packages/app/node_modules/
