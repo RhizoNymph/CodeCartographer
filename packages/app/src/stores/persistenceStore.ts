@@ -37,6 +37,14 @@ export function getLastFolder(): string | null {
   }
 }
 
+export function clearLastFolder(): void {
+  try {
+    localStorage.removeItem(LAST_FOLDER_KEY);
+  } catch (e) {
+    console.warn("Failed to clear last folder:", e);
+  }
+}
+
 export function saveFolderState(
   folderPath: string,
   expandedNodes: Set<string>,

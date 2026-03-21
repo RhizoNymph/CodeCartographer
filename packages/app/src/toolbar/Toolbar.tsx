@@ -5,7 +5,8 @@ import { useGraphStore } from "../stores/graphStore";
 import { useViewportStore } from "../stores/viewportStore";
 import type { EdgeKind } from "../api/types";
 import { EDGE_COLORS } from "../api/types";
-import { saveLastFolder, getLastFolder } from "../stores/persistenceStore";
+import { saveLastFolder, getLastFolder, clearLastFolder } from "../stores/persistenceStore";
+import { checkNorestore } from "../api/commands";
 
 const ALL_EDGE_KINDS: EdgeKind[] = [
   "Import",
@@ -62,19 +63,29 @@ export function Toolbar() {
     [setRepoPath, setGraph, setIsParsing, handleParseEvent]
   );
 
-  // Restore last opened folder on startup
+  // Restore last opened folder on startup (unless --norestore flag was passed)
   const startupRestoredRef = useRef(false);
   useEffect(() => {
     if (startupRestoredRef.current) return;
     startupRestoredRef.current = true;
 
-    const lastFolder = getLastFolder();
-    if (lastFolder) {
-      console.log("Restoring last folder:", lastFolder);
-      openAndScan(lastFolder).catch((err) => {
-        console.warn("Failed to restore last folder:", err);
-      });
-    }
+    checkNorestore().then((norestore) => {
+      if (norestore) {
+        console.log("--norestore flag detected, clearing saved folder");
+        clearLastFolder();
+        return;
+      }
+
+      const lastFolder = getLastFolder();
+      if (lastFolder) {
+        console.log("Restoring last folder:", lastFolder);
+        openAndScan(lastFolder).catch((err) => {
+          console.warn("Failed to restore last folder:", err);
+        });
+      }
+    }).catch((err) => {
+      console.warn("Failed to check norestore flag:", err);
+    });
   }, [openAndScan]);
 
   const handleOpenFolder = async () => {
