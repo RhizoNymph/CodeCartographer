@@ -12,7 +12,6 @@ import {
 } from "../layout/edgeGeometry";
 import { useGraphStore } from "../../stores/graphStore";
 import { useViewportStore, type LODLevel } from "../../stores/viewportStore";
-import { CullingManager } from "../culling/cullingManager";
 
 // Edge styling configuration by type
 const EDGE_STYLES: Record<EdgeKind, { width: number; baseAlpha: number }> = {
@@ -65,17 +64,21 @@ export class PixiRenderer {
   private hoveredNodeId: string | null = null;
   private currentEnabledEdgeKinds: Set<EdgeKind> | null = null;
   private parentByNodeId = new Map<string, string>();
-  private minimapGraphics: Graphics | null = null;
+  private _minimapNodesGfx: Graphics | null = null;    // static node dots
+  private _minimapViewportGfx: Graphics | null = null;  // viewport rectangle
+  private _minimapLayoutVersion: LayoutResult | null = null;
   private resizeObserver: ResizeObserver;
   private containerEl: HTMLElement;
   private initialized = false;
   private selectedNodeId: string | null = null;
   private currentLOD: LODLevel = "detail";
-  private cullingManager = new CullingManager();
   private lastLayout: LayoutResult | null = null;
   private currentGraph: CodeGraph | null = null;
   private currentVisibleNodes: Set<string> = new Set();
   private edgeRedrawFrame: number | null = null;
+  private _viewportDirty = false;
+  private _viewportRafId: number | null = null;
+  private _layoutRequestId = 0;
 
   // Drag state
   private dragTarget: {
@@ -171,9 +174,18 @@ export class PixiRenderer {
 
     this.app.stage.addChild(this.viewport);
 
-    // Track viewport changes for LOD and culling
+    // Track viewport changes for LOD and culling (throttled to one per frame)
     this.viewport.on("moved", () => {
-      this.onViewportChanged();
+      if (!this._viewportDirty) {
+        this._viewportDirty = true;
+        this._viewportRafId = requestAnimationFrame(() => {
+          this._viewportRafId = null;
+          this._viewportDirty = false;
+          if (!this.destroyed && this.initialized) {
+            this.onViewportChanged();
+          }
+        });
+      }
     });
 
     // Click on empty space to deselect
@@ -267,8 +279,10 @@ export class PixiRenderer {
     this.currentEnabledEdgeKinds = enabledEdgeKinds ?? null;
     this.parentByNodeId = this.buildParentMap(graph);
 
-    // Run layout with edge kind filtering
+    // Run layout with edge kind filtering (with cancellation token for stale results)
+    const requestId = ++this._layoutRequestId;
     layoutGraph(graph, expandedNodes, visibleNodes, enabledEdgeKinds).then((layout) => {
+      if (requestId !== this._layoutRequestId) return; // stale — discard
       this.lastLayout = layout;
       this.renderFromLayout(graph, layout, expandedNodes, visibleNodes);
     });
@@ -312,7 +326,6 @@ export class PixiRenderer {
       display.container.destroy({ children: true });
     }
     this.nodeDisplays.clear();
-    this.cullingManager.clear();
 
     if (this.edgeGraphics) {
       this.edgeGraphics.destroy();
@@ -325,7 +338,6 @@ export class PixiRenderer {
       if (!node) continue;
 
       this.createNodeDisplay(nodeId, node, pos, expandedNodes.has(nodeId));
-      this.cullingManager.upsert(nodeId, pos.x, pos.y, pos.width, pos.height);
     }
 
     // Draw edges
@@ -927,14 +939,6 @@ export class PixiRenderer {
       return;
     }
 
-    this.cullingManager.upsert(
-      nodeId,
-      display.container.x,
-      display.container.y,
-      display.layoutPos.width,
-      display.layoutPos.height
-    );
-
     if (this.lastLayout?.nodes[nodeId]) {
       this.lastLayout.nodes[nodeId] = {
         ...this.lastLayout.nodes[nodeId],
@@ -1078,26 +1082,18 @@ export class PixiRenderer {
     gfx.fill({ color, alpha: Math.min(1, alpha * 1.1) });
   }
 
-  private updateMinimap() {
-    // Simple minimap in bottom-right corner
-    if (this.minimapGraphics) {
-      this.minimapGraphics.destroy();
-    }
+  /**
+   * Compute minimap geometry (world bounds and scale) from lastLayout.
+   * Returns null if no layout / no nodes.
+   */
+  private getMinimapGeometry() {
+    if (!this.lastLayout || this.nodeDisplays.size === 0) return null;
 
-    if (!this.lastLayout || this.nodeDisplays.size === 0) return;
-
-    const gfx = new Graphics();
     const mmWidth = 150;
     const mmHeight = 100;
     const mmX = this.containerEl.clientWidth - mmWidth - 10;
     const mmY = this.containerEl.clientHeight - mmHeight - 10;
 
-    // Background
-    gfx.roundRect(mmX, mmY, mmWidth, mmHeight, 4);
-    gfx.fill({ color: 0x1e293b, alpha: 0.85 });
-    gfx.stroke({ color: 0x334155, width: 1 });
-
-    // Calculate world bounds
     let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
     for (const pos of Object.values(this.lastLayout.nodes)) {
       minX = Math.min(minX, pos.x);
@@ -1112,29 +1108,72 @@ export class PixiRenderer {
     const scaleY = (mmHeight - 8) / worldH;
     const mmScale = Math.min(scaleX, scaleY);
 
-    // Draw nodes as small dots
-    for (const pos of Object.values(this.lastLayout.nodes)) {
-      const rx = mmX + 4 + (pos.x - minX) * mmScale;
-      const ry = mmY + 4 + (pos.y - minY) * mmScale;
-      const rw = Math.max(pos.width * mmScale, 2);
-      const rh = Math.max(pos.height * mmScale, 1);
+    return { mmX, mmY, mmWidth, mmHeight, minX, minY, mmScale };
+  }
+
+  /**
+   * Rebuild the static minimap nodes layer (background + node rectangles).
+   * Only called when the layout reference changes.
+   */
+  private rebuildMinimapNodes() {
+    if (this._minimapLayoutVersion === this.lastLayout) return;
+    this._minimapLayoutVersion = this.lastLayout;
+
+    if (this._minimapNodesGfx) {
+      this._minimapNodesGfx.destroy();
+      this._minimapNodesGfx = null;
+    }
+
+    const geo = this.getMinimapGeometry();
+    if (!geo) return;
+
+    const gfx = new Graphics();
+
+    // Background
+    gfx.roundRect(geo.mmX, geo.mmY, geo.mmWidth, geo.mmHeight, 4);
+    gfx.fill({ color: 0x1e293b, alpha: 0.85 });
+    gfx.stroke({ color: 0x334155, width: 1 });
+
+    // Draw nodes as small rectangles
+    for (const pos of Object.values(this.lastLayout!.nodes)) {
+      const rx = geo.mmX + 4 + (pos.x - geo.minX) * geo.mmScale;
+      const ry = geo.mmY + 4 + (pos.y - geo.minY) * geo.mmScale;
+      const rw = Math.max(pos.width * geo.mmScale, 2);
+      const rh = Math.max(pos.height * geo.mmScale, 1);
 
       gfx.rect(rx, ry, rw, rh);
       gfx.fill({ color: 0x3b82f6, alpha: 0.5 });
     }
 
-    // Draw viewport rectangle
-    const vp = this.viewport.getVisibleBounds();
-    const vpRx = mmX + 4 + (vp.x - minX) * mmScale;
-    const vpRy = mmY + 4 + (vp.y - minY) * mmScale;
-    const vpRw = vp.width * mmScale;
-    const vpRh = vp.height * mmScale;
-
-    gfx.rect(vpRx, vpRy, vpRw, vpRh);
-    gfx.stroke({ color: 0x60a5fa, width: 1.5 });
-
     this.app.stage.addChild(gfx);
-    this.minimapGraphics = gfx;
+    this._minimapNodesGfx = gfx;
+  }
+
+  private updateMinimap() {
+    // Rebuild static node layer only when layout changes
+    this.rebuildMinimapNodes();
+
+    // Destroy/recreate only the viewport rectangle overlay
+    if (this._minimapViewportGfx) {
+      this._minimapViewportGfx.destroy();
+      this._minimapViewportGfx = null;
+    }
+
+    const geo = this.getMinimapGeometry();
+    if (!geo) return;
+
+    const vpGfx = new Graphics();
+    const vp = this.viewport.getVisibleBounds();
+    const vpRx = geo.mmX + 4 + (vp.x - geo.minX) * geo.mmScale;
+    const vpRy = geo.mmY + 4 + (vp.y - geo.minY) * geo.mmScale;
+    const vpRw = vp.width * geo.mmScale;
+    const vpRh = vp.height * geo.mmScale;
+
+    vpGfx.rect(vpRx, vpRy, vpRw, vpRh);
+    vpGfx.stroke({ color: 0x60a5fa, width: 1.5 });
+
+    this.app.stage.addChild(vpGfx);
+    this._minimapViewportGfx = vpGfx;
   }
 
   setSelectedNode(nodeId: string | null) {
@@ -1232,10 +1271,17 @@ export class PixiRenderer {
       window.cancelAnimationFrame(this.edgeRedrawFrame);
       this.edgeRedrawFrame = null;
     }
+    if (this._viewportRafId !== null) {
+      cancelAnimationFrame(this._viewportRafId);
+      this._viewportRafId = null;
+    }
     this.resizeObserver.disconnect();
     if (!this.initialized) return;
-    if (this.minimapGraphics) {
-      this.minimapGraphics.destroy();
+    if (this._minimapNodesGfx) {
+      this._minimapNodesGfx.destroy();
+    }
+    if (this._minimapViewportGfx) {
+      this._minimapViewportGfx.destroy();
     }
     try {
       this.app.destroy(true, { children: true });
