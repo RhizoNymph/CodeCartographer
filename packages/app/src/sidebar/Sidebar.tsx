@@ -6,9 +6,10 @@ interface TreeItemProps {
   nodeId: string;
   depth: number;
   searchQuery: string;
+  matchingIds: Set<string> | null;
 }
 
-function TreeItem({ nodeId, depth, searchQuery }: TreeItemProps) {
+function TreeItem({ nodeId, depth, searchQuery, matchingIds }: TreeItemProps) {
   const graph = useGraphStore((s) => s.graph);
   const expandedNodes = useGraphStore((s) => s.expandedNodes);
   const visibleNodes = useGraphStore((s) => s.visibleNodes);
@@ -22,7 +23,7 @@ function TreeItem({ nodeId, depth, searchQuery }: TreeItemProps) {
   if (!node) return null;
 
   // Filter by search query
-  const matchesSearch = !searchQuery || matchesQuery(node, searchQuery, graph);
+  const matchesSearch = !searchQuery || !matchingIds || matchingIds.has(nodeId);
   if (!matchesSearch) return null;
 
   const isExpanded = expandedNodes.has(nodeId);
@@ -122,27 +123,11 @@ function TreeItem({ nodeId, depth, searchQuery }: TreeItemProps) {
             nodeId={childId}
             depth={depth + 1}
             searchQuery={searchQuery}
+            matchingIds={matchingIds}
           />
         ))}
     </div>
   );
-}
-
-function matchesQuery(
-  node: CodeNode,
-  query: string,
-  graph: { nodes: Record<string, CodeNode> }
-): boolean {
-  const q = query.toLowerCase();
-  if (node.name.toLowerCase().includes(q)) return true;
-
-  // Check if any descendant matches
-  for (const childId of node.children) {
-    const child = graph.nodes[childId];
-    if (child && matchesQuery(child, query, graph)) return true;
-  }
-
-  return false;
 }
 
 function highlightMatch(text: string, query: string): React.ReactNode {
@@ -196,6 +181,35 @@ function getTextColor(node: CodeNode): string {
   }
 }
 
+function computeMatchingIds(
+  graph: { nodes: Record<string, CodeNode>; root: string },
+  query: string
+): Set<string> {
+  const result = new Set<string>();
+  const q = query.toLowerCase();
+
+  function visit(nodeId: string): boolean {
+    const node = graph.nodes[nodeId];
+    if (!node) return false;
+    const selfMatches = node.name.toLowerCase().includes(q);
+    let anyChildMatches = false;
+    for (const childId of node.children) {
+      if (visit(childId)) anyChildMatches = true;
+    }
+    if (selfMatches || anyChildMatches) {
+      result.add(nodeId);
+      return true;
+    }
+    return false;
+  }
+
+  const root = graph.nodes[graph.root];
+  if (root) {
+    for (const childId of root.children) visit(childId);
+  }
+  return result;
+}
+
 export function Sidebar() {
   const graph = useGraphStore((s) => s.graph);
   const parseProgress = useGraphStore((s) => s.parseProgress);
@@ -203,6 +217,11 @@ export function Sidebar() {
   const needsRelayout = useGraphStore((s) => s.needsRelayout);
   const requestRelayout = useGraphStore((s) => s.requestRelayout);
   const [searchQuery, setSearchQuery] = useState("");
+
+  const matchingIds = useMemo(
+    () => (graph && searchQuery ? computeMatchingIds(graph, searchQuery) : null),
+    [graph, searchQuery]
+  );
 
   if (!graph) return null;
 
@@ -356,6 +375,7 @@ export function Sidebar() {
             nodeId={childId}
             depth={0}
             searchQuery={searchQuery}
+            matchingIds={matchingIds}
           />
         ))}
       </div>
