@@ -35,3 +35,7 @@ export async function getSubgraph(
 export async function cloneGithubRepo(url: string): Promise<string> {
   return invoke<string>("clone_github_repo", { url });
 }
+
+export async function checkNorestore(): Promise<boolean> {
+  return invoke<boolean>("check_norestore");
+}

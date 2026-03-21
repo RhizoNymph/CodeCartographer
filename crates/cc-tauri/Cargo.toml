@@ -10,3 +10,4 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 tauri = { version = "2", features = [] }
 tracing = { workspace = true }
+rayon = { workspace = true }

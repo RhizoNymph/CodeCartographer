@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use cc_core::model::{CodeGraph, CodeNode, EdgeKind, Language, NodeId, SubGraph};
 use cc_core::parser::{Extractor, ParseEvent};
 use cc_core::resolver::SymbolTable;
+use rayon::prelude::*;
 use tauri::command;
 use tauri::ipc::Channel;
 
@@ -15,6 +16,7 @@ pub async fn parse_repo(
     let root = PathBuf::from(&path);
     let mut graph: CodeGraph =
         serde_json::from_str(&graph_json).map_err(|e| e.to_string())?;
+    graph.rebuild_adjacency();
 
     let mut all_refs = Vec::new();
     let mut total_blocks = 0usize;
@@ -36,54 +38,43 @@ pub async fn parse_repo(
         })
         .collect();
 
-    for (file_id, rel_path, language) in &file_nodes {
-        let abs_path = root.join(rel_path);
-
-        let _ = on_event.send(ParseEvent::FileStart {
-            path: rel_path.clone(),
-        });
-
-        let source = match std::fs::read_to_string(&abs_path) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = on_event.send(ParseEvent::Error {
-                    path: rel_path.clone(),
-                    message: e.to_string(),
-                });
-                continue;
+    // Phase 1: Parse files in parallel (I/O + tree-sitter)
+    let parse_results: Vec<_> = file_nodes
+        .par_iter()
+        .map(|(file_id, rel_path, language)| {
+            let abs_path = root.join(rel_path);
+            let source = match std::fs::read_to_string(&abs_path) {
+                Ok(s) => s,
+                Err(e) => return (file_id.clone(), rel_path.clone(), Err(e.to_string())),
+            };
+            match Extractor::extract_file(rel_path, &source, language) {
+                Ok((nodes, refs)) => (file_id.clone(), rel_path.clone(), Ok((nodes, refs))),
+                Err(e) => (file_id.clone(), rel_path.clone(), Err(e.to_string())),
             }
-        };
+        })
+        .collect();
 
-        match Extractor::extract_file(rel_path, &source, language) {
+    // Phase 2: Merge results and send progress events sequentially
+    for (file_id, rel_path, result) in parse_results {
+        let _ = on_event.send(ParseEvent::FileStart { path: rel_path.clone() });
+        match result {
             Ok((nodes, refs)) => {
                 let block_count = nodes.len();
                 total_blocks += block_count;
-
-                // Add code block nodes to graph and update file's children
                 for node in nodes {
                     let block_id = node.id().clone();
                     graph.add_node(node);
-
-                    if let Some(file_node) = graph.nodes.get_mut(file_id) {
+                    if let Some(file_node) = graph.nodes.get_mut(&file_id) {
                         file_node.children_mut().push(block_id);
                     }
                 }
-
                 all_refs.extend(refs);
-
-                let _ = on_event.send(ParseEvent::FileDone {
-                    path: rel_path.clone(),
-                    blocks: block_count,
-                });
+                let _ = on_event.send(ParseEvent::FileDone { path: rel_path, blocks: block_count });
             }
             Err(e) => {
-                let _ = on_event.send(ParseEvent::Error {
-                    path: rel_path.clone(),
-                    message: e.to_string(),
-                });
+                let _ = on_event.send(ParseEvent::Error { path: rel_path, message: e });
             }
         }
-
         total_files += 1;
     }
 
