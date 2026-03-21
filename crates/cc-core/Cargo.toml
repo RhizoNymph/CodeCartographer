@@ -18,3 +18,12 @@ tree-sitter-rust = "0.23"
 
 [dev-dependencies]
 tempfile = "3"
+criterion = { workspace = true }
+
+[[bench]]
+name = "graph_bench"
+harness = false
+
+[[bench]]
+name = "parse_bench"
+harness = false
