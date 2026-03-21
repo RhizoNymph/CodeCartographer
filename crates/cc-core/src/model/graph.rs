@@ -16,6 +16,9 @@ pub struct CodeGraph {
     /// Reverse adjacency: target -> [(source, edge_index)]
     #[serde(skip)]
     pub reverse_adj: HashMap<NodeId, Vec<(NodeId, usize)>>,
+    /// Dedup index: (source, target, kind) -> edge index
+    #[serde(skip)]
+    pub edge_dedup: HashMap<(NodeId, NodeId, EdgeKind), usize>,
 }
 
 impl CodeGraph {
@@ -26,6 +29,7 @@ impl CodeGraph {
             root: root_id,
             forward_adj: HashMap::new(),
             reverse_adj: HashMap::new(),
+            edge_dedup: HashMap::new(),
         }
     }
 
@@ -34,16 +38,13 @@ impl CodeGraph {
     }
 
     pub fn add_edge(&mut self, edge: CodeEdge) {
-        if let Some(existing) = self.edges.iter_mut().find(|existing| {
-            existing.source == edge.source
-                && existing.target == edge.target
-                && existing.kind == edge.kind
-        }) {
-            existing.weight = existing.weight.saturating_add(edge.weight);
+        let key = (edge.source.clone(), edge.target.clone(), edge.kind.clone());
+        if let Some(&idx) = self.edge_dedup.get(&key) {
+            self.edges[idx].weight = self.edges[idx].weight.saturating_add(edge.weight);
             return;
         }
-
         let idx = self.edges.len();
+        self.edge_dedup.insert(key, idx);
         self.forward_adj
             .entry(edge.source.clone())
             .or_default()
@@ -71,6 +72,7 @@ impl CodeGraph {
     pub fn rebuild_adjacency(&mut self) {
         self.forward_adj.clear();
         self.reverse_adj.clear();
+        self.edge_dedup.clear();
         for (idx, edge) in self.edges.iter().enumerate() {
             self.forward_adj
                 .entry(edge.source.clone())
@@ -80,6 +82,10 @@ impl CodeGraph {
                 .entry(edge.target.clone())
                 .or_default()
                 .push((edge.source.clone(), idx));
+            self.edge_dedup.insert(
+                (edge.source.clone(), edge.target.clone(), edge.kind.clone()),
+                idx,
+            );
         }
     }
 }
