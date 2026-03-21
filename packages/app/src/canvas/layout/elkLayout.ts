@@ -1,5 +1,5 @@
 import ELK, { type ElkNode, type ElkExtendedEdge } from "elkjs/lib/elk.bundled.js";
-import type { CodeGraph, CodeNode, EdgeKind } from "../../api/types";
+import type { CodeGraph, CodeNode, CodeEdge, EdgeKind } from "../../api/types";
 import { EDGE_COLORS } from "../../api/types";
 import { useDebugStore } from "../../stores/debugStore";
 import {
@@ -253,18 +253,20 @@ export async function layoutGraph(
   // Compute aggregated edges for collapsed containers
   const aggregatedEdges = computeAggregatedEdges(graph, elkNodeIds, parentMap, enabledEdgeKinds);
 
-  console.log("Edge filtering:", {
-    totalGraphEdges: graph.edges.length,
-    elkNodeIdsCount: elkNodeIds.size,
-    edgesWithBothEndpointsInTree: edgesInTree.length,
-    edgesMissingEndpoints: edgesNotInTree.length,
-    aggregatedEdges: aggregatedEdges.length,
-    sampleGraphEdge: graph.edges[0],
-    sampleElkNodeIds: Array.from(elkNodeIds).slice(0, 5),
-    sampleMissingEdge: edgesNotInTree[0],
-    sampleEdgeSourceInTree: edgesNotInTree[0] ? elkNodeIds.has(edgesNotInTree[0].source) : "N/A",
-    sampleEdgeTargetInTree: edgesNotInTree[0] ? elkNodeIds.has(edgesNotInTree[0].target) : "N/A",
-  });
+  if (import.meta.env.DEV) {
+    console.log("Edge filtering:", {
+      totalGraphEdges: graph.edges.length,
+      elkNodeIdsCount: elkNodeIds.size,
+      edgesWithBothEndpointsInTree: edgesInTree.length,
+      edgesMissingEndpoints: edgesNotInTree.length,
+      aggregatedEdges: aggregatedEdges.length,
+      sampleGraphEdge: graph.edges[0],
+      sampleElkNodeIds: Array.from(elkNodeIds).slice(0, 5),
+      sampleMissingEdge: edgesNotInTree[0],
+      sampleEdgeSourceInTree: edgesNotInTree[0] ? elkNodeIds.has(edgesNotInTree[0].source) : "N/A",
+      sampleEdgeTargetInTree: edgesNotInTree[0] ? elkNodeIds.has(edgesNotInTree[0].target) : "N/A",
+    });
+  }
 
   // Create ELK edges from direct edges
   const elkEdges: ElkExtendedEdge[] = edgesInTree.map((e, i) => ({
@@ -299,33 +301,35 @@ export async function layoutGraph(
     },
   };
 
-  // Count nested children
-  function countChildren(nodes: ElkNode[]): number {
-    let count = nodes.length;
-    for (const n of nodes) {
-      if (n.children) count += countChildren(n.children);
+  if (import.meta.env.DEV) {
+    // Count nested children
+    function countChildren(nodes: ElkNode[]): number {
+      let count = nodes.length;
+      for (const n of nodes) {
+        if (n.children) count += countChildren(n.children);
+      }
+      return count;
     }
-    return count;
+
+    // Count code blocks in the graph
+    const codeBlocksInGraph = Object.values(graph.nodes).filter(n => n.type === "CodeBlock").length;
+    const filesWithChildren = Object.values(graph.nodes).filter(n => n.type === "File" && n.children.length > 0).length;
+    const expandedFiles = Array.from(expandedNodes).filter(id => graph.nodes[id]?.type === "File").length;
+
+    useDebugStore.getState().addLog(`ELK: codeBlocks=${codeBlocksInGraph}, edges=${graph.edges.length}, aggregated=${aggregatedEdges.length}, elkNodes=${elkNodeIds.size}`);
+
+    console.log("ELK input:", {
+      topLevelChildren: children.length,
+      totalNestedNodes: countChildren(children),
+      elkEdges: elkEdges.length,
+      graphEdges: graph.edges.length,
+      expanded: expandedNodes.size,
+      visible: visibleNodes.size,
+      codeBlocksInGraph,
+      filesWithChildren,
+      expandedFiles,
+    });
   }
-
-  // Count code blocks in the graph
-  const codeBlocksInGraph = Object.values(graph.nodes).filter(n => n.type === "CodeBlock").length;
-  const filesWithChildren = Object.values(graph.nodes).filter(n => n.type === "File" && n.children.length > 0).length;
-  const expandedFiles = Array.from(expandedNodes).filter(id => graph.nodes[id]?.type === "File").length;
-
-  useDebugStore.getState().addLog(`ELK: codeBlocks=${codeBlocksInGraph}, edges=${graph.edges.length}, aggregated=${aggregatedEdges.length}, elkNodes=${elkNodeIds.size}`);
-
-  console.log("ELK input:", {
-    topLevelChildren: children.length,
-    totalNestedNodes: countChildren(children),
-    elkEdges: elkEdges.length,
-    graphEdges: graph.edges.length,
-    expanded: expandedNodes.size,
-    visible: visibleNodes.size,
-    codeBlocksInGraph,
-    filesWithChildren,
-    expandedFiles,
-  });
 
   // Build aggregated edge info map for extractLayout
   const aggregatedEdgeInfo = new Map<string, { color: string; kind: EdgeKind | null }>();
@@ -334,43 +338,54 @@ export async function layoutGraph(
   }
 
   try {
-    useDebugStore.getState().addLog(`ELK layout starting...`);
+    if (import.meta.env.DEV) {
+      useDebugStore.getState().addLog(`ELK layout starting...`);
+    }
     const laidOut = await elk.layout(elkGraph);
-    useDebugStore.getState().addLog(`ELK layout done, extracting...`);
-    console.log("ELK raw output:", {
-      rootEdgesCount: laidOut.edges?.length ?? 0,
-      rootEdgeSample: laidOut.edges?.[0],
-      hasChildren: !!laidOut.children,
-      childCount: laidOut.children?.length ?? 0,
-    });
+    if (import.meta.env.DEV) {
+      useDebugStore.getState().addLog(`ELK layout done, extracting...`);
+      console.log("ELK raw output:", {
+        rootEdgesCount: laidOut.edges?.length ?? 0,
+        rootEdgeSample: laidOut.edges?.[0],
+        hasChildren: !!laidOut.children,
+        childCount: laidOut.children?.length ?? 0,
+      });
+    }
     const result = extractLayout(laidOut, graph, aggregatedEdgeInfo);
-    useDebugStore.getState().addLog(`ELK extracted ${result.edges.length} edges`);
-    console.log("ELK output:", {
-      nodes: Object.keys(result.nodes).length,
-      edges: result.edges.length,
-    });
+    if (import.meta.env.DEV) {
+      useDebugStore.getState().addLog(`ELK extracted ${result.edges.length} edges`);
+      console.log("ELK output:", {
+        nodes: Object.keys(result.nodes).length,
+        edges: result.edges.length,
+      });
 
-    // Update debug store
-    useDebugStore.getState().setLayoutInfo({
-      elkNodeIds: elkNodeIds.size,
-      edgesInTree: edgesInTree.length,
-      edgesNotInTree: edgesNotInTree.length,
-      aggregatedEdges: aggregatedEdges.length,
-      elkEdgesInput: elkEdges.length,
-      elkEdgesOutput: result.edges.length,
-      edgesWithSections: result.edges.length, // approximate
-      edgesWithoutSections: elkEdges.length - result.edges.length,
-      sampleGraphEdge: JSON.stringify(graph.edges[0]),
-      sampleElkNodeId: Array.from(elkNodeIds)[0] ?? "none",
-      codeBlocksInGraph,
-      filesWithChildren,
-      expandedFiles,
-    });
+      // Update debug store
+      const codeBlocksInGraph = Object.values(graph.nodes).filter(n => n.type === "CodeBlock").length;
+      const filesWithChildren = Object.values(graph.nodes).filter(n => n.type === "File" && n.children.length > 0).length;
+      const expandedFiles = Array.from(expandedNodes).filter(id => graph.nodes[id]?.type === "File").length;
+      useDebugStore.getState().setLayoutInfo({
+        elkNodeIds: elkNodeIds.size,
+        edgesInTree: edgesInTree.length,
+        edgesNotInTree: edgesNotInTree.length,
+        aggregatedEdges: aggregatedEdges.length,
+        elkEdgesInput: elkEdges.length,
+        elkEdgesOutput: result.edges.length,
+        edgesWithSections: result.edges.length, // approximate
+        edgesWithoutSections: elkEdges.length - result.edges.length,
+        sampleGraphEdge: JSON.stringify(graph.edges[0]),
+        sampleElkNodeId: Array.from(elkNodeIds)[0] ?? "none",
+        codeBlocksInGraph,
+        filesWithChildren,
+        expandedFiles,
+      });
+    }
 
     return result;
   } catch (err) {
     console.error("ELK layout failed:", err);
-    useDebugStore.getState().addLog(`ELK FAILED: ${err}`);
+    if (import.meta.env.DEV) {
+      useDebugStore.getState().addLog(`ELK FAILED: ${err}`);
+    }
     return fallbackLayout(graph, visibleNodes);
   }
 }
@@ -381,6 +396,13 @@ function extractLayout(
   aggregatedEdgeInfo: Map<string, { color: string; kind: EdgeKind | null }>
 ): LayoutResult {
   const result: LayoutResult = { nodes: {}, edges: [] };
+
+  const edgeLookup = new Map<string, CodeEdge>();
+  for (const e of graph.edges) {
+    const key = `${e.source}->${e.target}`;
+    if (!edgeLookup.has(key)) edgeLookup.set(key, e);
+  }
+
   let edgesWithSections = 0;
   let edgesWithoutSections = 0;
   let totalEdgesFound = 0;
@@ -405,7 +427,7 @@ function extractLayout(
     }
 
     if (node.edges) {
-      totalEdgesFound += node.edges.length;
+      if (import.meta.env.DEV) { totalEdgesFound += node.edges.length; }
       for (const edge of node.edges) {
         const sourceId = edge.sources[0];
         const targetId = edge.targets[0];
@@ -420,9 +442,7 @@ function extractLayout(
           color = aggInfo.color;
           kind = aggInfo.kind;
         } else {
-          const graphEdge = graph.edges.find(
-            (e) => e.source === sourceId && e.target === targetId
-          );
+          const graphEdge = edgeLookup.get(`${sourceId}->${targetId}`);
           color = graphEdge
             ? EDGE_COLORS[graphEdge.kind]
             : "#64748b";
@@ -431,7 +451,7 @@ function extractLayout(
 
         const points: Point[] = [];
         if (edge.sections) {
-          edgesWithSections++;
+          if (import.meta.env.DEV) { edgesWithSections++; }
           for (const section of edge.sections) {
             points.push({
               x: nx + section.startPoint.x,
@@ -448,7 +468,7 @@ function extractLayout(
             });
           }
         } else {
-          edgesWithoutSections++;
+          if (import.meta.env.DEV) { edgesWithoutSections++; }
           // Fallback: draw straight line between node centers
           const sourcePos = result.nodes[sourceId];
           const targetPos = result.nodes[targetId];
@@ -509,16 +529,20 @@ function extractLayout(
 
   processNode(elkNode, 0, 0);
 
-  console.log("extractLayout debug:", {
-    totalEdgesFound,
-    edgesWithSections,
-    edgesWithoutSections,
-    resultEdges: result.edges.length,
-  });
+  if (import.meta.env.DEV) {
+    console.log("extractLayout debug:", {
+      totalEdgesFound,
+      edgesWithSections,
+      edgesWithoutSections,
+      resultEdges: result.edges.length,
+    });
+  }
 
   // If ELK didn't provide edges, generate straight-line fallback edges from graph data
   if (result.edges.length === 0 && graph.edges.length > 0) {
-    console.log("ELK provided no routed edges, generating fallback edges from graph");
+    if (import.meta.env.DEV) {
+      console.log("ELK provided no routed edges, generating fallback edges from graph");
+    }
 
     // Helper to create fallback edge
     const createFallbackEdge = (
@@ -604,7 +628,9 @@ function extractLayout(
       }
     }
 
-    console.log("Generated", result.edges.length, "fallback edges");
+    if (import.meta.env.DEV) {
+      console.log("Generated", result.edges.length, "fallback edges");
+    }
   }
 
   return result;
