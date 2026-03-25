@@ -1,6 +1,4 @@
-use crate::model::{
-    BlockKind, CodeNode, Language, NodeId, Span, Visibility,
-};
+use crate::model::{BlockKind, CodeNode, Language, NodeId, Span, Visibility};
 
 /// Raw reference found during parsing, before resolution.
 #[derive(Debug, Clone)]
@@ -26,10 +24,21 @@ pub enum RawRefKind {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "type")]
 pub enum ParseEvent {
-    FileStart { path: String },
-    FileDone { path: String, blocks: usize },
-    Error { path: String, message: String },
-    Complete { total_files: usize, total_blocks: usize },
+    FileStart {
+        path: String,
+    },
+    FileDone {
+        path: String,
+        blocks: usize,
+    },
+    Error {
+        path: String,
+        message: String,
+    },
+    Complete {
+        total_files: usize,
+        total_blocks: usize,
+    },
 }
 
 /// Extracts code blocks from a single source file using tree-sitter.
@@ -277,10 +286,7 @@ impl Extractor {
         }
     }
 
-    fn rust_visibility(
-        node: &tree_sitter::Node,
-        _source: &str,
-    ) -> Option<Visibility> {
+    fn rust_visibility(node: &tree_sitter::Node, _source: &str) -> Option<Visibility> {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             if child.kind() == "visibility_modifier" {
@@ -290,11 +296,7 @@ impl Extractor {
         Some(Visibility::Private)
     }
 
-    fn child_text(
-        node: &tree_sitter::Node,
-        field: &str,
-        source: &str,
-    ) -> Option<String> {
+    fn child_text(node: &tree_sitter::Node, field: &str, source: &str) -> Option<String> {
         node.child_by_field_name(field)
             .and_then(|n| n.utf8_text(source.as_bytes()).ok())
             .map(|s| s.to_string())
@@ -326,104 +328,98 @@ impl Extractor {
             let kind = current.kind();
 
             match language {
-                Language::Python => {
-                    match kind {
-                        "import_statement" | "import_from_statement" => {
-                            if let Some(module) = current
-                                .child_by_field_name("module_name")
-                                .or_else(|| current.child_by_field_name("name"))
-                            {
-                                if let Ok(text) = module.utf8_text(source.as_bytes()) {
-                                    refs.push(RawReference {
-                                        from_node: from_id.clone(),
-                                        kind: RawRefKind::Import {
-                                            module_path: text.to_string(),
-                                        },
-                                        name: text.to_string(),
-                                        span: Self::node_span(&current),
-                                    });
-                                }
-                            }
-                        }
-                        "call" => {
-                            if let Some(func) = current.child_by_field_name("function") {
-                                let name = Self::extract_function_name(&func, source);
-                                if !name.is_empty() {
-                                    refs.push(RawReference {
-                                        from_node: from_id.clone(),
-                                        kind: RawRefKind::FunctionCall,
-                                        name,
-                                        span: Self::node_span(&current),
-                                    });
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                Language::TypeScript | Language::JavaScript => {
-                    match kind {
-                        "import_statement" => {
-                            if let Some(src) = current.child_by_field_name("source") {
-                                if let Ok(text) = src.utf8_text(source.as_bytes()) {
-                                    let clean = text.trim_matches(|c| c == '\'' || c == '"');
-                                    refs.push(RawReference {
-                                        from_node: from_id.clone(),
-                                        kind: RawRefKind::Import {
-                                            module_path: clean.to_string(),
-                                        },
-                                        name: clean.to_string(),
-                                        span: Self::node_span(&current),
-                                    });
-                                }
-                            }
-                        }
-                        "call_expression" => {
-                            if let Some(func) = current.child_by_field_name("function") {
-                                let name = Self::extract_function_name(&func, source);
-                                if !name.is_empty() {
-                                    refs.push(RawReference {
-                                        from_node: from_id.clone(),
-                                        kind: RawRefKind::FunctionCall,
-                                        name,
-                                        span: Self::node_span(&current),
-                                    });
-                                }
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-                Language::Rust => {
-                    match kind {
-                        "use_declaration" => {
-                            if let Some(name) = Self::extract_use_name(&current, source) {
+                Language::Python => match kind {
+                    "import_statement" | "import_from_statement" => {
+                        if let Some(module) = current
+                            .child_by_field_name("module_name")
+                            .or_else(|| current.child_by_field_name("name"))
+                        {
+                            if let Ok(text) = module.utf8_text(source.as_bytes()) {
                                 refs.push(RawReference {
                                     from_node: from_id.clone(),
                                     kind: RawRefKind::Import {
-                                        module_path: name.clone(),
+                                        module_path: text.to_string(),
                                     },
+                                    name: text.to_string(),
+                                    span: Self::node_span(&current),
+                                });
+                            }
+                        }
+                    }
+                    "call" => {
+                        if let Some(func) = current.child_by_field_name("function") {
+                            let name = Self::extract_function_name(&func, source);
+                            if !name.is_empty() {
+                                refs.push(RawReference {
+                                    from_node: from_id.clone(),
+                                    kind: RawRefKind::FunctionCall,
                                     name,
                                     span: Self::node_span(&current),
                                 });
                             }
                         }
-                        "call_expression" => {
-                            if let Some(func) = current.child_by_field_name("function") {
-                                let name = Self::extract_function_name(&func, source);
-                                if !name.is_empty() && name != "Self" && name != "self" {
-                                    refs.push(RawReference {
-                                        from_node: from_id.clone(),
-                                        kind: RawRefKind::FunctionCall,
-                                        name,
-                                        span: Self::node_span(&current),
-                                    });
-                                }
+                    }
+                    _ => {}
+                },
+                Language::TypeScript | Language::JavaScript => match kind {
+                    "import_statement" => {
+                        if let Some(src) = current.child_by_field_name("source") {
+                            if let Ok(text) = src.utf8_text(source.as_bytes()) {
+                                let clean = text.trim_matches(|c| c == '\'' || c == '"');
+                                refs.push(RawReference {
+                                    from_node: from_id.clone(),
+                                    kind: RawRefKind::Import {
+                                        module_path: clean.to_string(),
+                                    },
+                                    name: clean.to_string(),
+                                    span: Self::node_span(&current),
+                                });
                             }
                         }
-                        _ => {}
                     }
-                }
+                    "call_expression" => {
+                        if let Some(func) = current.child_by_field_name("function") {
+                            let name = Self::extract_function_name(&func, source);
+                            if !name.is_empty() {
+                                refs.push(RawReference {
+                                    from_node: from_id.clone(),
+                                    kind: RawRefKind::FunctionCall,
+                                    name,
+                                    span: Self::node_span(&current),
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
+                },
+                Language::Rust => match kind {
+                    "use_declaration" => {
+                        if let Some(name) = Self::extract_use_name(&current, source) {
+                            refs.push(RawReference {
+                                from_node: from_id.clone(),
+                                kind: RawRefKind::Import {
+                                    module_path: name.clone(),
+                                },
+                                name,
+                                span: Self::node_span(&current),
+                            });
+                        }
+                    }
+                    "call_expression" => {
+                        if let Some(func) = current.child_by_field_name("function") {
+                            let name = Self::extract_function_name(&func, source);
+                            if !name.is_empty() && name != "Self" && name != "self" {
+                                refs.push(RawReference {
+                                    from_node: from_id.clone(),
+                                    kind: RawRefKind::FunctionCall,
+                                    name,
+                                    span: Self::node_span(&current),
+                                });
+                            }
+                        }
+                    }
+                    _ => {}
+                },
             }
 
             // Push children onto stack

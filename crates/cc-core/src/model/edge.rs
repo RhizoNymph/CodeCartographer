@@ -18,12 +18,12 @@ impl EdgeKind {
     pub fn color(&self) -> &str {
         match self {
             EdgeKind::Import => "#6366f1",        // indigo
-            EdgeKind::FunctionCall => "#22c55e",   // green
-            EdgeKind::MethodCall => "#14b8a6",     // teal
-            EdgeKind::TypeReference => "#f59e0b",  // amber
-            EdgeKind::Inheritance => "#ef4444",    // red
-            EdgeKind::TraitImpl => "#a855f7",      // purple
-            EdgeKind::VariableUsage => "#64748b",  // slate
+            EdgeKind::FunctionCall => "#22c55e",  // green
+            EdgeKind::MethodCall => "#14b8a6",    // teal
+            EdgeKind::TypeReference => "#f59e0b", // amber
+            EdgeKind::Inheritance => "#ef4444",   // red
+            EdgeKind::TraitImpl => "#a855f7",     // purple
+            EdgeKind::VariableUsage => "#64748b", // slate
         }
     }
 }

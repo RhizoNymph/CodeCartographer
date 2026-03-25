@@ -1,7 +1,7 @@
+mod edge;
 mod graph;
 mod node;
-mod edge;
 
+pub use edge::*;
 pub use graph::*;
 pub use node::*;
-pub use edge::*;

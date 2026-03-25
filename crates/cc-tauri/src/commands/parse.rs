@@ -7,16 +7,26 @@ use rayon::prelude::*;
 use tauri::command;
 use tauri::ipc::Channel;
 
+use crate::GraphState;
+
 #[command]
 pub async fn parse_repo(
     path: String,
-    graph_json: String,
     on_event: Channel<ParseEvent>,
+    state: tauri::State<'_, GraphState>,
 ) -> Result<CodeGraph, String> {
     let root = PathBuf::from(&path);
-    let mut graph: CodeGraph =
-        serde_json::from_str(&graph_json).map_err(|e| e.to_string())?;
-    graph.rebuild_adjacency();
+
+    // Take the graph from server-side state
+    let mut graph = {
+        let mut guard = state
+            .0
+            .lock()
+            .map_err(|e| format!("Lock poisoned: {}", e))?;
+        guard
+            .take()
+            .ok_or_else(|| "No graph in state. Run scan_repo first.".to_string())?
+    };
 
     let mut all_refs = Vec::new();
     let mut total_blocks = 0usize;
@@ -28,7 +38,9 @@ pub async fn parse_repo(
         .iter()
         .filter_map(|(id, node)| {
             if let CodeNode::File {
-                path, language: Some(lang), ..
+                path,
+                language: Some(lang),
+                ..
             } = node
             {
                 Some((id.clone(), path.clone(), lang.clone()))
@@ -56,7 +68,9 @@ pub async fn parse_repo(
 
     // Phase 2: Merge results and send progress events sequentially
     for (file_id, rel_path, result) in parse_results {
-        let _ = on_event.send(ParseEvent::FileStart { path: rel_path.clone() });
+        let _ = on_event.send(ParseEvent::FileStart {
+            path: rel_path.clone(),
+        });
         match result {
             Ok((nodes, refs)) => {
                 let block_count = nodes.len();
@@ -69,10 +83,16 @@ pub async fn parse_repo(
                     }
                 }
                 all_refs.extend(refs);
-                let _ = on_event.send(ParseEvent::FileDone { path: rel_path, blocks: block_count });
+                let _ = on_event.send(ParseEvent::FileDone {
+                    path: rel_path,
+                    blocks: block_count,
+                });
             }
             Err(e) => {
-                let _ = on_event.send(ParseEvent::Error { path: rel_path, message: e });
+                let _ = on_event.send(ParseEvent::Error {
+                    path: rel_path,
+                    message: e,
+                });
             }
         }
         total_files += 1;
@@ -105,27 +125,38 @@ pub async fn parse_repo(
     for edge in &edges {
         graph.add_edge(edge.clone());
     }
-    tracing::info!(
-        "Graph now has {} edges after adding",
-        graph.edges.len()
-    );
+    tracing::info!("Graph now has {} edges after adding", graph.edges.len());
 
     let _ = on_event.send(ParseEvent::Complete {
         total_files,
         total_blocks,
     });
 
+    // Store updated graph back in server-side state
+    {
+        let mut guard = state
+            .0
+            .lock()
+            .map_err(|e| format!("Lock poisoned: {}", e))?;
+        *guard = Some(graph.clone());
+    }
+
     Ok(graph)
 }
 
 #[command]
 pub async fn get_subgraph(
-    graph_json: String,
     visible_ids: Vec<String>,
     edge_kinds: Vec<String>,
+    state: tauri::State<'_, GraphState>,
 ) -> Result<SubGraph, String> {
-    let graph: CodeGraph =
-        serde_json::from_str(&graph_json).map_err(|e| e.to_string())?;
+    let guard = state
+        .0
+        .lock()
+        .map_err(|e| format!("Lock poisoned: {}", e))?;
+    let graph = guard
+        .as_ref()
+        .ok_or_else(|| "No graph in state. Run scan_repo first.".to_string())?;
 
     let visible: Vec<NodeId> = visible_ids.into_iter().map(NodeId).collect();
     let kinds: Vec<EdgeKind> = edge_kinds
@@ -142,5 +173,5 @@ pub async fn get_subgraph(
         })
         .collect();
 
-    Ok(SubGraph::from_graph(&graph, &visible, &kinds))
+    Ok(SubGraph::from_graph(graph, &visible, &kinds))
 }

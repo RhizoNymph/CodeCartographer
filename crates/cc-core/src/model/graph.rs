@@ -128,6 +128,100 @@ mod tests {
             .unwrap();
         assert_eq!(function_call.weight, 2);
     }
+
+    #[test]
+    fn test_add_1000_unique_edges() {
+        let mut graph = CodeGraph::new(NodeId("root".into()));
+        for i in 0..1000 {
+            graph.add_edge(CodeEdge {
+                source: NodeId(format!("src_{}", i)),
+                target: NodeId(format!("tgt_{}", i)),
+                kind: EdgeKind::FunctionCall,
+                weight: 1,
+            });
+        }
+        assert_eq!(graph.edge_count(), 1000);
+        assert_eq!(graph.edges.len(), 1000);
+    }
+
+    #[test]
+    fn test_edge_index_consistency() {
+        let mut graph = CodeGraph::new(NodeId("root".into()));
+
+        // Add 10 unique edges
+        for i in 0..10 {
+            graph.add_edge(CodeEdge {
+                source: NodeId(format!("a_{}", i)),
+                target: NodeId(format!("b_{}", i)),
+                kind: EdgeKind::Import,
+                weight: 1,
+            });
+        }
+
+        // Add 5 duplicates of existing edges
+        for i in 0..5 {
+            graph.add_edge(CodeEdge {
+                source: NodeId(format!("a_{}", i)),
+                target: NodeId(format!("b_{}", i)),
+                kind: EdgeKind::Import,
+                weight: 1,
+            });
+        }
+
+        // Add 3 edges with same endpoints but different kind
+        for i in 0..3 {
+            graph.add_edge(CodeEdge {
+                source: NodeId(format!("a_{}", i)),
+                target: NodeId(format!("b_{}", i)),
+                kind: EdgeKind::MethodCall,
+                weight: 1,
+            });
+        }
+
+        // 10 unique Import edges + 3 unique MethodCall edges = 13
+        assert_eq!(graph.edges.len(), 13);
+        assert_eq!(graph.edge_dedup.len(), 13);
+
+        // Verify the first 5 Import edges have weight 2 (original + duplicate)
+        for i in 0..5 {
+            let key = (
+                NodeId(format!("a_{}", i)),
+                NodeId(format!("b_{}", i)),
+                EdgeKind::Import,
+            );
+            let &idx = graph.edge_dedup.get(&key).unwrap();
+            assert_eq!(graph.edges[idx].weight, 2);
+        }
+
+        // Verify the last 5 Import edges have weight 1
+        for i in 5..10 {
+            let key = (
+                NodeId(format!("a_{}", i)),
+                NodeId(format!("b_{}", i)),
+                EdgeKind::Import,
+            );
+            let &idx = graph.edge_dedup.get(&key).unwrap();
+            assert_eq!(graph.edges[idx].weight, 1);
+        }
+    }
+
+    #[test]
+    fn test_add_edge_weight_accumulation() {
+        let mut graph = CodeGraph::new(NodeId("root".into()));
+
+        for _ in 0..5 {
+            graph.add_edge(CodeEdge {
+                source: NodeId("x".into()),
+                target: NodeId("y".into()),
+                kind: EdgeKind::FunctionCall,
+                weight: 1,
+            });
+        }
+
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.edges[0].weight, 5);
+        assert_eq!(graph.edge_dedup.len(), 1);
+    }
 }
 
 /// A filtered subgraph for frontend rendering.
