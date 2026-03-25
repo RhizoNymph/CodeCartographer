@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use cc_core::model::{CodeGraph, CodeNode, EdgeKind, Language, NodeId, SubGraph};
@@ -173,19 +174,7 @@ pub async fn get_subgraph(
         .ok_or_else(|| "No graph in state. Run scan_repo first.".to_string())?;
 
     let visible: Vec<NodeId> = visible_ids.into_iter().map(NodeId).collect();
-    let kinds: Vec<EdgeKind> = edge_kinds
-        .iter()
-        .filter_map(|k| match k.as_str() {
-            "Import" => Some(EdgeKind::Import),
-            "FunctionCall" => Some(EdgeKind::FunctionCall),
-            "MethodCall" => Some(EdgeKind::MethodCall),
-            "TypeReference" => Some(EdgeKind::TypeReference),
-            "Inheritance" => Some(EdgeKind::Inheritance),
-            "TraitImpl" => Some(EdgeKind::TraitImpl),
-            "VariableUsage" => Some(EdgeKind::VariableUsage),
-            _ => None,
-        })
-        .collect();
+    let kinds: HashSet<EdgeKind> = edge_kinds.into_iter().collect();
 
     Ok(SubGraph::from_graph(graph, &visible, &kinds))
 }

@@ -1,59 +1,52 @@
 Overview:
     description:
-        CodeCartographer is a Tauri desktop application that visualizes code structure
-        and dependencies as an interactive graph. It parses source code using Tree-sitter,
-        builds a hierarchical graph of files, directories, and code blocks, then renders
-        it using Pixi.js with ELK.js layout.
+        CodeCartographer is a Tauri desktop application (Rust backend + React/TypeScript frontend)
+        for visualizing code structure as interactive graphs. It scans a repository, parses source
+        files using tree-sitter, resolves references between code symbols, and renders the resulting
+        graph as an interactive canvas using Pixi.js with ELK layout.
 
     subsystems:
-        cc-core:
-            The core parsing engine and graph model. Contains the data model (CodeGraph,
-            CodeNode, CodeEdge), Tree-sitter parsing/extraction, repository scanning,
-            symbol resolution, and reference-to-edge conversion.
-
-        cc-tauri:
-            Bridge layer exposing cc-core as Tauri IPC commands. Manages server-side
-            graph state, orchestrates the scan/parse pipeline, and handles parallel
-            file parsing via rayon.
-
-        frontend (React/TypeScript):
-            React UI with Zustand state management, Pixi.js WebGL rendering, ELK.js
-            hierarchical layout, and a toolbar/sidebar for user interaction.
-
-        tauri-app (src-tauri):
-            Desktop application shell. Registers IPC commands, manages Tauri state
-            (GraphState, NoRestore flag), and configures plugins.
+        - cc-core (Rust): Core library containing the graph model (CodeGraph, CodeNode, CodeEdge),
+          file scanner, tree-sitter parser/extractor, and symbol resolver. Language-agnostic graph
+          operations and data structures.
+        - cc-tauri (Rust): Tauri command layer exposing parse_repo, get_subgraph, and scan_repo
+          commands over IPC. Orchestrates cc-core operations and sends progress events.
+        - packages/app (TypeScript/React): Frontend application with Pixi.js canvas rendering,
+          ELK graph layout, Zustand state stores, and toolbar UI.
 
     data_flow:
-        1. User selects a folder or clones a repo URL.
-        2. Frontend calls scan_repo -> cc-tauri -> RepoScanner -> CodeGraph (skeleton).
-        3. Graph stored in server-side GraphState.
-        4. Frontend calls parse_repo -> cc-tauri takes graph from state, parses files
-           in parallel with rayon, resolves references via SymbolTable, stores updated
-           graph back in state, returns full graph.
-        5. Frontend receives graph, computes ELK layout, renders with Pixi.js.
-        6. get_subgraph reads graph from state for filtered views.
+        1. User selects a repository path via the toolbar.
+        2. Frontend calls scan_repo (Tauri IPC) -> cc-tauri scans directory tree -> returns CodeGraph with Directory/File nodes.
+        3. Frontend calls parse_repo (Tauri IPC) -> cc-tauri parses each file with tree-sitter (parallel via rayon) -> extracts CodeBlock nodes and raw references -> resolves references into edges via SymbolTable -> returns enriched CodeGraph.
+        4. Frontend graphStore receives the CodeGraph, computes visibility/expansion state.
+        5. Canvas component passes graph + state to PixiRenderer.
+        6. PixiRenderer delegates to elkLayout for node positioning, then renders nodes and edges on the Pixi.js canvas.
+        7. User interactions (hover, select, expand, drag, zoom) update stores and trigger re-renders.
 
 Features Index:
-    server_side_graph_state:
-        description: Backend keeps the CodeGraph in managed Tauri state instead of
-                     requiring the frontend to pass the full graph JSON on every IPC call.
-        entry_points: [src-tauri/src/lib.rs, crates/cc-tauri/src/lib.rs]
-        depends_on: []
-        doc: docs/features/server_side_graph_state.md
+    canvas-rendering:
+        description: Interactive Pixi.js canvas with node rendering, edge drawing, minimap, drag, and LOD-based visibility.
+        entry_points: [packages/app/src/canvas/renderers/PixiRenderer.ts, packages/app/src/canvas/Canvas.tsx]
+        depends_on: [graph-layout]
+        doc: docs/features/canvas-rendering.md
 
-    edge_dedup:
-        description: O(1) edge deduplication using a HashMap index keyed by
-                     (source, target, kind). Duplicate edges increment weight instead
-                     of creating new entries.
-        entry_points: [crates/cc-core/src/model/graph.rs]
+    graph-layout:
+        description: ELK-based hierarchical graph layout with edge routing, aggregated edges for collapsed containers, and fallback layout.
+        entry_points: [packages/app/src/canvas/layout/elkLayout.ts]
         depends_on: []
-        doc: docs/features/edge_dedup.md
+        doc: docs/features/graph-layout.md
 
-    parallel_parsing:
-        description: File parsing is parallelized using rayon. Each file is read and
-                     parsed with Tree-sitter in parallel, then results are merged
-                     sequentially into the graph.
-        entry_points: [crates/cc-tauri/src/commands/parse.rs]
-        depends_on: [edge_dedup]
-        doc: docs/features/parallel_parsing.md
+    graph-model:
+        description: Rust data model for code graphs including nodes (Directory, File, CodeBlock), edges with kinds, adjacency indexes, and subgraph extraction.
+        entry_points: [crates/cc-core/src/model/graph.rs, crates/cc-core/src/model/edge.rs]
+        depends_on: []
+
+    parsing:
+        description: Tree-sitter based source code parsing, extracting code blocks and raw references from Python, TypeScript, JavaScript, and Rust files.
+        entry_points: [crates/cc-core/src/parser/extract.rs, crates/cc-tauri/src/commands/parse.rs]
+        depends_on: [graph-model]
+
+    state-management:
+        description: Zustand stores for graph state, viewport state, debug logging, and persistence.
+        entry_points: [packages/app/src/stores/graphStore.ts, packages/app/src/stores/viewportStore.ts, packages/app/src/stores/debugStore.ts]
+        depends_on: []

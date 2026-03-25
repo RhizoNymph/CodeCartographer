@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 
@@ -237,9 +237,9 @@ impl SubGraph {
     pub fn from_graph(
         graph: &CodeGraph,
         visible_ids: &[NodeId],
-        enabled_edge_kinds: &[EdgeKind],
+        enabled_edge_kinds: &HashSet<EdgeKind>,
     ) -> Self {
-        let visible_set: std::collections::HashSet<&NodeId> = visible_ids.iter().collect();
+        let visible_set: HashSet<&NodeId> = visible_ids.iter().collect();
 
         let nodes: Vec<CodeNode> = visible_ids
             .iter()
