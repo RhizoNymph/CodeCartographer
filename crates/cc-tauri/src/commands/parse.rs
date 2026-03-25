@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use cc_core::model::{CodeGraph, CodeNode, EdgeKind, Language, NodeId, SubGraph};
 use cc_core::parser::{Extractor, ParseEvent};
-use cc_core::resolver::SymbolTable;
+use cc_core::resolver::{ImportResolver, SymbolTable};
 use rayon::prelude::*;
 use tauri::command;
 use tauri::ipc::Channel;
@@ -14,8 +14,7 @@ pub async fn parse_repo(
     on_event: Channel<ParseEvent>,
 ) -> Result<CodeGraph, String> {
     let root = PathBuf::from(&path);
-    let mut graph: CodeGraph =
-        serde_json::from_str(&graph_json).map_err(|e| e.to_string())?;
+    let mut graph: CodeGraph = serde_json::from_str(&graph_json).map_err(|e| e.to_string())?;
     graph.rebuild_adjacency();
 
     let mut all_refs = Vec::new();
@@ -28,7 +27,9 @@ pub async fn parse_repo(
         .iter()
         .filter_map(|(id, node)| {
             if let CodeNode::File {
-                path, language: Some(lang), ..
+                path,
+                language: Some(lang),
+                ..
             } = node
             {
                 Some((id.clone(), path.clone(), lang.clone()))
@@ -56,9 +57,9 @@ pub async fn parse_repo(
 
     // Phase 2: Merge results and send progress events sequentially
     for (file_id, rel_path, result) in parse_results {
-        if let Err(e) = on_event.send(ParseEvent::FileStart { path: rel_path.clone() }) {
-            tracing::warn!(error = %e, "Failed to send parse event");
-        }
+        let _ = on_event.send(ParseEvent::FileStart {
+            path: rel_path.clone(),
+        });
         match result {
             Ok((nodes, refs)) => {
                 let block_count = nodes.len();
@@ -71,14 +72,16 @@ pub async fn parse_repo(
                     }
                 }
                 all_refs.extend(refs);
-                if let Err(e) = on_event.send(ParseEvent::FileDone { path: rel_path, blocks: block_count }) {
-                    tracing::warn!(error = %e, "Failed to send parse event");
-                }
+                let _ = on_event.send(ParseEvent::FileDone {
+                    path: rel_path,
+                    blocks: block_count,
+                });
             }
             Err(e) => {
-                if let Err(e) = on_event.send(ParseEvent::Error { path: rel_path, message: e }) {
-                    tracing::warn!(error = %e, "Failed to send parse event");
-                }
+                let _ = on_event.send(ParseEvent::Error {
+                    path: rel_path,
+                    message: e,
+                });
             }
         }
         total_files += 1;
@@ -111,10 +114,15 @@ pub async fn parse_repo(
     for edge in &edges {
         graph.add_edge(edge.clone());
     }
-    tracing::info!(
-        "Graph now has {} edges after adding",
-        graph.edges.len()
-    );
+
+    // Resolve import paths to file-level edges
+    let import_edges = ImportResolver::resolve(&graph, &all_refs);
+    tracing::info!("Resolved {} file-level import edges", import_edges.len());
+    for edge in &import_edges {
+        graph.add_edge(edge.clone());
+    }
+
+    tracing::info!("Graph now has {} edges after adding", graph.edges.len());
 
     if let Err(e) = on_event.send(ParseEvent::Complete {
         total_files,
@@ -126,14 +134,16 @@ pub async fn parse_repo(
     Ok(graph)
 }
 
+// TODO: get_subgraph is registered as a Tauri command but not yet called from the
+// frontend. It will become useful once server-side graph state is implemented so the
+// frontend can request filtered subgraphs without sending the full graph over IPC.
 #[command]
 pub async fn get_subgraph(
     graph_json: String,
     visible_ids: Vec<String>,
     edge_kinds: Vec<String>,
 ) -> Result<SubGraph, String> {
-    let graph: CodeGraph =
-        serde_json::from_str(&graph_json).map_err(|e| e.to_string())?;
+    let graph: CodeGraph = serde_json::from_str(&graph_json).map_err(|e| e.to_string())?;
 
     let visible: Vec<NodeId> = visible_ids.into_iter().map(NodeId).collect();
     let kinds: Vec<EdgeKind> = edge_kinds
