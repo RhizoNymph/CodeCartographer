@@ -7,15 +7,26 @@ use rayon::prelude::*;
 use tauri::command;
 use tauri::ipc::Channel;
 
+use crate::GraphState;
+
 #[command]
 pub async fn parse_repo(
     path: String,
-    graph_json: String,
     on_event: Channel<ParseEvent>,
+    state: tauri::State<'_, GraphState>,
 ) -> Result<CodeGraph, String> {
     let root = PathBuf::from(&path);
-    let mut graph: CodeGraph = serde_json::from_str(&graph_json).map_err(|e| e.to_string())?;
-    graph.rebuild_adjacency();
+
+    // Take the graph from server-side state
+    let mut graph = {
+        let mut guard = state
+            .0
+            .lock()
+            .map_err(|e| format!("Lock poisoned: {}", e))?;
+        guard
+            .take()
+            .ok_or_else(|| "No graph in state. Run scan_repo first.".to_string())?
+    };
 
     let mut all_refs = Vec::new();
     let mut total_blocks = 0usize;
@@ -114,6 +125,7 @@ pub async fn parse_repo(
     for edge in &edges {
         graph.add_edge(edge.clone());
     }
+    tracing::info!("Graph now has {} edges after adding", graph.edges.len());
 
     // Resolve import paths to file-level edges
     let import_edges = ImportResolver::resolve(&graph, &all_refs);
@@ -131,6 +143,15 @@ pub async fn parse_repo(
         tracing::warn!(error = %e, "Failed to send parse event");
     }
 
+    // Store updated graph back in server-side state
+    {
+        let mut guard = state
+            .0
+            .lock()
+            .map_err(|e| format!("Lock poisoned: {}", e))?;
+        *guard = Some(graph.clone());
+    }
+
     Ok(graph)
 }
 
@@ -139,11 +160,17 @@ pub async fn parse_repo(
 // frontend can request filtered subgraphs without sending the full graph over IPC.
 #[command]
 pub async fn get_subgraph(
-    graph_json: String,
     visible_ids: Vec<String>,
     edge_kinds: Vec<String>,
+    state: tauri::State<'_, GraphState>,
 ) -> Result<SubGraph, String> {
-    let graph: CodeGraph = serde_json::from_str(&graph_json).map_err(|e| e.to_string())?;
+    let guard = state
+        .0
+        .lock()
+        .map_err(|e| format!("Lock poisoned: {}", e))?;
+    let graph = guard
+        .as_ref()
+        .ok_or_else(|| "No graph in state. Run scan_repo first.".to_string())?;
 
     let visible: Vec<NodeId> = visible_ids.into_iter().map(NodeId).collect();
     let kinds: Vec<EdgeKind> = edge_kinds
@@ -160,5 +187,5 @@ pub async fn get_subgraph(
         })
         .collect();
 
-    Ok(SubGraph::from_graph(&graph, &visible, &kinds))
+    Ok(SubGraph::from_graph(graph, &visible, &kinds))
 }

@@ -1,7 +1,7 @@
-mod scan;
-mod parse;
 mod clone;
+mod parse;
+mod scan;
 
-pub use scan::*;
-pub use parse::*;
 pub use clone::*;
+pub use parse::*;
+pub use scan::*;

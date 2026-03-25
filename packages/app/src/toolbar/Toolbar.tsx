@@ -49,7 +49,6 @@ export function Toolbar() {
         setIsParsing(true);
         const parsedGraph = await parseRepo(
           path,
-          scannedGraph,
           handleParseEvent
         );
         setGraph(parsedGraph);

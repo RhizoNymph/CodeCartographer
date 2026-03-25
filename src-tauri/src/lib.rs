@@ -1,4 +1,5 @@
 use cc_tauri::commands;
+use cc_tauri::GraphState;
 
 struct NoRestore(bool);
 
@@ -13,6 +14,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .manage(NoRestore(norestore))
+        .manage(GraphState::default())
         .invoke_handler(tauri::generate_handler![
             commands::scan_repo,
             commands::parse_repo,
