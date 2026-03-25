@@ -77,10 +77,15 @@ pub struct CodeGraph {
     pub nodes: HashMap<NodeId, CodeNode>,
     pub edges: Vec<CodeEdge>,
     pub root: NodeId,
-    pub forward_adj: HashMap<NodeId, Vec<(NodeId, usize)>>,  // Skip serialization
-    pub reverse_adj: HashMap<NodeId, Vec<(NodeId, usize)>>,  // Skip serialization
+    pub forward_adj: HashMap<NodeId, Vec<(NodeId, usize)>>,           // Skip serialization
+    pub reverse_adj: HashMap<NodeId, Vec<(NodeId, usize)>>,           // Skip serialization
+    pub edge_dedup: HashMap<(NodeId, NodeId, EdgeKind), usize>,       // Skip serialization
 }
 ```
+
+The `edge_dedup` field provides O(1) edge deduplication. When `add_edge()` is called with
+an edge that matches an existing (source, target, kind) triple, the weight is incremented
+instead of creating a duplicate entry.
 
 Methods: `add_node()`, `add_edge()`, `node()`, `node_count()`, `edge_count()`, `rebuild_adjacency()`
 
@@ -186,26 +191,19 @@ SymbolTable::resolve_references(refs) -> Vec<CodeEdge>
 
 Stores both simple names (`foo`) and qualified names (`path/file.rs::foo`).
 
+`resolve_references` applies name normalization before symbol lookup:
+- **FunctionCall/MethodCall**: strips method receiver (`foo.bar()` -> `bar`) and module path (`module::func` -> `func`)
+- **TypeReference/Inheritance/TraitImpl**: strips generic parameters (`Foo<Bar>` -> `Foo`) and path prefix (`std::vec::Vec` -> `Vec`)
+- Falls back to the original qualified name for type references if the simplified name doesn't match
+
 ### ImportResolver
 
-Resolves import statements to target files:
+Resolves import statements to file-level edges:
 - Handles relative imports (`./`, `../`)
 - Python dotted imports (`foo.bar.baz`)
 - Rust crate imports (`crate::module::item`)
 - Tries multiple extensions (`.ts`, `.tsx`, `.js`, `.py`, `.rs`)
-
-### CallResolver
-
-Resolves function/method calls to definitions:
-- Strips method receiver: `foo.bar()` → `bar`
-- Strips module path: `module::func` → `func`
-- Looks up in SymbolTable
-
-### TypeResolver
-
-Resolves type references, inheritance, trait implementations:
-- Strips generic parameters: `Foo<Bar>` → `Foo`
-- Strips path prefix: `std::vec::Vec` → `Vec`
+- Creates file-to-file Import edges (separate from the symbol-level edges from `SymbolTable`)
 
 ## Typical Workflow
 
@@ -223,11 +221,15 @@ for file in graph.files() {
 // 3. Build symbol table
 let symbols = SymbolTable::build_from_graph(&graph);
 
-// 4. Resolve references
+// 4. Resolve symbol references (with name normalization)
 let edges = symbols.resolve_references(&all_refs);
 // Add edges to graph
 
-// 5. Filter for rendering
+// 5. Resolve file-level import edges
+let import_edges = ImportResolver::resolve(&graph, &all_refs);
+// Add import edges to graph
+
+// 6. Filter for rendering
 let subgraph = SubGraph::from_graph(&graph, &visible_ids, &edge_kinds);
 ```
 

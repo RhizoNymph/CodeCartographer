@@ -1,9 +1,5 @@
 // Types matching the Rust data model
 
-export interface NodeId {
-  id: string;
-}
-
 export interface Span {
   start_line: number;
   start_col: number;

@@ -2,16 +2,31 @@
 
 Bridge layer exposing cc-core functionality as Tauri IPC commands.
 
+## Server-side Graph State
+
+The `GraphState` type wraps a `Mutex<Option<CodeGraph>>` and is registered as Tauri managed state. This eliminates the need to serialize the full graph over IPC for every command:
+
+- `scan_repo` creates the initial graph and stores it in state
+- `parse_repo` takes the graph from state, parses, stores it back, and returns it
+- `get_subgraph` reads the graph from state without needing it passed over IPC
+
+```rust
+pub struct GraphState(pub Mutex<Option<CodeGraph>>);
+```
+
 ## Commands
 
 ### scan_repo
 
 ```rust
 #[command]
-pub async fn scan_repo(path: String) -> Result<CodeGraph, String>
+pub async fn scan_repo(
+    path: String,
+    state: tauri::State<'_, GraphState>,
+) -> Result<CodeGraph, String>
 ```
 
-Discovers directory structure and files in a repository.
+Discovers directory structure and files in a repository. Stores the result in server-side state.
 
 **Parameters:**
 - `path` - Absolute filesystem path to repository
@@ -29,16 +44,17 @@ Discovers directory structure and files in a repository.
 #[command]
 pub async fn parse_repo(
     path: String,
-    graph_json: String,
     on_event: Channel<ParseEvent>,
+    state: tauri::State<'_, GraphState>,
 ) -> Result<CodeGraph, String>
 ```
 
 Parses source code, extracts code blocks, and resolves references into edges.
+Reads the graph from server-side state (set by `scan_repo`), parses files in parallel
+using rayon, and stores the updated graph back in state.
 
 **Parameters:**
 - `path` - Repository root path
-- `graph_json` - Serialized CodeGraph from `scan_repo`
 - `on_event` - Streaming channel for progress events
 
 **Streaming Events:**
@@ -58,16 +74,16 @@ enum ParseEvent {
 ```rust
 #[command]
 pub async fn get_subgraph(
-    graph_json: String,
     visible_ids: Vec<String>,
     edge_kinds: Vec<String>,
+    state: tauri::State<'_, GraphState>,
 ) -> Result<SubGraph, String>
 ```
 
 Filters graph to visible nodes and selected edge types.
+Reads the graph from server-side state.
 
 **Parameters:**
-- `graph_json` - Full CodeGraph
 - `visible_ids` - Node IDs to include
 - `edge_kinds` - Edge types to include (e.g., `["Import", "FunctionCall"]`)
 
@@ -101,24 +117,31 @@ Frontend
     ├─ invoke("scan_repo", { path })
     │       ↓
     │   RepoScanner::scan()
+    │   Store graph in GraphState
     │       ↓
     │   Returns CodeGraph (skeleton)
     │
-    ├─ invoke("parse_repo", { path, graphJson, onEvent })
+    ├─ invoke("parse_repo", { path, onEvent })
     │       ↓
-    │   For each file:
-    │     ├─ Send FileStart
+    │   Take graph from GraphState
+    │   For each file (parallel via rayon):
+    │     ├─ Read source file
     │     ├─ Extractor::extract_file()
+    │   Merge results sequentially:
+    │     ├─ Send FileStart
+    │     ├─ Add nodes to graph
     │     ├─ Send FileDone
     │       ↓
     │   SymbolTable::build_from_graph()
     │   SymbolTable::resolve_references()
+    │   Store graph in GraphState
     │       ↓
     │   Send Complete
     │   Returns CodeGraph (full)
     │
-    └─ invoke("get_subgraph", { graphJson, visibleIds, edgeKinds })
+    └─ invoke("get_subgraph", { visibleIds, edgeKinds })
             ↓
+        Read graph from GraphState
         SubGraph::from_graph()
             ↓
         Returns SubGraph
@@ -134,11 +157,15 @@ All data passes through JSON via serde:
 - Tauri serializes result to JSON
 - Frontend receives as TypeScript object
 
+**Server-side state:** The graph is kept in memory on the backend via `GraphState`.
+Commands read/write it directly, avoiding repeated JSON serialization of the full graph.
+
 **Skipped fields** (not serialized):
 - `CodeGraph.forward_adj`
 - `CodeGraph.reverse_adj`
+- `CodeGraph.edge_dedup`
 
-These adjacency indexes are rebuilt after deserialization.
+These indexes are rebuilt after deserialization via `rebuild_adjacency()`.
 
 ## Error Handling
 
@@ -161,25 +188,21 @@ export async function scanRepo(path: string): Promise<CodeGraph> {
 
 export async function parseRepo(
   path: string,
-  graph: CodeGraph,
   onEvent: (event: ParseEvent) => void
 ): Promise<CodeGraph> {
   const channel = new Channel<ParseEvent>();
   channel.onmessage = onEvent;
   return invoke("parse_repo", {
     path,
-    graphJson: JSON.stringify(graph),
     onEvent: channel,
   });
 }
 
 export async function getSubgraph(
-  graph: CodeGraph,
   visibleIds: string[],
   edgeKinds: string[]
 ): Promise<SubGraph> {
   return invoke("get_subgraph", {
-    graphJson: JSON.stringify(graph),
     visibleIds,
     edgeKinds,
   });
@@ -190,6 +213,10 @@ export async function cloneGithubRepo(url: string): Promise<string> {
 }
 ```
 
+Note: The graph is no longer passed from the frontend to `parseRepo` or `getSubgraph`.
+The backend maintains the graph in server-side state, eliminating the overhead of
+serializing the full graph to JSON for each IPC call.
+
 ## Dependencies
 
 | Crate | Purpose |
@@ -198,3 +225,4 @@ export async function cloneGithubRepo(url: string): Promise<string> {
 | tauri | Tauri framework |
 | serde/serde_json | Serialization |
 | tracing | Logging |
+| rayon | Parallel file parsing |
