@@ -485,3 +485,488 @@ impl Extractor {
         find_last_ident(node, source)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{BlockKind, Language, Visibility};
+
+    // ── Helpers ──────────────────────────────────────────────────────
+
+    fn extract(source: &str, lang: &Language) -> (Vec<CodeNode>, Vec<RawReference>) {
+        Extractor::extract_file("test.file", source, lang).expect("extraction should succeed")
+    }
+
+    fn find_block<'a>(nodes: &'a [CodeNode], name: &str) -> &'a CodeNode {
+        nodes
+            .iter()
+            .find(|n| {
+                if let CodeNode::CodeBlock { name: n_name, .. } = n {
+                    n_name == name
+                } else {
+                    false
+                }
+            })
+            .unwrap_or_else(|| panic!("no code block named '{}'", name))
+    }
+
+    fn find_block_by_kind<'a>(nodes: &'a [CodeNode], kind: &BlockKind) -> &'a CodeNode {
+        nodes
+            .iter()
+            .find(|n| {
+                if let CodeNode::CodeBlock { kind: k, .. } = n {
+                    k == kind
+                } else {
+                    false
+                }
+            })
+            .unwrap_or_else(|| panic!("no code block with kind {:?}", kind))
+    }
+
+    // ── Python tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_python_function() {
+        let (nodes, _) = extract("def foo(): pass", &Language::Python);
+        let block = find_block(&nodes, "foo");
+        if let CodeNode::CodeBlock { kind, name, .. } = block {
+            assert_eq!(*kind, BlockKind::Function);
+            assert_eq!(name, "foo");
+        } else {
+            panic!("expected CodeBlock");
+        }
+    }
+
+    #[test]
+    fn test_extract_python_class() {
+        let (nodes, _) = extract("class Foo:\n    pass", &Language::Python);
+        let block = find_block(&nodes, "Foo");
+        if let CodeNode::CodeBlock { kind, name, .. } = block {
+            assert_eq!(*kind, BlockKind::Class);
+            assert_eq!(name, "Foo");
+        } else {
+            panic!("expected CodeBlock");
+        }
+    }
+
+    #[test]
+    fn test_extract_python_private_function() {
+        let (nodes, _) = extract("def _private(): pass", &Language::Python);
+        let block = find_block(&nodes, "_private");
+        if let CodeNode::CodeBlock { visibility, .. } = block {
+            assert_eq!(*visibility, Some(Visibility::Private));
+        } else {
+            panic!("expected CodeBlock");
+        }
+    }
+
+    #[test]
+    fn test_extract_python_imports() {
+        // Import statements inside a function body are collected as references
+        // (collect_references only runs on subtrees of classified code blocks)
+        let source = "def setup():\n    import os\n    from os import path";
+        let (_, refs) = extract(source, &Language::Python);
+        let import_refs: Vec<_> = refs
+            .iter()
+            .filter(|r| matches!(&r.kind, RawRefKind::Import { .. }))
+            .collect();
+        assert!(
+            !import_refs.is_empty(),
+            "expected at least one import reference inside function"
+        );
+
+        // Top-level imports are not inside any code block, so they are NOT collected
+        let source_top = "import os\nfrom os import path";
+        let (_, refs_top) = extract(source_top, &Language::Python);
+        let top_imports: Vec<_> = refs_top
+            .iter()
+            .filter(|r| matches!(&r.kind, RawRefKind::Import { .. }))
+            .collect();
+        assert!(
+            top_imports.is_empty(),
+            "top-level imports produce no refs (no enclosing code block)"
+        );
+    }
+
+    #[test]
+    fn test_extract_python_function_calls() {
+        let source = "def foo():\n    bar()";
+        let (nodes, refs) = extract(source, &Language::Python);
+        // Should have a function "foo"
+        assert!(!nodes.is_empty());
+        // Should have a FunctionCall reference to "bar"
+        let call_refs: Vec<_> = refs
+            .iter()
+            .filter(|r| matches!(r.kind, RawRefKind::FunctionCall) && r.name == "bar")
+            .collect();
+        assert!(
+            !call_refs.is_empty(),
+            "expected FunctionCall reference for 'bar'"
+        );
+    }
+
+    #[test]
+    fn test_extract_python_nested_class_method() {
+        let source = "class Foo:\n    def bar(self):\n        pass";
+        let (nodes, _) = extract(source, &Language::Python);
+
+        let class_block = find_block(&nodes, "Foo");
+        let method_block = find_block(&nodes, "bar");
+
+        let class_id = if let CodeNode::CodeBlock { id, .. } = class_block {
+            id.clone()
+        } else {
+            panic!("expected CodeBlock");
+        };
+
+        if let CodeNode::CodeBlock { parent, .. } = method_block {
+            assert_eq!(
+                *parent, class_id,
+                "method's parent should be the class block"
+            );
+        } else {
+            panic!("expected CodeBlock");
+        }
+    }
+
+    // ── TypeScript tests ─────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_ts_function() {
+        let (nodes, _) = extract("function foo() {}", &Language::TypeScript);
+        let block = find_block(&nodes, "foo");
+        if let CodeNode::CodeBlock { kind, .. } = block {
+            assert_eq!(*kind, BlockKind::Function);
+        } else {
+            panic!("expected CodeBlock");
+        }
+    }
+
+    #[test]
+    fn test_extract_ts_class() {
+        let (nodes, _) = extract("class Foo {}", &Language::TypeScript);
+        let block = find_block(&nodes, "Foo");
+        if let CodeNode::CodeBlock { kind, .. } = block {
+            assert_eq!(*kind, BlockKind::Class);
+        } else {
+            panic!("expected CodeBlock");
+        }
+    }
+
+    #[test]
+    fn test_extract_ts_interface() {
+        let (nodes, _) = extract("interface Foo {}", &Language::TypeScript);
+        let block = find_block(&nodes, "Foo");
+        if let CodeNode::CodeBlock { kind, .. } = block {
+            assert_eq!(*kind, BlockKind::Interface);
+        } else {
+            panic!("expected CodeBlock");
+        }
+    }
+
+    #[test]
+    fn test_extract_ts_type_alias() {
+        let (nodes, _) = extract("type Foo = string", &Language::TypeScript);
+        let block = find_block(&nodes, "Foo");
+        if let CodeNode::CodeBlock { kind, .. } = block {
+            assert_eq!(*kind, BlockKind::TypeAlias);
+        } else {
+            panic!("expected CodeBlock");
+        }
+    }
+
+    #[test]
+    fn test_extract_ts_enum() {
+        let (nodes, _) = extract("enum Foo {}", &Language::TypeScript);
+        let block = find_block(&nodes, "Foo");
+        if let CodeNode::CodeBlock { kind, .. } = block {
+            assert_eq!(*kind, BlockKind::Enum);
+        } else {
+            panic!("expected CodeBlock");
+        }
+    }
+
+    #[test]
+    fn test_extract_ts_arrow_function() {
+        let (nodes, _) = extract("const foo = () => {}", &Language::TypeScript);
+        let block = find_block(&nodes, "foo");
+        if let CodeNode::CodeBlock { kind, name, .. } = block {
+            assert_eq!(*kind, BlockKind::Function);
+            assert_eq!(name, "foo");
+        } else {
+            panic!("expected CodeBlock");
+        }
+    }
+
+    #[test]
+    fn test_extract_ts_imports() {
+        // Top-level import statements are not inside any code block, so the
+        // extractor does not collect them as references (collect_references only
+        // runs for subtrees of classified blocks). Verify this expected behavior:
+        let source_top = "import { foo } from './bar'";
+        let (_, refs_top) = extract(source_top, &Language::TypeScript);
+        let top_imports: Vec<_> = refs_top
+            .iter()
+            .filter(|r| matches!(&r.kind, RawRefKind::Import { .. }))
+            .collect();
+        // Top-level imports produce no refs in current implementation
+        assert!(
+            top_imports.is_empty(),
+            "top-level imports are not collected as refs (no enclosing code block)"
+        );
+
+        // However, require() inside a function IS a call_expression
+        // and gets collected as a FunctionCall ref:
+        let source_dyn = "function loader() { require('./bar') }";
+        let (_, refs_dyn) = extract(source_dyn, &Language::TypeScript);
+        let call_refs: Vec<_> = refs_dyn
+            .iter()
+            .filter(|r| matches!(r.kind, RawRefKind::FunctionCall))
+            .collect();
+        assert!(
+            !call_refs.is_empty(),
+            "require() inside a function should produce a FunctionCall ref"
+        );
+    }
+
+    #[test]
+    fn test_extract_ts_call_expression() {
+        let source = "function foo() { bar() }";
+        let (_, refs) = extract(source, &Language::TypeScript);
+        let call_refs: Vec<_> = refs
+            .iter()
+            .filter(|r| matches!(r.kind, RawRefKind::FunctionCall) && r.name == "bar")
+            .collect();
+        assert!(
+            !call_refs.is_empty(),
+            "expected FunctionCall reference for 'bar'"
+        );
+    }
+
+    // ── Rust tests ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_rust_function() {
+        let (nodes, _) = extract("fn foo() {}", &Language::Rust);
+        let block = find_block(&nodes, "foo");
+        if let CodeNode::CodeBlock { kind, .. } = block {
+            assert_eq!(*kind, BlockKind::Function);
+        } else {
+            panic!("expected CodeBlock");
+        }
+    }
+
+    #[test]
+    fn test_extract_rust_pub_function() {
+        let (nodes, _) = extract("pub fn foo() {}", &Language::Rust);
+        let block = find_block(&nodes, "foo");
+        if let CodeNode::CodeBlock { visibility, .. } = block {
+            assert_eq!(*visibility, Some(Visibility::Public));
+        } else {
+            panic!("expected CodeBlock");
+        }
+    }
+
+    #[test]
+    fn test_extract_rust_struct() {
+        let (nodes, _) = extract("struct Foo {}", &Language::Rust);
+        let block = find_block(&nodes, "Foo");
+        if let CodeNode::CodeBlock { kind, .. } = block {
+            assert_eq!(*kind, BlockKind::Struct);
+        } else {
+            panic!("expected CodeBlock");
+        }
+    }
+
+    #[test]
+    fn test_extract_rust_enum() {
+        let (nodes, _) = extract("enum Foo {}", &Language::Rust);
+        let block = find_block(&nodes, "Foo");
+        if let CodeNode::CodeBlock { kind, .. } = block {
+            assert_eq!(*kind, BlockKind::Enum);
+        } else {
+            panic!("expected CodeBlock");
+        }
+    }
+
+    #[test]
+    fn test_extract_rust_trait() {
+        let (nodes, _) = extract("trait Foo {}", &Language::Rust);
+        let block = find_block(&nodes, "Foo");
+        if let CodeNode::CodeBlock { kind, .. } = block {
+            assert_eq!(*kind, BlockKind::Trait);
+        } else {
+            panic!("expected CodeBlock");
+        }
+    }
+
+    #[test]
+    fn test_extract_rust_impl() {
+        let (nodes, _) = extract("impl Foo { fn bar() {} }", &Language::Rust);
+        let impl_block = find_block_by_kind(&nodes, &BlockKind::Impl);
+        if let CodeNode::CodeBlock { name, kind, .. } = impl_block {
+            assert_eq!(*kind, BlockKind::Impl);
+            assert!(
+                name.contains("Foo"),
+                "impl block name should contain 'Foo', got '{}'",
+                name
+            );
+        } else {
+            panic!("expected CodeBlock");
+        }
+    }
+
+    #[test]
+    fn test_extract_rust_trait_impl() {
+        let (nodes, _) = extract("impl Trait for Foo {}", &Language::Rust);
+        let impl_block = find_block_by_kind(&nodes, &BlockKind::Impl);
+        if let CodeNode::CodeBlock { name, .. } = impl_block {
+            assert!(
+                name.contains("Trait for Foo"),
+                "trait impl name should contain 'Trait for Foo', got '{}'",
+                name
+            );
+        } else {
+            panic!("expected CodeBlock");
+        }
+    }
+
+    #[test]
+    fn test_extract_rust_mod() {
+        let (nodes, _) = extract("mod foo {}", &Language::Rust);
+        let block = find_block(&nodes, "foo");
+        if let CodeNode::CodeBlock { kind, .. } = block {
+            assert_eq!(*kind, BlockKind::Module);
+        } else {
+            panic!("expected CodeBlock");
+        }
+    }
+
+    #[test]
+    fn test_extract_rust_const() {
+        let (nodes, _) = extract("const FOO: i32 = 1;", &Language::Rust);
+        let block = find_block(&nodes, "FOO");
+        if let CodeNode::CodeBlock { kind, .. } = block {
+            assert_eq!(*kind, BlockKind::Constant);
+        } else {
+            panic!("expected CodeBlock");
+        }
+    }
+
+    #[test]
+    fn test_extract_rust_type_alias() {
+        let (nodes, _) = extract("type Foo = Bar;", &Language::Rust);
+        let block = find_block(&nodes, "Foo");
+        if let CodeNode::CodeBlock { kind, .. } = block {
+            assert_eq!(*kind, BlockKind::TypeAlias);
+        } else {
+            panic!("expected CodeBlock");
+        }
+    }
+
+    #[test]
+    fn test_extract_rust_use() {
+        // use declarations inside a module or function body are collected
+        let source = "mod setup {\n    use std::collections::HashMap;\n}";
+        let (_, refs) = extract(source, &Language::Rust);
+        let import_refs: Vec<_> = refs
+            .iter()
+            .filter(|r| matches!(&r.kind, RawRefKind::Import { .. }))
+            .collect();
+        assert!(
+            !import_refs.is_empty(),
+            "expected at least one import reference inside mod"
+        );
+        // The extracted name should be "HashMap" (last identifier in use path)
+        assert!(
+            import_refs.iter().any(|r| r.name == "HashMap"),
+            "expected import ref with name 'HashMap'"
+        );
+
+        // Top-level use declarations produce no refs (no enclosing code block)
+        let source_top = "use std::collections::HashMap;";
+        let (_, refs_top) = extract(source_top, &Language::Rust);
+        let top_imports: Vec<_> = refs_top
+            .iter()
+            .filter(|r| matches!(&r.kind, RawRefKind::Import { .. }))
+            .collect();
+        assert!(
+            top_imports.is_empty(),
+            "top-level use produces no refs (no enclosing code block)"
+        );
+    }
+
+    #[test]
+    fn test_extract_rust_call() {
+        let source = "fn foo() { bar(); }";
+        let (_, refs) = extract(source, &Language::Rust);
+        let call_refs: Vec<_> = refs
+            .iter()
+            .filter(|r| matches!(r.kind, RawRefKind::FunctionCall) && r.name == "bar")
+            .collect();
+        assert!(
+            !call_refs.is_empty(),
+            "expected FunctionCall reference for 'bar'"
+        );
+    }
+
+    // ── Edge cases ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_extract_empty_file() {
+        for lang in &[
+            Language::Python,
+            Language::TypeScript,
+            Language::JavaScript,
+            Language::Rust,
+        ] {
+            let (nodes, refs) = extract("", lang);
+            assert!(
+                nodes.is_empty(),
+                "empty source for {:?} should produce no nodes",
+                lang
+            );
+            assert!(
+                refs.is_empty(),
+                "empty source for {:?} should produce no refs",
+                lang
+            );
+        }
+    }
+
+    #[test]
+    fn test_extract_signature() {
+        // Python function: signature should be the first line
+        let (nodes, _) = extract("def foo():\n    pass", &Language::Python);
+        let block = find_block(&nodes, "foo");
+        if let CodeNode::CodeBlock { signature, .. } = block {
+            let sig = signature.as_ref().expect("signature should be present");
+            assert_eq!(sig, "def foo():");
+        } else {
+            panic!("expected CodeBlock");
+        }
+
+        // Rust function
+        let (nodes, _) = extract("fn bar() {\n    42\n}", &Language::Rust);
+        let block = find_block(&nodes, "bar");
+        if let CodeNode::CodeBlock { signature, .. } = block {
+            let sig = signature.as_ref().expect("signature should be present");
+            assert_eq!(sig, "fn bar() {");
+        } else {
+            panic!("expected CodeBlock");
+        }
+
+        // TypeScript function
+        let (nodes, _) = extract(
+            "function baz() {\n    return 1;\n}",
+            &Language::TypeScript,
+        );
+        let block = find_block(&nodes, "baz");
+        if let CodeNode::CodeBlock { signature, .. } = block {
+            let sig = signature.as_ref().expect("signature should be present");
+            assert_eq!(sig, "function baz() {");
+        } else {
+            panic!("expected CodeBlock");
+        }
+    }
+}
