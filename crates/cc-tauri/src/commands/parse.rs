@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use cc_core::model::{CodeGraph, CodeNode, EdgeKind, Language, NodeId, SubGraph};
 use cc_core::parser::{Extractor, ParseEvent};
-use cc_core::resolver::SymbolTable;
+use cc_core::resolver::{ImportResolver, SymbolTable};
 use rayon::prelude::*;
 use tauri::command;
 use tauri::ipc::Channel;
@@ -127,10 +127,21 @@ pub async fn parse_repo(
     }
     tracing::info!("Graph now has {} edges after adding", graph.edges.len());
 
-    let _ = on_event.send(ParseEvent::Complete {
+    // Resolve import paths to file-level edges
+    let import_edges = ImportResolver::resolve(&graph, &all_refs);
+    tracing::info!("Resolved {} file-level import edges", import_edges.len());
+    for edge in &import_edges {
+        graph.add_edge(edge.clone());
+    }
+
+    tracing::info!("Graph now has {} edges after adding", graph.edges.len());
+
+    if let Err(e) = on_event.send(ParseEvent::Complete {
         total_files,
         total_blocks,
-    });
+    }) {
+        tracing::warn!(error = %e, "Failed to send parse event");
+    }
 
     // Store updated graph back in server-side state
     {
@@ -144,6 +155,9 @@ pub async fn parse_repo(
     Ok(graph)
 }
 
+// TODO: get_subgraph is registered as a Tauri command but not yet called from the
+// frontend. It will become useful once server-side graph state is implemented so the
+// frontend can request filtered subgraphs without sending the full graph over IPC.
 #[command]
 pub async fn get_subgraph(
     visible_ids: Vec<String>,

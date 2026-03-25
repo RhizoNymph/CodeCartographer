@@ -58,8 +58,12 @@ impl Extractor {
                 let lang = tree_sitter_python::LANGUAGE;
                 parser.set_language(&lang.into())?;
             }
-            Language::TypeScript | Language::JavaScript => {
+            Language::TypeScript => {
                 let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT;
+                parser.set_language(&lang.into())?;
+            }
+            Language::JavaScript => {
+                let lang = tree_sitter_javascript::LANGUAGE;
                 parser.set_language(&lang.into())?;
             }
             Language::Rust => {
@@ -322,7 +326,7 @@ impl Extractor {
         refs: &mut Vec<RawReference>,
     ) {
         // Use a stack-based traversal to avoid issues with cursor invalidation
-        let mut stack = vec![node.clone()];
+        let mut stack = vec![*node];
 
         while let Some(current) = stack.pop() {
             let kind = current.kind();

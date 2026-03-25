@@ -56,8 +56,8 @@ function loadEdgeLODSettings(): EdgeLODSettings {
         hideAtOverview: new Set<EdgeKind>(parsed.hideAtOverview ?? Array.from(DEFAULT_EDGE_LOD_SETTINGS.hideAtOverview)),
       };
     }
-  } catch {
-    // Ignore parse errors
+  } catch (e) {
+    console.warn("Failed to load edge LOD settings:", e);
   }
   return { ...DEFAULT_EDGE_LOD_SETTINGS };
 }
@@ -71,8 +71,8 @@ function saveEdgeLODSettings(settings: EdgeLODSettings) {
       showEdgesInMinimap: settings.showEdgesInMinimap,
       hideAtOverview: Array.from(settings.hideAtOverview),
     }));
-  } catch {
-    // Ignore storage errors
+  } catch (e) {
+    console.warn("Failed to save edge LOD settings:", e);
   }
 }
 
