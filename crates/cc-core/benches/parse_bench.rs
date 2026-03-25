@@ -312,7 +312,11 @@ fn bench_full_pipeline(c: &mut Criterion) {
         let sources: Vec<(String, &str, Language)> = (0..n)
             .map(|i| match i % 3 {
                 0 => (format!("src/mod_{i}.py"), PYTHON_SOURCE, Language::Python),
-                1 => (format!("src/mod_{i}.ts"), TYPESCRIPT_SOURCE, Language::TypeScript),
+                1 => (
+                    format!("src/mod_{i}.ts"),
+                    TYPESCRIPT_SOURCE,
+                    Language::TypeScript,
+                ),
                 _ => (format!("src/mod_{i}.rs"), RUST_SOURCE, Language::Rust),
             })
             .collect();

@@ -9,10 +9,7 @@ pub struct ImportResolver;
 
 impl ImportResolver {
     /// Resolve import references into CodeEdges.
-    pub fn resolve(
-        graph: &CodeGraph,
-        refs: &[RawReference],
-    ) -> Vec<CodeEdge> {
+    pub fn resolve(graph: &CodeGraph, refs: &[RawReference]) -> Vec<CodeEdge> {
         let mut edges = Vec::new();
 
         // Build a map of file paths to NodeIds for fast lookup
@@ -36,11 +33,9 @@ impl ImportResolver {
                 // Try to resolve the import path
                 let from_file = Self::get_file_of_node(graph, &raw_ref.from_node);
 
-                if let Some(target_id) = Self::resolve_import_path(
-                    module_path,
-                    &from_file,
-                    &path_to_id,
-                ) {
+                if let Some(target_id) =
+                    Self::resolve_import_path(module_path, &from_file, &path_to_id)
+                {
                     // Import edge from file to file
                     let source_file_id = NodeId::file(&from_file);
                     if source_file_id != target_id {
@@ -56,9 +51,7 @@ impl ImportResolver {
         }
 
         // Deduplicate edges
-        edges.sort_by(|a, b| {
-            (&a.source.0, &a.target.0).cmp(&(&b.source.0, &b.target.0))
-        });
+        edges.sort_by(|a, b| (&a.source.0, &a.target.0).cmp(&(&b.source.0, &b.target.0)));
         edges.dedup_by(|a, b| a.source == b.source && a.target == b.target);
 
         edges
@@ -67,9 +60,7 @@ impl ImportResolver {
     fn get_file_of_node(graph: &CodeGraph, node_id: &NodeId) -> String {
         match graph.nodes.get(node_id) {
             Some(CodeNode::File { path, .. }) => path.clone(),
-            Some(CodeNode::CodeBlock { parent, .. }) => {
-                Self::get_file_of_node(graph, parent)
-            }
+            Some(CodeNode::CodeBlock { parent, .. }) => Self::get_file_of_node(graph, parent),
             _ => node_id.0.clone(),
         }
     }
@@ -81,9 +72,7 @@ impl ImportResolver {
     ) -> Option<NodeId> {
         // Handle relative imports (./foo, ../bar)
         if module_path.starts_with('.') {
-            let from_dir = Path::new(from_file)
-                .parent()
-                .unwrap_or(Path::new(""));
+            let from_dir = Path::new(from_file).parent().unwrap_or(Path::new(""));
 
             let resolved = from_dir.join(module_path);
             let normalized = Self::normalize_path(&resolved);
@@ -93,7 +82,18 @@ impl ImportResolver {
                 return Some(id.clone());
             }
 
-            for ext in &["", ".ts", ".tsx", ".js", ".jsx", ".py", ".rs", "/index.ts", "/index.js", "/mod.rs"] {
+            for ext in &[
+                "",
+                ".ts",
+                ".tsx",
+                ".js",
+                ".jsx",
+                ".py",
+                ".rs",
+                "/index.ts",
+                "/index.js",
+                "/mod.rs",
+            ] {
                 let with_ext = format!("{}{}", normalized, ext);
                 if let Some(id) = path_map.get(&with_ext) {
                     return Some(id.clone());
