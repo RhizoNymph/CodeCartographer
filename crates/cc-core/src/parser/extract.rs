@@ -331,6 +331,10 @@ impl Extractor {
         while let Some(current) = stack.pop() {
             let kind = current.kind();
 
+            // TODO: VariableUsage requires name resolution context not available
+            // during first-pass parsing. It would need a symbol table to distinguish
+            // variable references from other identifiers.
+
             match language {
                 Language::Python => match kind {
                     "import_statement" | "import_from_statement" => {
@@ -352,14 +356,63 @@ impl Extractor {
                     }
                     "call" => {
                         if let Some(func) = current.child_by_field_name("function") {
-                            let name = Self::extract_function_name(&func, source);
-                            if !name.is_empty() {
+                            if func.kind() == "attribute" {
+                                // Method call: obj.method()
+                                // Extract the method name (last identifier after .)
+                                let name = Self::extract_function_name(&func, source);
+                                if !name.is_empty() {
+                                    refs.push(RawReference {
+                                        from_node: from_id.clone(),
+                                        kind: RawRefKind::MethodCall,
+                                        name,
+                                        span: Self::node_span(&current),
+                                    });
+                                }
+                            } else {
+                                // Regular function call
+                                let name = Self::extract_function_name(&func, source);
+                                if !name.is_empty() {
+                                    refs.push(RawReference {
+                                        from_node: from_id.clone(),
+                                        kind: RawRefKind::FunctionCall,
+                                        name,
+                                        span: Self::node_span(&current),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    "type" => {
+                        // Type annotations in function parameters and return types
+                        if let Ok(text) = current.utf8_text(source.as_bytes()) {
+                            let name = text.trim().to_string();
+                            if !name.is_empty() && !Self::is_python_builtin_type(&name) {
                                 refs.push(RawReference {
                                     from_node: from_id.clone(),
-                                    kind: RawRefKind::FunctionCall,
+                                    kind: RawRefKind::TypeReference,
                                     name,
                                     span: Self::node_span(&current),
                                 });
+                            }
+                        }
+                    }
+                    "argument_list" => {
+                        // Check if this is a superclass list in a class definition
+                        if let Some(parent) = current.parent() {
+                            if parent.kind() == "class_definition" {
+                                let mut cursor = current.walk();
+                                for child in current.children(&mut cursor) {
+                                    if child.kind() == "identifier" {
+                                        if let Ok(text) = child.utf8_text(source.as_bytes()) {
+                                            refs.push(RawReference {
+                                                from_node: from_id.clone(),
+                                                kind: RawRefKind::Inheritance,
+                                                name: text.to_string(),
+                                                span: Self::node_span(&child),
+                                            });
+                                        }
+                                    }
+                                }
                             }
                         }
                     }
@@ -383,14 +436,59 @@ impl Extractor {
                     }
                     "call_expression" => {
                         if let Some(func) = current.child_by_field_name("function") {
-                            let name = Self::extract_function_name(&func, source);
+                            if func.kind() == "member_expression" {
+                                // Method call: obj.method()
+                                // Extract property name from member_expression
+                                let name = Self::extract_function_name(&func, source);
+                                if !name.is_empty() {
+                                    refs.push(RawReference {
+                                        from_node: from_id.clone(),
+                                        kind: RawRefKind::MethodCall,
+                                        name,
+                                        span: Self::node_span(&current),
+                                    });
+                                }
+                            } else {
+                                // Regular function call
+                                let name = Self::extract_function_name(&func, source);
+                                if !name.is_empty() {
+                                    refs.push(RawReference {
+                                        from_node: from_id.clone(),
+                                        kind: RawRefKind::FunctionCall,
+                                        name,
+                                        span: Self::node_span(&current),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    "type_identifier" => {
+                        // Custom type references (not predefined_type like number, string)
+                        if let Ok(text) = current.utf8_text(source.as_bytes()) {
+                            let name = text.trim().to_string();
                             if !name.is_empty() {
                                 refs.push(RawReference {
                                     from_node: from_id.clone(),
-                                    kind: RawRefKind::FunctionCall,
+                                    kind: RawRefKind::TypeReference,
                                     name,
                                     span: Self::node_span(&current),
                                 });
+                            }
+                        }
+                    }
+                    "extends_clause" => {
+                        // class Foo extends Bar
+                        let mut cursor = current.walk();
+                        for child in current.children(&mut cursor) {
+                            if child.kind() == "identifier" || child.kind() == "type_identifier" {
+                                if let Ok(text) = child.utf8_text(source.as_bytes()) {
+                                    refs.push(RawReference {
+                                        from_node: from_id.clone(),
+                                        kind: RawRefKind::Inheritance,
+                                        name: text.to_string(),
+                                        span: Self::node_span(&child),
+                                    });
+                                }
                             }
                         }
                     }
@@ -411,13 +509,55 @@ impl Extractor {
                     }
                     "call_expression" => {
                         if let Some(func) = current.child_by_field_name("function") {
-                            let name = Self::extract_function_name(&func, source);
-                            if !name.is_empty() && name != "Self" && name != "self" {
+                            if func.kind() == "field_expression" {
+                                // Method call: self.method() or foo.bar()
+                                let name = Self::extract_function_name(&func, source);
+                                if !name.is_empty() && name != "Self" && name != "self" {
+                                    refs.push(RawReference {
+                                        from_node: from_id.clone(),
+                                        kind: RawRefKind::MethodCall,
+                                        name,
+                                        span: Self::node_span(&current),
+                                    });
+                                }
+                            } else {
+                                // Regular function call or path call (Vec::new())
+                                let name = Self::extract_function_name(&func, source);
+                                if !name.is_empty() && name != "Self" && name != "self" {
+                                    refs.push(RawReference {
+                                        from_node: from_id.clone(),
+                                        kind: RawRefKind::FunctionCall,
+                                        name,
+                                        span: Self::node_span(&current),
+                                    });
+                                }
+                            }
+                        }
+                    }
+                    "type_identifier" => {
+                        // Type references in function parameters, return types, struct fields
+                        // Skip common primitive types that won't resolve
+                        if let Ok(text) = current.utf8_text(source.as_bytes()) {
+                            let name = text.trim().to_string();
+                            if !name.is_empty() && !Self::is_rust_builtin_type(&name) {
                                 refs.push(RawReference {
                                     from_node: from_id.clone(),
-                                    kind: RawRefKind::FunctionCall,
+                                    kind: RawRefKind::TypeReference,
                                     name,
                                     span: Self::node_span(&current),
+                                });
+                            }
+                        }
+                    }
+                    "impl_item" => {
+                        // Extract trait name from `impl Trait for Type`
+                        if let Some(trait_node) = current.child_by_field_name("trait") {
+                            if let Ok(text) = trait_node.utf8_text(source.as_bytes()) {
+                                refs.push(RawReference {
+                                    from_node: from_id.clone(),
+                                    kind: RawRefKind::TraitImpl,
+                                    name: text.to_string(),
+                                    span: Self::node_span(&trait_node),
                                 });
                             }
                         }
@@ -443,6 +583,53 @@ impl Extractor {
             end_line: node.end_position().row + 1,
             end_col: node.end_position().column,
         }
+    }
+
+    /// Check if a Python type name is a built-in type that won't resolve to a user symbol.
+    fn is_python_builtin_type(name: &str) -> bool {
+        matches!(
+            name,
+            "int"
+                | "str"
+                | "float"
+                | "bool"
+                | "bytes"
+                | "list"
+                | "dict"
+                | "set"
+                | "tuple"
+                | "None"
+                | "type"
+                | "object"
+                | "complex"
+                | "range"
+                | "frozenset"
+                | "bytearray"
+                | "memoryview"
+        )
+    }
+
+    /// Check if a Rust type name is a primitive that won't resolve to a user symbol.
+    fn is_rust_builtin_type(name: &str) -> bool {
+        matches!(
+            name,
+            "i8" | "i16"
+                | "i32"
+                | "i64"
+                | "i128"
+                | "isize"
+                | "u8"
+                | "u16"
+                | "u32"
+                | "u64"
+                | "u128"
+                | "usize"
+                | "f32"
+                | "f64"
+                | "bool"
+                | "char"
+                | "str"
+        )
     }
 
     /// Extract the actual function name from a call expression.
@@ -497,6 +684,39 @@ mod tests {
         Extractor::extract_file("test.file", source, lang).expect("extraction should succeed")
     }
 
+    fn refs_of_kind(
+        refs: &[RawReference],
+        kind_match: fn(&RawRefKind) -> bool,
+    ) -> Vec<&RawReference> {
+        refs.iter().filter(|r| kind_match(&r.kind)).collect()
+    }
+
+    // ── F1: MethodCall tests ─────────────────────────────────────────
+
+    #[test]
+    fn test_python_method_call() {
+        let source = "def foo():\n    obj.method()\n    bar()";
+        let (_, refs) = extract(source, &Language::Python);
+
+        // obj.method() should produce a MethodCall ref for "method"
+        let method_refs = refs_of_kind(&refs, |k| matches!(k, RawRefKind::MethodCall));
+        assert!(
+            method_refs.iter().any(|r| r.name == "method"),
+            "expected MethodCall reference for 'method', got: {:?}",
+            method_refs.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+
+        // bar() should remain a FunctionCall, not a MethodCall
+        let func_refs = refs_of_kind(&refs, |k| matches!(k, RawRefKind::FunctionCall));
+        assert!(
+            func_refs.iter().any(|r| r.name == "bar"),
+            "expected FunctionCall reference for 'bar'"
+        );
+
+        // Ensure "method" is NOT also a FunctionCall (no double-counting)
+        assert!(
+            !func_refs.iter().any(|r| r.name == "method"),
+            "method should not be double-counted as FunctionCall"
     fn find_block<'a>(nodes: &'a [CodeNode], name: &str) -> &'a CodeNode {
         nodes
             .iter()
@@ -606,6 +826,160 @@ mod tests {
     }
 
     #[test]
+    fn test_ts_method_call() {
+        let source = "function foo() { obj.method(); bar(); }";
+        let (_, refs) = extract(source, &Language::TypeScript);
+
+        let method_refs = refs_of_kind(&refs, |k| matches!(k, RawRefKind::MethodCall));
+        assert!(
+            method_refs.iter().any(|r| r.name == "method"),
+            "expected MethodCall reference for 'method', got: {:?}",
+            method_refs.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+
+        let func_refs = refs_of_kind(&refs, |k| matches!(k, RawRefKind::FunctionCall));
+        assert!(
+            func_refs.iter().any(|r| r.name == "bar"),
+            "expected FunctionCall reference for 'bar'"
+        );
+
+        assert!(
+            !func_refs.iter().any(|r| r.name == "method"),
+            "method should not be double-counted as FunctionCall"
+        );
+    }
+
+    #[test]
+    fn test_rust_method_call() {
+        let source = "fn foo() { self.method(); foo.bar(); Vec::new(); baz(); }";
+        let (_, refs) = extract(source, &Language::Rust);
+
+        let method_refs = refs_of_kind(&refs, |k| matches!(k, RawRefKind::MethodCall));
+        assert!(
+            method_refs.iter().any(|r| r.name == "method"),
+            "expected MethodCall for 'method', got: {:?}",
+            method_refs.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert!(
+            method_refs.iter().any(|r| r.name == "bar"),
+            "expected MethodCall for 'bar' (foo.bar())"
+        );
+
+        // Vec::new() should be FunctionCall (path call, not method call)
+        let func_refs = refs_of_kind(&refs, |k| matches!(k, RawRefKind::FunctionCall));
+        assert!(
+            func_refs.iter().any(|r| r.name == "new"),
+            "expected FunctionCall for 'new' (Vec::new())"
+        );
+
+        // baz() should be FunctionCall
+        assert!(
+            func_refs.iter().any(|r| r.name == "baz"),
+            "expected FunctionCall for 'baz'"
+        );
+
+        // method and bar should NOT appear as FunctionCall
+        assert!(
+            !func_refs.iter().any(|r| r.name == "method"),
+            "method should not be double-counted as FunctionCall"
+        );
+    }
+
+    // ── F2: TypeReference tests ──────────────────────────────────────
+
+    #[test]
+    fn test_python_type_annotation() {
+        // Only custom types should be extracted, not built-ins like int/str
+        let source = "def foo(x: MyClass) -> MyResult:\n    pass";
+        let (_, refs) = extract(source, &Language::Python);
+
+        let type_refs = refs_of_kind(&refs, |k| matches!(k, RawRefKind::TypeReference));
+        assert!(
+            type_refs.iter().any(|r| r.name == "MyClass"),
+            "expected TypeReference for 'MyClass', got: {:?}",
+            type_refs.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert!(
+            type_refs.iter().any(|r| r.name == "MyResult"),
+            "expected TypeReference for 'MyResult'"
+        );
+
+        // Built-in types should NOT produce TypeReference refs
+        let source_builtins = "def bar(x: int) -> str:\n    pass";
+        let (_, refs_builtins) = extract(source_builtins, &Language::Python);
+        let type_refs_builtins =
+            refs_of_kind(&refs_builtins, |k| matches!(k, RawRefKind::TypeReference));
+        assert!(
+            !type_refs_builtins.iter().any(|r| r.name == "int"),
+            "built-in 'int' should not produce TypeReference"
+        );
+        assert!(
+            !type_refs_builtins.iter().any(|r| r.name == "str"),
+            "built-in 'str' should not produce TypeReference"
+        );
+    }
+
+    #[test]
+    fn test_ts_type_annotation() {
+        // Custom types (type_identifier) should produce TypeReference
+        let source = "function foo(x: Foo): Bar {}";
+        let (_, refs) = extract(source, &Language::TypeScript);
+
+        let type_refs = refs_of_kind(&refs, |k| matches!(k, RawRefKind::TypeReference));
+        assert!(
+            type_refs.iter().any(|r| r.name == "Foo"),
+            "expected TypeReference for 'Foo', got: {:?}",
+            type_refs.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert!(
+            type_refs.iter().any(|r| r.name == "Bar"),
+            "expected TypeReference for 'Bar'"
+        );
+
+        // Built-in types (predefined_type) should NOT produce TypeReference
+        let source_builtins = "function bar(x: number): string {}";
+        let (_, refs_builtins) = extract(source_builtins, &Language::TypeScript);
+        let type_refs_builtins =
+            refs_of_kind(&refs_builtins, |k| matches!(k, RawRefKind::TypeReference));
+        assert!(
+            !type_refs_builtins.iter().any(|r| r.name == "number"),
+            "built-in 'number' should not produce TypeReference"
+        );
+        assert!(
+            !type_refs_builtins.iter().any(|r| r.name == "string"),
+            "built-in 'string' should not produce TypeReference"
+        );
+    }
+
+    #[test]
+    fn test_rust_type_annotation() {
+        let source = "fn foo(x: Bar) -> Baz {}";
+        let (_, refs) = extract(source, &Language::Rust);
+
+        let type_refs = refs_of_kind(&refs, |k| matches!(k, RawRefKind::TypeReference));
+        assert!(
+            type_refs.iter().any(|r| r.name == "Bar"),
+            "expected TypeReference for 'Bar', got: {:?}",
+            type_refs.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+        assert!(
+            type_refs.iter().any(|r| r.name == "Baz"),
+            "expected TypeReference for 'Baz'"
+        );
+    }
+
+    // ── F3: Inheritance tests ────────────────────────────────────────
+
+    #[test]
+    fn test_python_inheritance() {
+        let source = "class Foo(Bar):\n    pass";
+        let (_, refs) = extract(source, &Language::Python);
+
+        let inherit_refs = refs_of_kind(&refs, |k| matches!(k, RawRefKind::Inheritance));
+        assert!(
+            inherit_refs.iter().any(|r| r.name == "Bar"),
+            "expected Inheritance reference to 'Bar', got: {:?}",
+            inherit_refs.iter().map(|r| &r.name).collect::<Vec<_>>()
     fn test_extract_python_nested_class_method() {
         let source = "class Foo:\n    def bar(self):\n        pass";
         let (nodes, _) = extract(source, &Language::Python);
@@ -897,6 +1271,31 @@ mod tests {
     }
 
     #[test]
+    fn test_ts_inheritance() {
+        let source = "class Foo extends Bar {}";
+        let (_, refs) = extract(source, &Language::TypeScript);
+
+        let inherit_refs = refs_of_kind(&refs, |k| matches!(k, RawRefKind::Inheritance));
+        assert!(
+            inherit_refs.iter().any(|r| r.name == "Bar"),
+            "expected Inheritance reference to 'Bar', got: {:?}",
+            inherit_refs.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    // ── F4: TraitImpl tests ──────────────────────────────────────────
+
+    #[test]
+    fn test_rust_trait_impl() {
+        let source = "impl Display for Foo {}";
+        let (_, refs) = extract(source, &Language::Rust);
+
+        let trait_refs = refs_of_kind(&refs, |k| matches!(k, RawRefKind::TraitImpl));
+        assert!(
+            trait_refs.iter().any(|r| r.name == "Display"),
+            "expected TraitImpl reference to 'Display', got: {:?}",
+            trait_refs.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
     fn test_extract_rust_call() {
         let source = "fn foo() { bar(); }";
         let (_, refs) = extract(source, &Language::Rust);

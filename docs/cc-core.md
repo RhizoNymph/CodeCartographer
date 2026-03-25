@@ -155,7 +155,17 @@ pub struct RawReference {
 }
 ```
 
-Reference kinds: `Import`, `FunctionCall`, `MethodCall`, `TypeReference`, `Inheritance`, `TraitImpl`, `VariableUsage`
+Reference kinds extracted during parsing:
+
+| Kind | Python | TypeScript/JS | Rust |
+|------|--------|---------------|------|
+| Import | `import`, `from...import` | `import...from` | `use` declarations |
+| FunctionCall | `call` with identifier | `call_expression` with identifier | `call_expression` with identifier or `scoped_identifier` |
+| MethodCall | `call` with `attribute` (e.g. `obj.method()`) | `call_expression` with `member_expression` | `call_expression` with `field_expression` |
+| TypeReference | `type` annotation nodes (non-builtin) | `type_identifier` nodes (not `predefined_type`) | `type_identifier` nodes (not primitive) |
+| Inheritance | `argument_list` in `class_definition` | `extends_clause` in class | N/A |
+| TraitImpl | N/A | N/A | `impl_item` with `trait` field |
+| VariableUsage | Not yet extracted (requires name resolution) | Not yet extracted | Not yet extracted |
 
 ## Repository Module
 
@@ -239,7 +249,8 @@ let subgraph = SubGraph::from_graph(&graph, &visible_ids, &edge_kinds);
 |-------|---------|
 | tree-sitter | AST parsing framework |
 | tree-sitter-python | Python parser |
-| tree-sitter-typescript | TS/JS parser |
+| tree-sitter-typescript | TypeScript parser |
+| tree-sitter-javascript | JavaScript parser |
 | tree-sitter-rust | Rust parser |
 | serde | Serialization |
 | rayon | Parallel processing |
