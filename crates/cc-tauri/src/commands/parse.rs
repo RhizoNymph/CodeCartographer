@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 
 use cc_core::model::{CodeGraph, CodeNode, EdgeKind, Language, NodeId, SubGraph};
@@ -122,25 +123,13 @@ pub async fn parse_repo(
 pub async fn get_subgraph(
     graph_json: String,
     visible_ids: Vec<String>,
-    edge_kinds: Vec<String>,
+    edge_kinds: Vec<EdgeKind>,
 ) -> Result<SubGraph, String> {
     let graph: CodeGraph =
         serde_json::from_str(&graph_json).map_err(|e| e.to_string())?;
 
     let visible: Vec<NodeId> = visible_ids.into_iter().map(NodeId).collect();
-    let kinds: Vec<EdgeKind> = edge_kinds
-        .iter()
-        .filter_map(|k| match k.as_str() {
-            "Import" => Some(EdgeKind::Import),
-            "FunctionCall" => Some(EdgeKind::FunctionCall),
-            "MethodCall" => Some(EdgeKind::MethodCall),
-            "TypeReference" => Some(EdgeKind::TypeReference),
-            "Inheritance" => Some(EdgeKind::Inheritance),
-            "TraitImpl" => Some(EdgeKind::TraitImpl),
-            "VariableUsage" => Some(EdgeKind::VariableUsage),
-            _ => None,
-        })
-        .collect();
+    let kinds: HashSet<EdgeKind> = edge_kinds.into_iter().collect();
 
     Ok(SubGraph::from_graph(&graph, &visible, &kinds))
 }

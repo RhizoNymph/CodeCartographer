@@ -1,6 +1,7 @@
 import { create } from "zustand";
 import type { CodeGraph, CodeNode, EdgeKind, ParseEvent } from "../api/types";
 import { saveFolderState, loadFolderState } from "./persistenceStore";
+import { useDebugStore } from "./debugStore";
 
 interface ParseProgress {
   totalFiles: number;
@@ -94,10 +95,11 @@ export const useGraphStore = create<GraphState>((set, get) => ({
             expanded = new Set(validExpanded);
             visible = new Set(validVisible);
             restored = true;
-            console.log("Restored folder state:", {
-              expanded: expanded.size,
-              visible: visible.size,
-            });
+            if (import.meta.env.DEV) {
+              useDebugStore.getState().addLog(
+                `Restored folder state: expanded=${expanded.size}, visible=${visible.size}`
+              );
+            }
           }
         }
       }
@@ -113,13 +115,11 @@ export const useGraphStore = create<GraphState>((set, get) => ({
         }
       }
 
-      console.log("setGraph:", {
-        nodes: Object.keys(graph.nodes).length,
-        edges: graph.edges.length,
-        expanded: expanded.size,
-        visible: visible.size,
-        restored,
-      });
+      if (import.meta.env.DEV) {
+        useDebugStore.getState().addLog(
+          `setGraph: nodes=${Object.keys(graph.nodes).length}, edges=${graph.edges.length}, expanded=${expanded.size}, visible=${visible.size}, restored=${restored}`
+        );
+      }
     }
 
     // Increment layoutVersion to trigger relayout
