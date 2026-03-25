@@ -77,10 +77,15 @@ pub struct CodeGraph {
     pub nodes: HashMap<NodeId, CodeNode>,
     pub edges: Vec<CodeEdge>,
     pub root: NodeId,
-    pub forward_adj: HashMap<NodeId, Vec<(NodeId, usize)>>,  // Skip serialization
-    pub reverse_adj: HashMap<NodeId, Vec<(NodeId, usize)>>,  // Skip serialization
+    pub forward_adj: HashMap<NodeId, Vec<(NodeId, usize)>>,           // Skip serialization
+    pub reverse_adj: HashMap<NodeId, Vec<(NodeId, usize)>>,           // Skip serialization
+    pub edge_dedup: HashMap<(NodeId, NodeId, EdgeKind), usize>,       // Skip serialization
 }
 ```
+
+The `edge_dedup` field provides O(1) edge deduplication. When `add_edge()` is called with
+an edge that matches an existing (source, target, kind) triple, the weight is incremented
+instead of creating a duplicate entry.
 
 Methods: `add_node()`, `add_edge()`, `node()`, `node_count()`, `edge_count()`, `rebuild_adjacency()`
 

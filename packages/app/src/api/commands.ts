@@ -7,7 +7,6 @@ export async function scanRepo(path: string): Promise<CodeGraph> {
 
 export async function parseRepo(
   path: string,
-  graph: CodeGraph,
   onEvent: (event: ParseEvent) => void
 ): Promise<CodeGraph> {
   const channel = new Channel<ParseEvent>();
@@ -15,18 +14,15 @@ export async function parseRepo(
 
   return invoke<CodeGraph>("parse_repo", {
     path,
-    graphJson: JSON.stringify(graph),
     onEvent: channel,
   });
 }
 
 export async function getSubgraph(
-  graph: CodeGraph,
   visibleIds: string[],
   edgeKinds: string[]
 ): Promise<SubGraph> {
   return invoke<SubGraph>("get_subgraph", {
-    graphJson: JSON.stringify(graph),
     visibleIds,
     edgeKinds,
   });
