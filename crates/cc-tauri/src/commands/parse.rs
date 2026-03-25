@@ -56,7 +56,9 @@ pub async fn parse_repo(
 
     // Phase 2: Merge results and send progress events sequentially
     for (file_id, rel_path, result) in parse_results {
-        let _ = on_event.send(ParseEvent::FileStart { path: rel_path.clone() });
+        if let Err(e) = on_event.send(ParseEvent::FileStart { path: rel_path.clone() }) {
+            tracing::warn!(error = %e, "Failed to send parse event");
+        }
         match result {
             Ok((nodes, refs)) => {
                 let block_count = nodes.len();
@@ -69,10 +71,14 @@ pub async fn parse_repo(
                     }
                 }
                 all_refs.extend(refs);
-                let _ = on_event.send(ParseEvent::FileDone { path: rel_path, blocks: block_count });
+                if let Err(e) = on_event.send(ParseEvent::FileDone { path: rel_path, blocks: block_count }) {
+                    tracing::warn!(error = %e, "Failed to send parse event");
+                }
             }
             Err(e) => {
-                let _ = on_event.send(ParseEvent::Error { path: rel_path, message: e });
+                if let Err(e) = on_event.send(ParseEvent::Error { path: rel_path, message: e }) {
+                    tracing::warn!(error = %e, "Failed to send parse event");
+                }
             }
         }
         total_files += 1;
@@ -110,10 +116,12 @@ pub async fn parse_repo(
         graph.edges.len()
     );
 
-    let _ = on_event.send(ParseEvent::Complete {
+    if let Err(e) = on_event.send(ParseEvent::Complete {
         total_files,
         total_blocks,
-    });
+    }) {
+        tracing::warn!(error = %e, "Failed to send parse event");
+    }
 
     Ok(graph)
 }
