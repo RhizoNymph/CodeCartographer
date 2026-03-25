@@ -1,5 +1,5 @@
-mod scanner;
 mod clone;
+mod scanner;
 
-pub use scanner::*;
 pub use clone::*;
+pub use scanner::*;

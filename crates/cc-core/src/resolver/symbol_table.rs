@@ -31,11 +31,7 @@ impl SymbolTable {
                     .entry(name.clone())
                     .or_default()
                     .push(id.clone());
-                table
-                    .symbols
-                    .entry(fqn)
-                    .or_default()
-                    .push(id.clone());
+                table.symbols.entry(fqn).or_default().push(id.clone());
             }
         }
 
@@ -51,10 +47,7 @@ impl SymbolTable {
     }
 
     /// Resolve raw references into edges.
-    pub fn resolve_references(
-        &self,
-        refs: &[RawReference],
-    ) -> Vec<CodeEdge> {
+    pub fn resolve_references(&self, refs: &[RawReference]) -> Vec<CodeEdge> {
         let mut edges = Vec::new();
 
         for raw_ref in refs {
