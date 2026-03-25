@@ -124,10 +124,12 @@ pub async fn parse_repo(
 
     tracing::info!("Graph now has {} edges after adding", graph.edges.len());
 
-    let _ = on_event.send(ParseEvent::Complete {
+    if let Err(e) = on_event.send(ParseEvent::Complete {
         total_files,
         total_blocks,
-    });
+    }) {
+        tracing::warn!(error = %e, "Failed to send parse event");
+    }
 
     Ok(graph)
 }

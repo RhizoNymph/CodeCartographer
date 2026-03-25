@@ -87,10 +87,7 @@ impl RepoScanner {
                     parent_node.children_mut().push(dir_id);
                 }
             } else if abs_path.is_file() {
-                let ext = abs_path
-                    .extension()
-                    .and_then(|e| e.to_str())
-                    .unwrap_or("");
+                let ext = abs_path.extension().and_then(|e| e.to_str()).unwrap_or("");
                 let language = Language::from_extension(ext);
 
                 let file_id = NodeId::file(&rel_str);
@@ -109,10 +106,7 @@ impl RepoScanner {
             }
         }
 
-        tracing::info!(
-            "Scanned repository: {} nodes",
-            graph.node_count()
-        );
+        tracing::info!("Scanned repository: {} nodes", graph.node_count());
 
         Ok(graph)
     }
