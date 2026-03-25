@@ -84,6 +84,11 @@ pub struct CodeGraph {
 
 Methods: `add_node()`, `add_edge()`, `node()`, `node_count()`, `edge_count()`, `rebuild_adjacency()`
 
+### CodeNode Methods
+
+- `id()` - Returns the NodeId for any variant
+- `children_mut()` - Returns a mutable reference to the children Vec for any variant
+
 ### SubGraph
 
 Filtered view for rendering:
@@ -107,7 +112,7 @@ Extractor::extract_file(
     file_path: &str,
     source: &str,
     language: &Language,
-) -> (Vec<CodeNode>, Vec<RawReference>)
+) -> Result<(Vec<CodeNode>, Vec<RawReference>)>
 ```
 
 Uses Tree-sitter to parse source and extract:
@@ -186,26 +191,19 @@ SymbolTable::resolve_references(refs) -> Vec<CodeEdge>
 
 Stores both simple names (`foo`) and qualified names (`path/file.rs::foo`).
 
+`resolve_references` applies name normalization before symbol lookup:
+- **FunctionCall/MethodCall**: strips method receiver (`foo.bar()` -> `bar`) and module path (`module::func` -> `func`)
+- **TypeReference/Inheritance/TraitImpl**: strips generic parameters (`Foo<Bar>` -> `Foo`) and path prefix (`std::vec::Vec` -> `Vec`)
+- Falls back to the original qualified name for type references if the simplified name doesn't match
+
 ### ImportResolver
 
-Resolves import statements to target files:
+Resolves import statements to file-level edges:
 - Handles relative imports (`./`, `../`)
 - Python dotted imports (`foo.bar.baz`)
 - Rust crate imports (`crate::module::item`)
 - Tries multiple extensions (`.ts`, `.tsx`, `.js`, `.py`, `.rs`)
-
-### CallResolver
-
-Resolves function/method calls to definitions:
-- Strips method receiver: `foo.bar()` → `bar`
-- Strips module path: `module::func` → `func`
-- Looks up in SymbolTable
-
-### TypeResolver
-
-Resolves type references, inheritance, trait implementations:
-- Strips generic parameters: `Foo<Bar>` → `Foo`
-- Strips path prefix: `std::vec::Vec` → `Vec`
+- Creates file-to-file Import edges (separate from the symbol-level edges from `SymbolTable`)
 
 ## Typical Workflow
 
@@ -223,13 +221,39 @@ for file in graph.files() {
 // 3. Build symbol table
 let symbols = SymbolTable::build_from_graph(&graph);
 
-// 4. Resolve references
+// 4. Resolve symbol references (with name normalization)
 let edges = symbols.resolve_references(&all_refs);
 // Add edges to graph
 
-// 5. Filter for rendering
+// 5. Resolve file-level import edges
+let import_edges = ImportResolver::resolve(&graph, &all_refs);
+// Add import edges to graph
+
+// 6. Filter for rendering
 let subgraph = SubGraph::from_graph(&graph, &visible_ids, &edge_kinds);
 ```
+
+## Benchmarking
+
+Criterion benchmark suite in `crates/cc-core/benches/`:
+
+### graph_bench.rs
+
+Graph operation benchmarks:
+- `add_edge_unique` - Adding unique edges (100, 500, 1000, 5000 edges)
+- `add_edge_all_duplicates` - Adding duplicate edges (merge path)
+- `add_edge_mixed` - Realistic mix (~20% duplicates among 50 hot edges)
+- `rebuild_adjacency` - Rebuilding forward/reverse adjacency indexes
+- `subgraph_extraction` - SubGraph::from_graph with partial visibility
+
+### parse_bench.rs
+
+Parsing pipeline benchmarks:
+- `extract_file` - Single file extraction per language (Python, TypeScript, Rust)
+- `extract_many_files` - Sequential multi-file extraction (10, 50, 100 files)
+- `full_pipeline` - End-to-end: parse → symbol table → resolve → add edges (20, 50 files)
+
+Run with: `cargo bench -p cc-core`
 
 ## Dependencies
 
@@ -243,3 +267,36 @@ let subgraph = SubGraph::from_graph(&graph, &visible_ids, &edge_kinds);
 | rayon | Parallel processing |
 | ignore | Gitignore-aware walking |
 | anyhow/thiserror | Error handling |
+
+## Files
+
+| File | Role | Key Exports |
+|------|------|-------------|
+| `crates/cc-core/src/lib.rs` | Crate root | Public module re-exports |
+| `crates/cc-core/src/model/mod.rs` | Model module | Re-exports node, edge, graph types |
+| `crates/cc-core/src/model/node.rs` | Node types | NodeId, CodeNode, BlockKind, Visibility, Language |
+| `crates/cc-core/src/model/edge.rs` | Edge types | EdgeKind, CodeEdge, AggregatedEdge, RawReference, RawRefKind |
+| `crates/cc-core/src/model/graph.rs` | Graph structure | CodeGraph, SubGraph |
+| `crates/cc-core/src/parser/mod.rs` | Parser module | Re-exports Extractor |
+| `crates/cc-core/src/parser/extract.rs` | Tree-sitter extraction | Extractor::extract_file |
+| `crates/cc-core/src/repo/mod.rs` | Repo module | Re-exports scanner, clone |
+| `crates/cc-core/src/repo/scanner.rs` | Directory walking | RepoScanner::scan |
+| `crates/cc-core/src/repo/clone.rs` | Git cloning | clone_repo |
+| `crates/cc-core/src/resolver/mod.rs` | Resolver module | Re-exports resolvers |
+| `crates/cc-core/src/resolver/symbol_table.rs` | Symbol resolution | SymbolTable |
+| `crates/cc-core/src/resolver/import_resolver.rs` | Import resolution | ImportResolver |
+| `crates/cc-core/src/resolver/call_resolver.rs` | Call resolution | CallResolver |
+| `crates/cc-core/src/resolver/type_resolver.rs` | Type resolution | TypeResolver |
+| `crates/cc-core/benches/graph_bench.rs` | Graph benchmarks | Criterion benchmark group |
+| `crates/cc-core/benches/parse_bench.rs` | Parse benchmarks | Criterion benchmark group |
+
+## Invariants and Constraints
+
+- NodeId format is stable: directories use path, files use path, code blocks use "path::name@line".
+- CodeGraph adjacency indexes (forward_adj, reverse_adj) are skipped during JSON serialization and must be rebuilt after deserialization via `rebuild_adjacency()`.
+- Duplicate edges (same source, target, kind) are merged by incrementing weight rather than creating a second edge.
+- The Extractor is stateless — each `extract_file` call is independent and can be parallelized.
+- RawReferences are intermediate — they must be resolved through the SymbolTable to produce CodeEdges.
+- The SymbolTable maps both simple names ("foo") and qualified names ("path/file.rs::foo") to NodeIds.
+- ImportResolver tries multiple file extensions when resolving import paths; resolution order matters for ambiguous cases.
+- Tree-sitter parsers are language-specific; adding a new language requires a new tree-sitter grammar dependency and classification logic in the Extractor.
