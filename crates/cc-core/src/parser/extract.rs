@@ -717,6 +717,9 @@ mod tests {
         assert!(
             !func_refs.iter().any(|r| r.name == "method"),
             "method should not be double-counted as FunctionCall"
+        );
+    }
+
     fn find_block<'a>(nodes: &'a [CodeNode], name: &str) -> &'a CodeNode {
         nodes
             .iter()
@@ -980,6 +983,10 @@ mod tests {
             inherit_refs.iter().any(|r| r.name == "Bar"),
             "expected Inheritance reference to 'Bar', got: {:?}",
             inherit_refs.iter().map(|r| &r.name).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn test_extract_python_nested_class_method() {
         let source = "class Foo:\n    def bar(self):\n        pass";
         let (nodes, _) = extract(source, &Language::Python);
@@ -1296,6 +1303,9 @@ mod tests {
             "expected TraitImpl reference to 'Display', got: {:?}",
             trait_refs.iter().map(|r| &r.name).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
     fn test_extract_rust_call() {
         let source = "fn foo() { bar(); }";
         let (_, refs) = extract(source, &Language::Rust);
