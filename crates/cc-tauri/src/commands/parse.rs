@@ -102,17 +102,19 @@ pub async fn parse_repo(
     // Resolve references into edges
     let symbol_table = SymbolTable::build_from_graph(&graph);
 
-    // Debug: show some refs and symbols
-    if !all_refs.is_empty() {
-        tracing::info!("Sample refs (first 5):");
-        for r in all_refs.iter().take(5) {
-            tracing::info!("  ref: '{}' from {:?}", r.name, r.from_node);
+    // Debug: show some refs and symbols (only when DEBUG level is enabled)
+    if tracing::event_enabled!(tracing::Level::DEBUG) {
+        if !all_refs.is_empty() {
+            tracing::debug!("Sample refs (first 5):");
+            for r in all_refs.iter().take(5) {
+                tracing::debug!("  ref: '{}' from {:?}", r.name, r.from_node);
+            }
         }
-    }
-    if !symbol_table.symbols.is_empty() {
-        tracing::info!("Sample symbols (first 5):");
-        for (name, ids) in symbol_table.symbols.iter().take(5) {
-            tracing::info!("  sym: '{}' -> {:?}", name, ids);
+        if !symbol_table.symbols.is_empty() {
+            tracing::debug!("Sample symbols (first 5):");
+            for (name, ids) in symbol_table.symbols.iter().take(5) {
+                tracing::debug!("  sym: '{}' -> {:?}", name, ids);
+            }
         }
     }
 

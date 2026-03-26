@@ -11,3 +11,4 @@ anyhow = { workspace = true }
 tauri = { version = "2", features = [] }
 tracing = { workspace = true }
 rayon = { workspace = true }
+thiserror = { workspace = true }
