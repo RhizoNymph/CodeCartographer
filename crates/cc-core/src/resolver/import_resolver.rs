@@ -1,8 +1,10 @@
 use std::collections::HashMap;
 use std::path::Path;
 
-use crate::model::{CodeEdge, CodeGraph, CodeNode, EdgeKind, NodeId};
+use crate::model::{CodeEdge, CodeGraph, CodeNode, EdgeKind, Language, NodeId};
 use crate::parser::{RawRefKind, RawReference};
+
+use super::extension_probe::{probe_path, probe_path_all};
 
 /// Resolves import statements to their target files/modules.
 pub struct ImportResolver;
@@ -32,10 +34,14 @@ impl ImportResolver {
             if let RawRefKind::Import { module_path } = &raw_ref.kind {
                 // Try to resolve the import path
                 let from_file = Self::get_file_of_node(graph, &raw_ref.from_node);
+                let from_language = Self::get_file_language(graph, &from_file);
 
-                if let Some(target_id) =
-                    Self::resolve_import_path(module_path, &from_file, &path_to_id)
-                {
+                if let Some(target_id) = Self::resolve_import_path(
+                    module_path,
+                    &from_file,
+                    from_language.as_ref(),
+                    &path_to_id,
+                ) {
                     // Import edge from file to file
                     let source_file_id = NodeId::file(&from_file);
                     if source_file_id != target_id {
@@ -65,9 +71,20 @@ impl ImportResolver {
         }
     }
 
+    /// Get the language of a file node by path.
+    fn get_file_language(graph: &CodeGraph, file_path: &str) -> Option<Language> {
+        let file_id = NodeId::file(file_path);
+        if let Some(CodeNode::File { language, .. }) = graph.nodes.get(&file_id) {
+            language.clone()
+        } else {
+            None
+        }
+    }
+
     fn resolve_import_path(
         module_path: &str,
         from_file: &str,
+        language: Option<&Language>,
         path_map: &HashMap<String, NodeId>,
     ) -> Option<NodeId> {
         // Handle relative imports (./foo, ../bar)
@@ -77,28 +94,16 @@ impl ImportResolver {
             let resolved = from_dir.join(module_path);
             let normalized = Self::normalize_path(&resolved);
 
-            // Try exact match, then with common extensions
+            // Try exact match first
             if let Some(id) = path_map.get(&normalized) {
                 return Some(id.clone());
             }
 
-            for ext in &[
-                "",
-                ".ts",
-                ".tsx",
-                ".js",
-                ".jsx",
-                ".py",
-                ".rs",
-                "/index.ts",
-                "/index.js",
-                "/mod.rs",
-            ] {
-                let with_ext = format!("{}{}", normalized, ext);
-                if let Some(id) = path_map.get(&with_ext) {
-                    return Some(id.clone());
-                }
+            // Use extension probing based on language
+            if let Some(lang) = language {
+                return probe_path(&normalized, lang.clone(), path_map);
             }
+            return probe_path_all(&normalized, path_map);
         }
 
         // Handle Python dotted imports (foo.bar.baz -> foo/bar/baz.py)
@@ -107,12 +112,7 @@ impl ImportResolver {
             if let Some(id) = path_map.get(&as_path) {
                 return Some(id.clone());
             }
-            for ext in &[".py", "/__init__.py"] {
-                let with_ext = format!("{}{}", as_path, ext);
-                if let Some(id) = path_map.get(&with_ext) {
-                    return Some(id.clone());
-                }
-            }
+            return probe_path(&as_path, Language::Python, path_map);
         }
 
         // Handle Rust crate-level imports (crate::foo::bar)
@@ -122,13 +122,8 @@ impl ImportResolver {
                 .unwrap()
                 .split("::")
                 .collect();
-            let as_path = parts.join("/");
-            for ext in &[".rs", "/mod.rs"] {
-                let with_ext = format!("src/{}{}", as_path, ext);
-                if let Some(id) = path_map.get(&with_ext) {
-                    return Some(id.clone());
-                }
-            }
+            let as_path = format!("src/{}", parts.join("/"));
+            return probe_path(&as_path, Language::Rust, path_map);
         }
 
         // Bare module name lookup

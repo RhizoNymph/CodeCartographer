@@ -1,3 +1,4 @@
+pub mod extension_probe;
 mod import_resolver;
 mod symbol_table;
 

@@ -43,10 +43,10 @@ Features Index:
         doc: docs/features/edge_dedup.md
 
     parsing:
-        description: Tree-sitter based source code parsing with parallel file extraction via rayon, structured error types, and debug-gated diagnostic logging. Extracts code blocks and raw references from Python, TypeScript, JavaScript, and Rust files.
-        entry_points: [crates/cc-core/src/parser/extract.rs, crates/cc-tauri/src/commands/parse.rs]
+        description: Tree-sitter based source code parsing using a trait-based LanguageSupport system. Extracts code blocks and raw references from Python, TypeScript, JavaScript, and Rust files. Includes extension probing for import resolution.
+        entry_points: [crates/cc-core/src/parser/extract.rs, crates/cc-core/src/parser/language.rs, crates/cc-tauri/src/commands/parse.rs]
         depends_on: [graph-model]
-        doc: docs/features/parallel_parsing.md
+        doc: docs/features/parsing.md
 
     state-management:
         description: Zustand stores for graph state, viewport state, debug logging, and persistence.

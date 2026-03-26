@@ -1,4 +1,9 @@
-use crate::model::{BlockKind, CodeNode, Language, NodeId, Span, Visibility};
+use crate::model::{CodeNode, Language, NodeId, Span};
+
+use super::language::LanguageSupport;
+use super::python::PythonSupport;
+use super::rust_lang::RustSupport;
+use super::typescript::{JavaScriptSupport, TypeScriptSupport};
 
 /// Raw reference found during parsing, before resolution.
 #[derive(Debug, Clone)]
@@ -51,26 +56,15 @@ impl Extractor {
         source: &str,
         language: &Language,
     ) -> anyhow::Result<(Vec<CodeNode>, Vec<RawReference>)> {
-        let mut parser = tree_sitter::Parser::new();
+        let lang_support: Box<dyn LanguageSupport> = match language {
+            Language::Python => Box::new(PythonSupport),
+            Language::TypeScript => Box::new(TypeScriptSupport),
+            Language::JavaScript => Box::new(JavaScriptSupport),
+            Language::Rust => Box::new(RustSupport),
+        };
 
-        match language {
-            Language::Python => {
-                let lang = tree_sitter_python::LANGUAGE;
-                parser.set_language(&lang.into())?;
-            }
-            Language::TypeScript => {
-                let lang = tree_sitter_typescript::LANGUAGE_TYPESCRIPT;
-                parser.set_language(&lang.into())?;
-            }
-            Language::JavaScript => {
-                let lang = tree_sitter_javascript::LANGUAGE;
-                parser.set_language(&lang.into())?;
-            }
-            Language::Rust => {
-                let lang = tree_sitter_rust::LANGUAGE;
-                parser.set_language(&lang.into())?;
-            }
-        }
+        let mut parser = tree_sitter::Parser::new();
+        parser.set_language(&lang_support.tree_sitter_language())?;
 
         let tree = parser
             .parse(source, None)
@@ -82,7 +76,7 @@ impl Extractor {
         Self::walk_tree(
             file_path,
             source,
-            language,
+            lang_support.as_ref(),
             &tree.root_node(),
             &NodeId::file(file_path),
             &mut nodes,
@@ -95,7 +89,7 @@ impl Extractor {
     fn walk_tree(
         file_path: &str,
         source: &str,
-        language: &Language,
+        lang: &dyn LanguageSupport,
         node: &tree_sitter::Node,
         parent_id: &NodeId,
         out_nodes: &mut Vec<CodeNode>,
@@ -103,9 +97,7 @@ impl Extractor {
     ) {
         let kind = node.kind();
 
-        if let Some((block_kind, name, visibility)) =
-            Self::classify_node(kind, node, source, language)
-        {
+        if let Some((block_kind, name, visibility)) = lang.classify_node(kind, node, source) {
             let span = Span {
                 start_line: node.start_position().row + 1,
                 start_col: node.start_position().column,
@@ -113,7 +105,7 @@ impl Extractor {
                 end_col: node.end_position().column,
             };
 
-            let signature = Self::extract_signature(node, source, language);
+            let signature = Self::extract_signature(node, source);
 
             let block_id = NodeId::code_block(file_path, &name, span.start_line);
 
@@ -131,452 +123,45 @@ impl Extractor {
             // Recurse with this block as parent
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
-                Self::walk_tree(
-                    file_path, source, language, &child, &block_id, out_nodes, out_refs,
-                );
+                Self::walk_tree(file_path, source, lang, &child, &block_id, out_nodes, out_refs);
             }
 
             // Collect references
-            Self::collect_references(file_path, source, language, node, &block_id, out_refs);
+            lang.collect_references(source, node, &block_id, out_refs);
         } else {
             // Not a code block, recurse normally
             let mut cursor = node.walk();
             for child in node.children(&mut cursor) {
                 Self::walk_tree(
-                    file_path, source, language, &child, parent_id, out_nodes, out_refs,
+                    file_path, source, lang, &child, parent_id, out_nodes, out_refs,
                 );
             }
         }
     }
 
-    fn classify_node(
-        kind: &str,
+    /// Get the text of a named child field.
+    pub(crate) fn child_text(
         node: &tree_sitter::Node,
+        field: &str,
         source: &str,
-        language: &Language,
-    ) -> Option<(BlockKind, String, Option<Visibility>)> {
-        match language {
-            Language::Python => Self::classify_python(kind, node, source),
-            Language::TypeScript | Language::JavaScript => {
-                Self::classify_typescript(kind, node, source)
-            }
-            Language::Rust => Self::classify_rust(kind, node, source),
-        }
-    }
-
-    fn classify_python(
-        kind: &str,
-        node: &tree_sitter::Node,
-        source: &str,
-    ) -> Option<(BlockKind, String, Option<Visibility>)> {
-        match kind {
-            "function_definition" => {
-                let name = Self::child_text(node, "name", source)?;
-                let vis = if name.starts_with('_') {
-                    Some(Visibility::Private)
-                } else {
-                    Some(Visibility::Public)
-                };
-                Some((BlockKind::Function, name, vis))
-            }
-            "class_definition" => {
-                let name = Self::child_text(node, "name", source)?;
-                Some((BlockKind::Class, name, Some(Visibility::Public)))
-            }
-            _ => None,
-        }
-    }
-
-    fn classify_typescript(
-        kind: &str,
-        node: &tree_sitter::Node,
-        source: &str,
-    ) -> Option<(BlockKind, String, Option<Visibility>)> {
-        match kind {
-            "function_declaration" => {
-                let name = Self::child_text(node, "name", source)?;
-                Some((BlockKind::Function, name, Some(Visibility::Public)))
-            }
-            "class_declaration" => {
-                let name = Self::child_text(node, "name", source)?;
-                Some((BlockKind::Class, name, Some(Visibility::Public)))
-            }
-            "interface_declaration" => {
-                let name = Self::child_text(node, "name", source)?;
-                Some((BlockKind::Interface, name, Some(Visibility::Public)))
-            }
-            "type_alias_declaration" => {
-                let name = Self::child_text(node, "name", source)?;
-                Some((BlockKind::TypeAlias, name, Some(Visibility::Public)))
-            }
-            "enum_declaration" => {
-                let name = Self::child_text(node, "name", source)?;
-                Some((BlockKind::Enum, name, Some(Visibility::Public)))
-            }
-            "method_definition" => {
-                let name = Self::child_text(node, "name", source)?;
-                Some((BlockKind::Function, name, Some(Visibility::Public)))
-            }
-            "arrow_function" | "function_expression" => {
-                // Check if it's assigned to a variable
-                if let Some(parent) = node.parent() {
-                    if parent.kind() == "variable_declarator" {
-                        let name = Self::child_text(&parent, "name", source)?;
-                        return Some((BlockKind::Function, name, Some(Visibility::Public)));
-                    }
-                }
-                None
-            }
-            _ => None,
-        }
-    }
-
-    fn classify_rust(
-        kind: &str,
-        node: &tree_sitter::Node,
-        source: &str,
-    ) -> Option<(BlockKind, String, Option<Visibility>)> {
-        let vis = Self::rust_visibility(node, source);
-
-        match kind {
-            "function_item" => {
-                let name = Self::child_text(node, "name", source)?;
-                Some((BlockKind::Function, name, vis))
-            }
-            "struct_item" => {
-                let name = Self::child_text(node, "name", source)?;
-                Some((BlockKind::Struct, name, vis))
-            }
-            "enum_item" => {
-                let name = Self::child_text(node, "name", source)?;
-                Some((BlockKind::Enum, name, vis))
-            }
-            "trait_item" => {
-                let name = Self::child_text(node, "name", source)?;
-                Some((BlockKind::Trait, name, vis))
-            }
-            "impl_item" => {
-                // Get the type name being implemented
-                let type_node = node.child_by_field_name("type");
-                let trait_node = node.child_by_field_name("trait");
-                let name = match (trait_node, type_node) {
-                    (Some(t), Some(ty)) => {
-                        format!(
-                            "{} for {}",
-                            t.utf8_text(source.as_bytes()).unwrap_or("?"),
-                            ty.utf8_text(source.as_bytes()).unwrap_or("?")
-                        )
-                    }
-                    (None, Some(ty)) => {
-                        format!("impl {}", ty.utf8_text(source.as_bytes()).unwrap_or("?"))
-                    }
-                    _ => "impl".to_string(),
-                };
-                Some((BlockKind::Impl, name, vis))
-            }
-            "mod_item" => {
-                let name = Self::child_text(node, "name", source)?;
-                Some((BlockKind::Module, name, vis))
-            }
-            "const_item" | "static_item" => {
-                let name = Self::child_text(node, "name", source)?;
-                Some((BlockKind::Constant, name, vis))
-            }
-            "type_item" => {
-                let name = Self::child_text(node, "name", source)?;
-                Some((BlockKind::TypeAlias, name, vis))
-            }
-            _ => None,
-        }
-    }
-
-    fn rust_visibility(node: &tree_sitter::Node, _source: &str) -> Option<Visibility> {
-        let mut cursor = node.walk();
-        for child in node.children(&mut cursor) {
-            if child.kind() == "visibility_modifier" {
-                return Some(Visibility::Public);
-            }
-        }
-        Some(Visibility::Private)
-    }
-
-    fn child_text(node: &tree_sitter::Node, field: &str, source: &str) -> Option<String> {
+    ) -> Option<String> {
         node.child_by_field_name(field)
             .and_then(|n| n.utf8_text(source.as_bytes()).ok())
             .map(|s| s.to_string())
     }
 
-    fn extract_signature(
+    /// Extract a rough signature from the first line of a node.
+    pub(crate) fn extract_signature(
         node: &tree_sitter::Node,
         source: &str,
-        _language: &Language,
     ) -> Option<String> {
-        // Take the first line of the node as a rough signature
         let text = node.utf8_text(source.as_bytes()).ok()?;
         let first_line = text.lines().next()?;
         Some(first_line.trim().to_string())
     }
 
-    fn collect_references(
-        _file_path: &str,
-        source: &str,
-        language: &Language,
-        node: &tree_sitter::Node,
-        from_id: &NodeId,
-        refs: &mut Vec<RawReference>,
-    ) {
-        // Use a stack-based traversal to avoid issues with cursor invalidation
-        let mut stack = vec![*node];
-
-        while let Some(current) = stack.pop() {
-            let kind = current.kind();
-
-            // TODO: VariableUsage requires name resolution context not available
-            // during first-pass parsing. It would need a symbol table to distinguish
-            // variable references from other identifiers.
-
-            match language {
-                Language::Python => match kind {
-                    "import_statement" | "import_from_statement" => {
-                        if let Some(module) = current
-                            .child_by_field_name("module_name")
-                            .or_else(|| current.child_by_field_name("name"))
-                        {
-                            if let Ok(text) = module.utf8_text(source.as_bytes()) {
-                                refs.push(RawReference {
-                                    from_node: from_id.clone(),
-                                    kind: RawRefKind::Import {
-                                        module_path: text.to_string(),
-                                    },
-                                    name: text.to_string(),
-                                    span: Self::node_span(&current),
-                                });
-                            }
-                        }
-                    }
-                    "call" => {
-                        if let Some(func) = current.child_by_field_name("function") {
-                            if func.kind() == "attribute" {
-                                // Method call: obj.method()
-                                // Extract the method name (last identifier after .)
-                                let name = Self::extract_function_name(&func, source);
-                                if !name.is_empty() {
-                                    refs.push(RawReference {
-                                        from_node: from_id.clone(),
-                                        kind: RawRefKind::MethodCall,
-                                        name,
-                                        span: Self::node_span(&current),
-                                    });
-                                }
-                            } else {
-                                // Regular function call
-                                let name = Self::extract_function_name(&func, source);
-                                if !name.is_empty() {
-                                    refs.push(RawReference {
-                                        from_node: from_id.clone(),
-                                        kind: RawRefKind::FunctionCall,
-                                        name,
-                                        span: Self::node_span(&current),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    "type" => {
-                        // Type annotations in function parameters and return types
-                        if let Ok(text) = current.utf8_text(source.as_bytes()) {
-                            let name = text.trim().to_string();
-                            if !name.is_empty() && !Self::is_python_builtin_type(&name) {
-                                refs.push(RawReference {
-                                    from_node: from_id.clone(),
-                                    kind: RawRefKind::TypeReference,
-                                    name,
-                                    span: Self::node_span(&current),
-                                });
-                            }
-                        }
-                    }
-                    "argument_list" => {
-                        // Check if this is a superclass list in a class definition
-                        if let Some(parent) = current.parent() {
-                            if parent.kind() == "class_definition" {
-                                let mut cursor = current.walk();
-                                for child in current.children(&mut cursor) {
-                                    if child.kind() == "identifier" {
-                                        if let Ok(text) = child.utf8_text(source.as_bytes()) {
-                                            refs.push(RawReference {
-                                                from_node: from_id.clone(),
-                                                kind: RawRefKind::Inheritance,
-                                                name: text.to_string(),
-                                                span: Self::node_span(&child),
-                                            });
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                },
-                Language::TypeScript | Language::JavaScript => match kind {
-                    "import_statement" => {
-                        if let Some(src) = current.child_by_field_name("source") {
-                            if let Ok(text) = src.utf8_text(source.as_bytes()) {
-                                let clean = text.trim_matches(|c| c == '\'' || c == '"');
-                                refs.push(RawReference {
-                                    from_node: from_id.clone(),
-                                    kind: RawRefKind::Import {
-                                        module_path: clean.to_string(),
-                                    },
-                                    name: clean.to_string(),
-                                    span: Self::node_span(&current),
-                                });
-                            }
-                        }
-                    }
-                    "call_expression" => {
-                        if let Some(func) = current.child_by_field_name("function") {
-                            if func.kind() == "member_expression" {
-                                // Method call: obj.method()
-                                // Extract property name from member_expression
-                                let name = Self::extract_function_name(&func, source);
-                                if !name.is_empty() {
-                                    refs.push(RawReference {
-                                        from_node: from_id.clone(),
-                                        kind: RawRefKind::MethodCall,
-                                        name,
-                                        span: Self::node_span(&current),
-                                    });
-                                }
-                            } else {
-                                // Regular function call
-                                let name = Self::extract_function_name(&func, source);
-                                if !name.is_empty() {
-                                    refs.push(RawReference {
-                                        from_node: from_id.clone(),
-                                        kind: RawRefKind::FunctionCall,
-                                        name,
-                                        span: Self::node_span(&current),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    "type_identifier" => {
-                        // Custom type references (not predefined_type like number, string)
-                        if let Ok(text) = current.utf8_text(source.as_bytes()) {
-                            let name = text.trim().to_string();
-                            if !name.is_empty() {
-                                refs.push(RawReference {
-                                    from_node: from_id.clone(),
-                                    kind: RawRefKind::TypeReference,
-                                    name,
-                                    span: Self::node_span(&current),
-                                });
-                            }
-                        }
-                    }
-                    "extends_clause" => {
-                        // class Foo extends Bar
-                        let mut cursor = current.walk();
-                        for child in current.children(&mut cursor) {
-                            if child.kind() == "identifier" || child.kind() == "type_identifier" {
-                                if let Ok(text) = child.utf8_text(source.as_bytes()) {
-                                    refs.push(RawReference {
-                                        from_node: from_id.clone(),
-                                        kind: RawRefKind::Inheritance,
-                                        name: text.to_string(),
-                                        span: Self::node_span(&child),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                },
-                Language::Rust => match kind {
-                    "use_declaration" => {
-                        if let Some(name) = Self::extract_use_name(&current, source) {
-                            refs.push(RawReference {
-                                from_node: from_id.clone(),
-                                kind: RawRefKind::Import {
-                                    module_path: name.clone(),
-                                },
-                                name,
-                                span: Self::node_span(&current),
-                            });
-                        }
-                    }
-                    "call_expression" => {
-                        if let Some(func) = current.child_by_field_name("function") {
-                            if func.kind() == "field_expression" {
-                                // Method call: self.method() or foo.bar()
-                                let name = Self::extract_function_name(&func, source);
-                                if !name.is_empty() && name != "Self" && name != "self" {
-                                    refs.push(RawReference {
-                                        from_node: from_id.clone(),
-                                        kind: RawRefKind::MethodCall,
-                                        name,
-                                        span: Self::node_span(&current),
-                                    });
-                                }
-                            } else {
-                                // Regular function call or path call (Vec::new())
-                                let name = Self::extract_function_name(&func, source);
-                                if !name.is_empty() && name != "Self" && name != "self" {
-                                    refs.push(RawReference {
-                                        from_node: from_id.clone(),
-                                        kind: RawRefKind::FunctionCall,
-                                        name,
-                                        span: Self::node_span(&current),
-                                    });
-                                }
-                            }
-                        }
-                    }
-                    "type_identifier" => {
-                        // Type references in function parameters, return types, struct fields
-                        // Skip common primitive types that won't resolve
-                        if let Ok(text) = current.utf8_text(source.as_bytes()) {
-                            let name = text.trim().to_string();
-                            if !name.is_empty() && !Self::is_rust_builtin_type(&name) {
-                                refs.push(RawReference {
-                                    from_node: from_id.clone(),
-                                    kind: RawRefKind::TypeReference,
-                                    name,
-                                    span: Self::node_span(&current),
-                                });
-                            }
-                        }
-                    }
-                    "impl_item" => {
-                        // Extract trait name from `impl Trait for Type`
-                        if let Some(trait_node) = current.child_by_field_name("trait") {
-                            if let Ok(text) = trait_node.utf8_text(source.as_bytes()) {
-                                refs.push(RawReference {
-                                    from_node: from_id.clone(),
-                                    kind: RawRefKind::TraitImpl,
-                                    name: text.to_string(),
-                                    span: Self::node_span(&trait_node),
-                                });
-                            }
-                        }
-                    }
-                    _ => {}
-                },
-            }
-
-            // Push children onto stack
-            let child_count = current.child_count();
-            for i in 0..child_count {
-                if let Some(child) = current.child(i) {
-                    stack.push(child);
-                }
-            }
-        }
-    }
-
-    fn node_span(node: &tree_sitter::Node) -> Span {
+    /// Create a Span from a tree-sitter Node.
+    pub(crate) fn node_span(node: &tree_sitter::Node) -> Span {
         Span {
             start_line: node.start_position().row + 1,
             start_col: node.start_position().column,
@@ -585,56 +170,9 @@ impl Extractor {
         }
     }
 
-    /// Check if a Python type name is a built-in type that won't resolve to a user symbol.
-    fn is_python_builtin_type(name: &str) -> bool {
-        matches!(
-            name,
-            "int"
-                | "str"
-                | "float"
-                | "bool"
-                | "bytes"
-                | "list"
-                | "dict"
-                | "set"
-                | "tuple"
-                | "None"
-                | "type"
-                | "object"
-                | "complex"
-                | "range"
-                | "frozenset"
-                | "bytearray"
-                | "memoryview"
-        )
-    }
-
-    /// Check if a Rust type name is a primitive that won't resolve to a user symbol.
-    fn is_rust_builtin_type(name: &str) -> bool {
-        matches!(
-            name,
-            "i8" | "i16"
-                | "i32"
-                | "i64"
-                | "i128"
-                | "isize"
-                | "u8"
-                | "u16"
-                | "u32"
-                | "u64"
-                | "u128"
-                | "usize"
-                | "f32"
-                | "f64"
-                | "bool"
-                | "char"
-                | "str"
-        )
-    }
-
     /// Extract the actual function name from a call expression.
     /// Handles: foo(), self.foo(), Self::foo(), module::foo(), obj.method()
-    fn extract_function_name(node: &tree_sitter::Node, source: &str) -> String {
+    pub(crate) fn extract_function_name(node: &tree_sitter::Node, source: &str) -> String {
         let text = match node.utf8_text(source.as_bytes()) {
             Ok(t) => t,
             Err(_) => return String::new(),
@@ -651,9 +189,8 @@ impl Extractor {
         text.to_string()
     }
 
-    /// Extract imported name from a use declaration
-    fn extract_use_name(node: &tree_sitter::Node, source: &str) -> Option<String> {
-        // Find the last identifier in the use path
+    /// Extract imported name from a use declaration.
+    pub(crate) fn extract_use_name(node: &tree_sitter::Node, source: &str) -> Option<String> {
         fn find_last_ident(n: &tree_sitter::Node, src: &str) -> Option<String> {
             if n.kind() == "identifier" {
                 return n.utf8_text(src.as_bytes()).ok().map(|s| s.to_string());
@@ -678,7 +215,7 @@ mod tests {
     use super::*;
     use crate::model::{BlockKind, Language, Visibility};
 
-    // ── Helpers ──────────────────────────────────────────────────────
+    // -- Helpers --
 
     fn extract(source: &str, lang: &Language) -> (Vec<CodeNode>, Vec<RawReference>) {
         Extractor::extract_file("test.file", source, lang).expect("extraction should succeed")
@@ -691,7 +228,7 @@ mod tests {
         refs.iter().filter(|r| kind_match(&r.kind)).collect()
     }
 
-    // ── F1: MethodCall tests ─────────────────────────────────────────
+    // -- F1: MethodCall tests --
 
     #[test]
     fn test_python_method_call() {
@@ -746,7 +283,7 @@ mod tests {
             .unwrap_or_else(|| panic!("no code block with kind {:?}", kind))
     }
 
-    // ── Python tests ─────────────────────────────────────────────────
+    // -- Python tests --
 
     #[test]
     fn test_extract_python_function() {
@@ -888,7 +425,7 @@ mod tests {
         );
     }
 
-    // ── F2: TypeReference tests ──────────────────────────────────────
+    // -- F2: TypeReference tests --
 
     #[test]
     fn test_python_type_annotation() {
@@ -971,7 +508,7 @@ mod tests {
         );
     }
 
-    // ── F3: Inheritance tests ────────────────────────────────────────
+    // -- F3: Inheritance tests --
 
     #[test]
     fn test_python_inheritance() {
@@ -1010,7 +547,7 @@ mod tests {
         }
     }
 
-    // ── TypeScript tests ─────────────────────────────────────────────
+    // -- TypeScript tests --
 
     #[test]
     fn test_extract_ts_function() {
@@ -1124,7 +661,7 @@ mod tests {
         );
     }
 
-    // ── Rust tests ───────────────────────────────────────────────────
+    // -- Rust tests --
 
     #[test]
     fn test_extract_rust_function() {
@@ -1290,7 +827,7 @@ mod tests {
         );
     }
 
-    // ── F4: TraitImpl tests ──────────────────────────────────────────
+    // -- F4: TraitImpl tests --
 
     #[test]
     fn test_rust_trait_impl() {
@@ -1319,7 +856,7 @@ mod tests {
         );
     }
 
-    // ── Edge cases ───────────────────────────────────────────────────
+    // -- Edge cases --
 
     #[test]
     fn test_extract_empty_file() {
