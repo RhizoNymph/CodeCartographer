@@ -426,13 +426,23 @@ export class PixiRenderer {
   }
 
   /**
-   * Set the hovered node and update edge highlighting
+   * Set the hovered node and update edge highlighting.
+   *
+   * Uses the two-layer optimisation in EdgeDrawingManager: on hover we only
+   * rebuild the lightweight highlight layer instead of destroying and
+   * recreating all edge graphics.
    */
   setHoveredNode(nodeId: string | null) {
     if (this.hoveredNodeId === nodeId) return;
     this.hoveredNodeId = nodeId;
     this.rebuildHoveredEdgeIndices();
-    this.triggerEdgeRedraw();
+
+    // Try a hover-only update (highlight layer only).
+    // Falls back to a full redraw if the base layer doesn't exist yet.
+    const handled = this.edgeManager.setHoveredNode(nodeId);
+    if (!handled) {
+      this.triggerEdgeRedraw();
+    }
   }
 
   private rebuildHoveredEdgeIndices() {

@@ -1,6 +1,7 @@
 import type { CodeGraph, CodeNode } from "../../api/types";
 import type { LayoutNodePosition, LayoutResult } from "../layout/elkLayout";
 import type { NodeDisplay } from "./nodeCreation";
+import type { NodePadding } from "./types";
 
 interface DragTarget {
   nodeId: string;
@@ -8,13 +9,6 @@ interface DragTarget {
   offsetY: number;
   /** Track descendants to move with parent */
   descendants: Array<{ nodeId: string; relX: number; relY: number }>;
-}
-
-interface NodePadding {
-  top: number;
-  right: number;
-  bottom: number;
-  left: number;
 }
 
 /**
