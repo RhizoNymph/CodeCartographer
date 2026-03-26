@@ -3,6 +3,7 @@ import { Toolbar } from "./toolbar/Toolbar";
 import { Sidebar } from "./sidebar/Sidebar";
 import { Canvas } from "./canvas/Canvas";
 import { Tooltip } from "./canvas/Tooltip";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import { useGraphStore } from "./stores/graphStore";
 
 export function App() {
@@ -28,10 +29,18 @@ export function App() {
         height: "100%",
       }}
     >
-      <Toolbar />
+      <ErrorBoundary fallbackMessage="Toolbar error">
+        <Toolbar />
+      </ErrorBoundary>
       <div style={{ display: "flex", flex: 1, overflow: "hidden", position: "relative" }}>
-        {isLoaded && <Sidebar />}
-        <Canvas />
+        {isLoaded && (
+          <ErrorBoundary fallbackMessage="Sidebar error">
+            <Sidebar />
+          </ErrorBoundary>
+        )}
+        <ErrorBoundary fallbackMessage="Canvas failed to render">
+          <Canvas />
+        </ErrorBoundary>
         <Tooltip />
       </div>
     </div>

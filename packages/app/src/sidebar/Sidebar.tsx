@@ -1,15 +1,16 @@
 import { useGraphStore } from "../stores/graphStore";
 import type { CodeNode } from "../api/types";
-import { useState, useMemo, useCallback } from "react";
+import { memo, useState, useMemo, useDeferredValue } from "react";
+import { computeMatchingNodeIds } from "./searchUtils";
 
 interface TreeItemProps {
   nodeId: string;
   depth: number;
   searchQuery: string;
-  matchingIds: Set<string> | null;
+  matchingNodeIds: Set<string>;
 }
 
-function TreeItem({ nodeId, depth, searchQuery, matchingIds }: TreeItemProps) {
+const TreeItem = memo(function TreeItem({ nodeId, depth, searchQuery, matchingNodeIds }: TreeItemProps) {
   const graph = useGraphStore((s) => s.graph);
   const expandedNodes = useGraphStore((s) => s.expandedNodes);
   const visibleNodes = useGraphStore((s) => s.visibleNodes);
@@ -22,9 +23,8 @@ function TreeItem({ nodeId, depth, searchQuery, matchingIds }: TreeItemProps) {
   const node = graph.nodes[nodeId];
   if (!node) return null;
 
-  // Filter by search query
-  const matchesSearch = !searchQuery || !matchingIds || matchingIds.has(nodeId);
-  if (!matchesSearch) return null;
+  // Filter by search query — node must be in the pre-computed matching set
+  if (!matchingNodeIds.has(nodeId)) return null;
 
   const isExpanded = expandedNodes.has(nodeId);
   const isVisible = visibleNodes.has(nodeId);
@@ -117,18 +117,25 @@ function TreeItem({ nodeId, depth, searchQuery, matchingIds }: TreeItemProps) {
 
       {isExpanded &&
         hasChildren &&
-        node.children.map((childId) => (
-          <TreeItem
-            key={childId}
-            nodeId={childId}
-            depth={depth + 1}
-            searchQuery={searchQuery}
-            matchingIds={matchingIds}
-          />
-        ))}
+        node.children
+          .filter((childId) => matchingNodeIds.has(childId))
+          .map((childId) => (
+            <TreeItem
+              key={childId}
+              nodeId={childId}
+              depth={depth + 1}
+              searchQuery={searchQuery}
+              matchingNodeIds={matchingNodeIds}
+            />
+          ))}
     </div>
   );
-}
+}, (prev, next) =>
+    prev.nodeId === next.nodeId &&
+    prev.depth === next.depth &&
+    prev.searchQuery === next.searchQuery &&
+    prev.matchingNodeIds === next.matchingNodeIds
+);
 
 function highlightMatch(text: string, query: string): React.ReactNode {
   if (!query) return text;
@@ -181,45 +188,17 @@ function getTextColor(node: CodeNode): string {
   }
 }
 
-function computeMatchingIds(
-  graph: { nodes: Record<string, CodeNode>; root: string },
-  query: string
-): Set<string> {
-  const result = new Set<string>();
-  const q = query.toLowerCase();
-
-  function visit(nodeId: string): boolean {
-    const node = graph.nodes[nodeId];
-    if (!node) return false;
-    const selfMatches = node.name.toLowerCase().includes(q);
-    let anyChildMatches = false;
-    for (const childId of node.children) {
-      if (visit(childId)) anyChildMatches = true;
-    }
-    if (selfMatches || anyChildMatches) {
-      result.add(nodeId);
-      return true;
-    }
-    return false;
-  }
-
-  const root = graph.nodes[graph.root];
-  if (root) {
-    for (const childId of root.children) visit(childId);
-  }
-  return result;
-}
-
 export function Sidebar() {
   const graph = useGraphStore((s) => s.graph);
   const parseProgress = useGraphStore((s) => s.parseProgress);
   const isParsing = useGraphStore((s) => s.isParsing);
   const needsRelayout = useGraphStore((s) => s.needsRelayout);
   const requestRelayout = useGraphStore((s) => s.requestRelayout);
-  const [searchQuery, setSearchQuery] = useState("");
+  const [searchInput, setSearchInput] = useState("");
+  const searchQuery = useDeferredValue(searchInput);
 
-  const matchingIds = useMemo(
-    () => (graph && searchQuery ? computeMatchingIds(graph, searchQuery) : null),
+  const matchingNodeIds = useMemo(
+    () => graph ? computeMatchingNodeIds(graph, searchQuery) : new Set<string>(),
     [graph, searchQuery]
   );
 
@@ -247,8 +226,8 @@ export function Sidebar() {
         <input
           type="text"
           placeholder="Search symbols..."
-          value={searchQuery}
-          onChange={(e) => setSearchQuery(e.target.value)}
+          value={searchInput}
+          onChange={(e) => setSearchInput(e.target.value)}
           style={{
             width: "100%",
             padding: "6px 10px",
@@ -369,15 +348,17 @@ export function Sidebar() {
           padding: "4px 0",
         }}
       >
-        {rootNode.children.map((childId) => (
-          <TreeItem
-            key={childId}
-            nodeId={childId}
-            depth={0}
-            searchQuery={searchQuery}
-            matchingIds={matchingIds}
-          />
-        ))}
+        {rootNode.children
+          .filter((childId) => matchingNodeIds.has(childId))
+          .map((childId) => (
+            <TreeItem
+              key={childId}
+              nodeId={childId}
+              depth={0}
+              searchQuery={searchQuery}
+              matchingNodeIds={matchingNodeIds}
+            />
+          ))}
       </div>
 
       {/* Stats */}

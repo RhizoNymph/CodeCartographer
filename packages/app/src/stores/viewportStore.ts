@@ -62,18 +62,23 @@ function loadEdgeLODSettings(): EdgeLODSettings {
   return { ...DEFAULT_EDGE_LOD_SETTINGS };
 }
 
-// Save settings to localStorage
+// Save settings to localStorage with debouncing to avoid excessive writes
+let lodSaveTimer: ReturnType<typeof setTimeout> | null = null;
+
 function saveEdgeLODSettings(settings: EdgeLODSettings) {
-  try {
-    localStorage.setItem("edgeLODSettings", JSON.stringify({
-      minimapOpacity: settings.minimapOpacity,
-      overviewOpacity: settings.overviewOpacity,
-      showEdgesInMinimap: settings.showEdgesInMinimap,
-      hideAtOverview: Array.from(settings.hideAtOverview),
-    }));
-  } catch (e) {
-    console.warn("Failed to save edge LOD settings:", e);
-  }
+  if (lodSaveTimer) clearTimeout(lodSaveTimer);
+  lodSaveTimer = setTimeout(() => {
+    try {
+      localStorage.setItem("edgeLODSettings", JSON.stringify({
+        minimapOpacity: settings.minimapOpacity,
+        overviewOpacity: settings.overviewOpacity,
+        showEdgesInMinimap: settings.showEdgesInMinimap,
+        hideAtOverview: Array.from(settings.hideAtOverview),
+      }));
+    } catch {
+      // localStorage quota exceeded or unavailable — silently ignore
+    }
+  }, 500);
 }
 
 export const useViewportStore = create<ViewportState>((set, get) => ({
