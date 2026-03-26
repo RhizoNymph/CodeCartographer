@@ -44,9 +44,25 @@ parse_repo(path, on_event, state)
 | File | Role | Key exports/interfaces |
 |------|------|----------------------|
 | `crates/cc-tauri/src/commands/parse.rs` | Orchestrates parallel parsing | `parse_repo` command |
-| `crates/cc-tauri/Cargo.toml` | rayon dependency | `rayon = { workspace = true }` |
+| `crates/cc-tauri/src/commands/error.rs` | Structured parse error types | `ParseError` enum |
+| `crates/cc-tauri/src/commands/mod.rs` | Module exports | `pub mod error` |
+| `crates/cc-tauri/Cargo.toml` | rayon + thiserror deps | `rayon`, `thiserror` workspace deps |
 | `crates/cc-core/src/parser/extract.rs` | File parsing (called per-file) | `Extractor::extract_file()` |
 | `crates/cc-core/src/resolver/symbol_table.rs` | Symbol resolution (sequential) | `SymbolTable::build_from_graph()`, `resolve_references()` |
+
+## Structured Error Types
+
+The `ParseError` enum in `crates/cc-tauri/src/commands/error.rs` provides typed, serializable errors for the parse pipeline:
+
+- `PathNotFound(String)` - Target path does not exist on disk
+- `Deserialization(String)` - Failed to deserialize graph data
+- `FileParseFailed { file, message }` - Tree-sitter parse failed for a specific file
+
+These errors derive `thiserror::Error`, `Debug`, and `serde::Serialize` so they can be returned directly over Tauri IPC.
+
+## Debug Logging
+
+Diagnostic logging (sample refs and symbols) is gated behind `tracing::event_enabled!(tracing::Level::DEBUG)`. This avoids iterating over collections at INFO level in production. The gate check is a zero-cost no-op when DEBUG is not enabled.
 
 ## Invariants and Constraints
 
@@ -55,3 +71,4 @@ parse_repo(path, on_event, state)
 3. Graph mutations (`add_node`, `add_edge`) happen only in the sequential phases.
 4. Symbol resolution requires the complete graph with all nodes, so it must happen after all parallel parsing and sequential merging is complete.
 5. File I/O happens during the parallel phase, taking advantage of OS-level I/O parallelism.
+6. `ParseError` must remain `Serialize` to cross the Tauri IPC boundary.

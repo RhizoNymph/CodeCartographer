@@ -37,9 +37,10 @@ Features Index:
         doc: docs/features/graph-layout.md
 
     graph-model:
-        description: Rust data model for code graphs including nodes (Directory, File, CodeBlock), edges with kinds, adjacency indexes, and subgraph extraction.
-        entry_points: [crates/cc-core/src/model/graph.rs, crates/cc-core/src/model/edge.rs]
+        description: Rust data model for code graphs including nodes (Directory, File, CodeBlock), edges with kinds, adjacency indexes, EdgeIndex for O(1) dedup, and subgraph extraction.
+        entry_points: [crates/cc-core/src/model/graph.rs, crates/cc-core/src/model/edge.rs, crates/cc-core/src/model/edge_index.rs]
         depends_on: []
+        doc: docs/features/edge_dedup.md
 
     parsing:
         description: Tree-sitter based source code parsing using a trait-based LanguageSupport system. Extracts code blocks and raw references from Python, TypeScript, JavaScript, and Rust files. Includes extension probing for import resolution.

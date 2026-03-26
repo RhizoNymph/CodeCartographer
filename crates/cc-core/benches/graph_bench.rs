@@ -151,7 +151,7 @@ fn bench_subgraph_extraction(c: &mut Criterion) {
         let visible: Vec<NodeId> = (0..total / 2)
             .map(|i| NodeId(format!("file_{i}")))
             .collect();
-        let all_kinds = vec![
+        let all_kinds: std::collections::HashSet<EdgeKind> = [
             EdgeKind::Import,
             EdgeKind::FunctionCall,
             EdgeKind::MethodCall,
@@ -159,7 +159,9 @@ fn bench_subgraph_extraction(c: &mut Criterion) {
             EdgeKind::Inheritance,
             EdgeKind::TraitImpl,
             EdgeKind::VariableUsage,
-        ];
+        ]
+        .into_iter()
+        .collect();
 
         group.bench_with_input(
             BenchmarkId::new("nodes", total),

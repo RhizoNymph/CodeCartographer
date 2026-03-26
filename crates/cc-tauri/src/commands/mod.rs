@@ -1,4 +1,5 @@
 mod clone;
+pub mod error;
 mod parse;
 mod scan;
 
