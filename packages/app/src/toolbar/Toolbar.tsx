@@ -4,9 +4,10 @@ import { scanRepo, parseRepo, cloneGithubRepo } from "../api/commands";
 import { useGraphStore } from "../stores/graphStore";
 import { useViewportStore } from "../stores/viewportStore";
 import type { EdgeKind } from "../api/types";
-import { EDGE_COLORS } from "../api/types";
 import { saveLastFolder, getLastFolder, clearLastFolder } from "../stores/persistenceStore";
 import { checkNorestore } from "../api/commands";
+import { EdgeToggleButton } from "./EdgeToggleButton";
+import { LODSettingsPanel } from "./LODSettingsPanel";
 
 const ALL_EDGE_KINDS: EdgeKind[] = [
   "Import",
@@ -278,26 +279,13 @@ export function Toolbar() {
             Edges:
           </span>
           {ALL_EDGE_KINDS.map((kind) => (
-            <button
+            <EdgeToggleButton
               key={kind}
-              onClick={() => toggleEdgeKind(kind)}
-              title={kind}
-              style={{
-                padding: "2px 6px",
-                fontSize: 10,
-                border: `1px solid ${EDGE_COLORS[kind]}`,
-                borderRadius: 4,
-                cursor: "pointer",
-                background: enabledEdgeKinds.has(kind)
-                  ? EDGE_COLORS[kind]
-                  : "transparent",
-                color: enabledEdgeKinds.has(kind) ? "white" : EDGE_COLORS[kind],
-                opacity: enabledEdgeKinds.has(kind) ? 1 : 0.5,
-                whiteSpace: "nowrap",
-              }}
-            >
-              {shortEdgeLabel(kind)}
-            </button>
+              kind={kind}
+              enabled={enabledEdgeKinds.has(kind)}
+              label={shortEdgeLabel(kind)}
+              onToggle={toggleEdgeKind}
+            />
           ))}
 
           {/* LOD Settings button */}
@@ -320,122 +308,10 @@ export function Toolbar() {
 
             {/* LOD Settings dropdown */}
             {showLODSettings && (
-              <div
-                style={{
-                  position: "absolute",
-                  top: "100%",
-                  right: 0,
-                  marginTop: 4,
-                  background: "#1e293b",
-                  border: "1px solid #334155",
-                  borderRadius: 6,
-                  padding: 12,
-                  zIndex: 100,
-                  minWidth: 220,
-                  boxShadow: "0 4px 12px rgba(0,0,0,0.3)",
-                }}
-              >
-                <div style={{ fontSize: 11, fontWeight: 600, color: "#e2e8f0", marginBottom: 10 }}>
-                  Edge LOD Settings
-                </div>
-
-                {/* Show edges in minimap */}
-                <label
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    gap: 8,
-                    fontSize: 11,
-                    color: "#94a3b8",
-                    marginBottom: 10,
-                    cursor: "pointer",
-                  }}
-                >
-                  <input
-                    type="checkbox"
-                    checked={edgeLODSettings.showEdgesInMinimap}
-                    onChange={(e) =>
-                      setEdgeLODSettings({ showEdgesInMinimap: e.target.checked })
-                    }
-                    style={{ accentColor: "#3b82f6" }}
-                  />
-                  Show edges at minimap zoom
-                </label>
-
-                {/* Minimap opacity slider */}
-                <div style={{ marginBottom: 10 }}>
-                  <div style={{ fontSize: 10, color: "#64748b", marginBottom: 4 }}>
-                    Minimap opacity: {Math.round(edgeLODSettings.minimapOpacity * 100)}%
-                  </div>
-                  <input
-                    type="range"
-                    min="0"
-                    max="100"
-                    value={edgeLODSettings.minimapOpacity * 100}
-                    onChange={(e) =>
-                      setEdgeLODSettings({ minimapOpacity: parseInt(e.target.value) / 100 })
-                    }
-                    style={{ width: "100%", accentColor: "#3b82f6" }}
-                  />
-                </div>
-
-                {/* Overview opacity slider */}
-                <div style={{ marginBottom: 10 }}>
-                  <div style={{ fontSize: 10, color: "#64748b", marginBottom: 4 }}>
-                    Overview opacity: {Math.round(edgeLODSettings.overviewOpacity * 100)}%
-                  </div>
-                  <input
-                    type="range"
-                    min="0"
-                    max="100"
-                    value={edgeLODSettings.overviewOpacity * 100}
-                    onChange={(e) =>
-                      setEdgeLODSettings({ overviewOpacity: parseInt(e.target.value) / 100 })
-                    }
-                    style={{ width: "100%", accentColor: "#3b82f6" }}
-                  />
-                </div>
-
-                {/* Hide at overview */}
-                <div>
-                  <div style={{ fontSize: 10, color: "#64748b", marginBottom: 6 }}>
-                    Hide at overview zoom:
-                  </div>
-                  <div style={{ display: "flex", flexWrap: "wrap", gap: 4 }}>
-                    {ALL_EDGE_KINDS.map((kind) => (
-                      <button
-                        key={kind}
-                        onClick={() => {
-                          const newSet = new Set(edgeLODSettings.hideAtOverview);
-                          if (newSet.has(kind)) {
-                            newSet.delete(kind);
-                          } else {
-                            newSet.add(kind);
-                          }
-                          setEdgeLODSettings({ hideAtOverview: newSet });
-                        }}
-                        title={`${edgeLODSettings.hideAtOverview.has(kind) ? "Show" : "Hide"} ${kind} at overview`}
-                        style={{
-                          padding: "2px 5px",
-                          fontSize: 9,
-                          border: `1px solid ${EDGE_COLORS[kind]}`,
-                          borderRadius: 3,
-                          cursor: "pointer",
-                          background: edgeLODSettings.hideAtOverview.has(kind)
-                            ? EDGE_COLORS[kind]
-                            : "transparent",
-                          color: edgeLODSettings.hideAtOverview.has(kind)
-                            ? "white"
-                            : EDGE_COLORS[kind],
-                          opacity: edgeLODSettings.hideAtOverview.has(kind) ? 0.7 : 0.4,
-                        }}
-                      >
-                        {shortEdgeLabel(kind)}
-                      </button>
-                    ))}
-                  </div>
-                </div>
-              </div>
+              <LODSettingsPanel
+                settings={edgeLODSettings}
+                onSettingsChange={setEdgeLODSettings}
+              />
             )}
           </div>
         </div>

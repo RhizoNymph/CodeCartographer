@@ -22,8 +22,13 @@ interface GraphState {
   isParsing: boolean;
   parseProgress: ParseProgress | null;
 
-  // Visibility state
+  /** Which container nodes (directories/files) have their children shown in the graph layout.
+   *  Controls the ELK tree structure -- expanded nodes include their children as ELK sub-nodes. */
   expandedNodes: Set<string>;
+
+  /** Which nodes are checkbox-toggled as visible in the sidebar.
+   *  Controls both sidebar checkbox state and canvas node rendering.
+   *  Independent from expandedNodes -- a node can be visible but collapsed. */
   visibleNodes: Set<string>;
   selectedNodeId: string | null;
   hoveredNodeId: string | null;

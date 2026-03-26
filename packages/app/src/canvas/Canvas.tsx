@@ -1,4 +1,5 @@
 import { useRef, useEffect, useState } from "react";
+import { useShallow } from "zustand/react/shallow";
 import { PixiRenderer } from "./renderers/PixiRenderer";
 import { useGraphStore } from "../stores/graphStore";
 import { useViewportStore } from "../stores/viewportStore";
@@ -7,13 +8,25 @@ import { useDebugStore } from "../stores/debugStore";
 export function Canvas() {
   const containerRef = useRef<HTMLDivElement>(null);
   const rendererRef = useRef<PixiRenderer | null>(null);
-  const graph = useGraphStore((s) => s.graph);
-  const expandedNodes = useGraphStore((s) => s.expandedNodes);
-  const visibleNodes = useGraphStore((s) => s.visibleNodes);
-  const selectedNodeId = useGraphStore((s) => s.selectedNodeId);
-  const hoveredNodeId = useGraphStore((s) => s.hoveredNodeId);
-  const enabledEdgeKinds = useGraphStore((s) => s.enabledEdgeKinds);
-  const layoutVersion = useGraphStore((s) => s.layoutVersion);
+  const {
+    graph,
+    expandedNodes,
+    visibleNodes,
+    selectedNodeId,
+    hoveredNodeId,
+    enabledEdgeKinds,
+    layoutVersion,
+  } = useGraphStore(
+    useShallow((s) => ({
+      graph: s.graph,
+      expandedNodes: s.expandedNodes,
+      visibleNodes: s.visibleNodes,
+      selectedNodeId: s.selectedNodeId,
+      hoveredNodeId: s.hoveredNodeId,
+      enabledEdgeKinds: s.enabledEdgeKinds,
+      layoutVersion: s.layoutVersion,
+    }))
+  );
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {

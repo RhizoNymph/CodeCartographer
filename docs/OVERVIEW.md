@@ -52,3 +52,21 @@ Features Index:
         description: Zustand stores for graph state, viewport state, debug logging, and persistence.
         entry_points: [packages/app/src/stores/graphStore.ts, packages/app/src/stores/viewportStore.ts, packages/app/src/stores/debugStore.ts]
         depends_on: []
+
+    sidebar:
+        description: File/symbol tree sidebar with search, checkbox visibility toggles, and expansion controls.
+        entry_points: [packages/app/src/sidebar/Sidebar.tsx, packages/app/src/sidebar/searchUtils.ts]
+        depends_on: [state-management]
+        doc: docs/features/sidebar.md
+
+    toolbar:
+        description: Top toolbar with folder open, GitHub clone, edge kind toggles, and LOD settings panel.
+        entry_points: [packages/app/src/toolbar/Toolbar.tsx, packages/app/src/toolbar/EdgeToggleButton.tsx, packages/app/src/toolbar/LODSettingsPanel.tsx]
+        depends_on: [state-management]
+        doc: docs/features/toolbar.md
+
+    error-handling:
+        description: React ErrorBoundary components wrapping major UI sections for graceful error recovery.
+        entry_points: [packages/app/src/components/ErrorBoundary.tsx, packages/app/src/App.tsx]
+        depends_on: []
+        doc: docs/features/error-handling.md
