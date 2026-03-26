@@ -4,47 +4,138 @@ import {
   anchorEdgePolyline,
   rerouteOrthogonalEdge,
   translatePolyline,
-  type EdgeAnchor,
   type Point,
 } from "../layout/edgeGeometry";
 import type { LayoutResult } from "../layout/elkLayout";
 import { useViewportStore, type LODLevel } from "../../stores/viewportStore";
+import {
+  EDGE_STYLES,
+  DEFAULT_EDGE_STYLE,
+  type EdgeDatum,
+  type NodeDisplayRef,
+} from "./types";
 
-// Edge styling configuration by type
-const EDGE_STYLES: Record<EdgeKind, { width: number; baseAlpha: number }> = {
-  Import: { width: 2.5, baseAlpha: 0.9 },
-  Inheritance: { width: 2.5, baseAlpha: 0.9 },
-  TraitImpl: { width: 2.5, baseAlpha: 0.85 },
-  FunctionCall: { width: 2, baseAlpha: 0.8 },
-  MethodCall: { width: 2, baseAlpha: 0.8 },
-  TypeReference: { width: 2, baseAlpha: 0.75 },
-  VariableUsage: { width: 1.5, baseAlpha: 0.5 },
-};
+// Re-export types for backwards compatibility with existing imports
+export type { EdgeDatum, NodeDisplayRef } from "./types";
 
-const DEFAULT_EDGE_STYLE = { width: 2, baseAlpha: 0.85 };
+/**
+ * Resolves edge routing points for a single edge given current node positions.
+ * Extracted so both base and highlight layers can share this logic.
+ */
+function resolveEdgePoints(
+  edge: EdgeDatum,
+  getNodeDisplayRef: (nodeId: string) => NodeDisplayRef | null
+): Point[] | null {
+  const sourceRef = getNodeDisplayRef(edge.source);
+  const targetRef = getNodeDisplayRef(edge.target);
 
-export interface EdgeDatum {
-  source: string;
-  target: string;
-  color: string;
-  kind: EdgeKind | null;
-  originalPoints: Point[];
-  sourceAnchor: EdgeAnchor;
-  targetAnchor: EdgeAnchor;
-}
+  if (!sourceRef || !targetRef || edge.originalPoints.length < 2) return null;
 
-export interface NodeDisplayRef {
-  containerX: number;
-  containerY: number;
-  layoutWidth: number;
-  layoutHeight: number;
-  layoutX: number;
-  layoutY: number;
+  const sourceBox = {
+    x: sourceRef.containerX,
+    y: sourceRef.containerY,
+    width: sourceRef.layoutWidth,
+    height: sourceRef.layoutHeight,
+  };
+  const targetBox = {
+    x: targetRef.containerX,
+    y: targetRef.containerY,
+    width: targetRef.layoutWidth,
+    height: targetRef.layoutHeight,
+  };
+  const sourceDx = sourceRef.containerX - sourceRef.layoutX;
+  const sourceDy = sourceRef.containerY - sourceRef.layoutY;
+  const targetDx = targetRef.containerX - targetRef.layoutX;
+  const targetDy = targetRef.containerY - targetRef.layoutY;
+  const sourceMoved = Math.abs(sourceDx) > 1 || Math.abs(sourceDy) > 1;
+  const targetMoved = Math.abs(targetDx) > 1 || Math.abs(targetDy) > 1;
+
+  let points: Point[];
+  if (!sourceMoved && !targetMoved) {
+    points = anchorEdgePolyline(
+      edge.originalPoints,
+      sourceBox,
+      targetBox,
+      edge.sourceAnchor,
+      edge.targetAnchor
+    );
+  } else if (
+    Math.abs(sourceDx - targetDx) <= 1 &&
+    Math.abs(sourceDy - targetDy) <= 1
+  ) {
+    points = anchorEdgePolyline(
+      translatePolyline(
+        edge.originalPoints,
+        (sourceDx + targetDx) / 2,
+        (sourceDy + targetDy) / 2
+      ),
+      sourceBox,
+      targetBox,
+      edge.sourceAnchor,
+      edge.targetAnchor
+    );
+  } else {
+    points = rerouteOrthogonalEdge(
+      edge.originalPoints,
+      sourceBox,
+      targetBox,
+      edge.sourceAnchor,
+      edge.targetAnchor
+    );
+  }
+
+  return points.length >= 2 ? points : null;
 }
 
 /**
- * Manages all edge-related rendering: building edge data from layout,
- * redrawing with highlight/LOD state, and scheduling redraws during drag.
+ * Draw a single edge (path + start cap + arrowhead) into a Graphics object.
+ */
+function renderSingleEdge(
+  gfx: Graphics,
+  points: Point[],
+  color: number,
+  alpha: number,
+  width: number,
+  showStartCap: boolean
+): void {
+  drawEdgePath(gfx, points, Math.max(4, width * 2.2));
+  gfx.stroke({
+    color,
+    width,
+    alpha,
+    cap: "round",
+    join: "round",
+  });
+
+  if (showStartCap) {
+    drawEdgeStartCap(gfx, points[0], color, alpha, width);
+  }
+
+  drawEdgeArrowhead(
+    gfx,
+    points[points.length - 2],
+    points[points.length - 1],
+    color,
+    alpha,
+    width
+  );
+}
+
+/**
+ * Manages all edge-related rendering using a two-layer architecture:
+ *
+ * - **baseLayer**: contains ALL edges drawn at normal LOD-based opacity.
+ *   Rebuilt on layout change, visibility change, LOD change, or drag.
+ *
+ * - **highlightLayer**: contains ONLY the highlighted (connected-to-hovered-node)
+ *   edges at full opacity. Rebuilt on hover change only.
+ *
+ * On hover, instead of destroying and recreating all edge graphics (O(n)):
+ *   1. Dim the base layer by setting its alpha to 0.15
+ *   2. Draw only highlighted edges onto the highlightLayer
+ *   3. On unhover: restore baseLayer alpha, clear highlightLayer
+ *
+ * This reduces hover cost from O(totalEdges) to O(connectedEdges).
  */
 export class EdgeDrawingManager {
   edgeData: EdgeDatum[] = [];
@@ -52,8 +143,19 @@ export class EdgeDrawingManager {
   nodeToEdgeIndices = new Map<string, number[]>();
   highlightedEdgeIndices = new Set<number>();
 
-  private edgeGraphics: Graphics | null = null;
+  /** Base layer: all edges at normal opacity. Only rebuilt on layout/visibility/LOD/drag. */
+  private baseLayer: Graphics | null = null;
+  /** Highlight layer: only connected edges at full opacity. Only rebuilt on hover. */
+  private highlightLayer: Graphics | null = null;
+
   private edgeRedrawFrame: number | null = null;
+
+  /** Stashed state so highlight layer can be rebuilt without full redraw args. */
+  private _lastEdgeLayer: Container | null = null;
+  private _lastLOD: LODLevel = "detail";
+  private _lastVisibleNodes: Set<string> = new Set();
+  private _lastGetRef: ((nodeId: string) => NodeDisplayRef | null) | null = null;
+  private _hoveredNodeId: string | null = null;
 
   /**
    * Build edge data from a layout result and populate the node-to-edge index.
@@ -84,7 +186,8 @@ export class EdgeDrawingManager {
   }
 
   /**
-   * Redraw all edges with current hover/LOD/visibility state.
+   * Full redraw of the base layer. Called on layout, visibility, LOD, or drag changes.
+   * If a node is currently hovered, also rebuilds the highlight layer.
    */
   redrawEdgesWithHighlight(
     edgeLayer: Container,
@@ -93,157 +196,125 @@ export class EdgeDrawingManager {
     currentVisibleNodes: Set<string>,
     getNodeDisplayRef: (nodeId: string) => NodeDisplayRef | null
   ): void {
+    // Stash state for highlight-only redraws
+    this._lastEdgeLayer = edgeLayer;
+    this._lastLOD = currentLOD;
+    this._lastVisibleNodes = currentVisibleNodes;
+    this._lastGetRef = getNodeDisplayRef;
+    this._hoveredNodeId = hoveredNodeId;
+
     if (this.edgeData.length === 0) return;
 
-    // Remove old edge graphics
-    if (this.edgeGraphics) {
-      this.edgeGraphics.destroy();
-      this.edgeGraphics = null;
-    }
+    // Destroy old layers
+    this.destroyBaseLayer();
+    this.destroyHighlightLayer();
 
     const gfx = new Graphics();
-
-    // Get connected edge indices for hovered node
-    const connectedEdgeIndices = this.highlightedEdgeIndices;
-
-    // Get LOD-based opacity multiplier
     const lodOpacityMultiplier = getLODEdgeOpacity(currentLOD);
 
-    // Draw edges (non-highlighted first, then highlighted on top)
-    const edgesToDraw = this.edgeData.map((edge, idx) => ({ edge, idx }));
-
-    // Sort so highlighted edges are drawn last (on top)
-    if (hoveredNodeId) {
-      edgesToDraw.sort((a, b) => {
-        const aConnected = connectedEdgeIndices.has(a.idx);
-        const bConnected = connectedEdgeIndices.has(b.idx);
-        if (aConnected && !bConnected) return 1;
-        if (!aConnected && bConnected) return -1;
-        return 0;
-      });
-    }
-
-    for (const { edge, idx } of edgesToDraw) {
+    for (const [idx, edge] of this.edgeData.entries()) {
       // Skip edges where either endpoint is not visible
       if (!currentVisibleNodes.has(edge.source) || !currentVisibleNodes.has(edge.target)) {
         continue;
       }
 
-      // Skip edge kinds that should be hidden at current LOD (unless highlighting)
-      if (!hoveredNodeId && shouldHideEdgeKindAtLOD(edge.kind, currentLOD)) {
+      // Skip edge kinds that should be hidden at current LOD
+      if (shouldHideEdgeKindAtLOD(edge.kind, currentLOD)) {
         continue;
       }
 
-      const sourceRef = getNodeDisplayRef(edge.source);
-      const targetRef = getNodeDisplayRef(edge.target);
+      const points = resolveEdgePoints(edge, getNodeDisplayRef);
+      if (!points) continue;
 
-      if (!sourceRef || !targetRef || edge.originalPoints.length < 2) continue;
-
-      const color = parseInt(edge.color.replace("#", ""), 16);
       const style = edge.kind ? EDGE_STYLES[edge.kind] : DEFAULT_EDGE_STYLE;
-      const sourceBox = {
-        x: sourceRef.containerX,
-        y: sourceRef.containerY,
-        width: sourceRef.layoutWidth,
-        height: sourceRef.layoutHeight,
-      };
-      const targetBox = {
-        x: targetRef.containerX,
-        y: targetRef.containerY,
-        width: targetRef.layoutWidth,
-        height: targetRef.layoutHeight,
-      };
-      const sourceDx = sourceRef.containerX - sourceRef.layoutX;
-      const sourceDy = sourceRef.containerY - sourceRef.layoutY;
-      const targetDx = targetRef.containerX - targetRef.layoutX;
-      const targetDy = targetRef.containerY - targetRef.layoutY;
-      const sourceMoved = Math.abs(sourceDx) > 1 || Math.abs(sourceDy) > 1;
-      const targetMoved = Math.abs(targetDx) > 1 || Math.abs(targetDy) > 1;
-
-      let points: Point[];
-      if (!sourceMoved && !targetMoved) {
-        points = anchorEdgePolyline(
-          edge.originalPoints,
-          sourceBox,
-          targetBox,
-          edge.sourceAnchor,
-          edge.targetAnchor
-        );
-      } else if (
-        Math.abs(sourceDx - targetDx) <= 1 &&
-        Math.abs(sourceDy - targetDy) <= 1
-      ) {
-        points = anchorEdgePolyline(
-          translatePolyline(
-            edge.originalPoints,
-            (sourceDx + targetDx) / 2,
-            (sourceDy + targetDy) / 2
-          ),
-          sourceBox,
-          targetBox,
-          edge.sourceAnchor,
-          edge.targetAnchor
-        );
-      } else {
-        points = rerouteOrthogonalEdge(
-          edge.originalPoints,
-          sourceBox,
-          targetBox,
-          edge.sourceAnchor,
-          edge.targetAnchor
-        );
-      }
-
-      if (points.length < 2) continue;
-
-      // Calculate alpha based on hover state and LOD
-      const isConnected = connectedEdgeIndices.has(idx);
-      let alpha: number;
-      let width: number;
-
-      if (hoveredNodeId) {
-        // Hover mode: highlight connected, dim others
-        if (isConnected) {
-          alpha = 1.0;
-          width = style.width + 1;
-        } else {
-          alpha = 0.15;
-          width = style.width * 0.8;
-        }
-      } else {
-        // Normal mode: apply LOD and base style
-        alpha = style.baseAlpha * lodOpacityMultiplier;
-        width = style.width * getLODEdgeWidthMultiplier(currentLOD);
-      }
+      const color = parseInt(edge.color.replace("#", ""), 16);
+      const alpha = style.baseAlpha * lodOpacityMultiplier;
+      const width = style.width * getLODEdgeWidthMultiplier(currentLOD);
 
       // Skip edges that are too faint
       if (alpha < 0.05) continue;
 
-      drawEdgePath(gfx, points, Math.max(4, width * 2.2));
-      gfx.stroke({
-        color,
-        width,
-        alpha,
-        cap: "round",
-        join: "round",
-      });
-
-      if (currentLOD !== "minimap") {
-        drawEdgeStartCap(gfx, points[0], color, alpha, width);
-      }
-
-      drawEdgeArrowhead(
-        gfx,
-        points[points.length - 2],
-        points[points.length - 1],
-        color,
-        alpha,
-        width
-      );
+      renderSingleEdge(gfx, points, color, alpha, width, currentLOD !== "minimap");
     }
 
     edgeLayer.addChild(gfx);
-    this.edgeGraphics = gfx;
+    this.baseLayer = gfx;
+
+    // If hovered, dim the base layer and draw highlights on top
+    if (hoveredNodeId && this.highlightedEdgeIndices.size > 0) {
+      this.baseLayer.alpha = 0.15;
+      this.rebuildHighlightLayer();
+    }
+  }
+
+  /**
+   * Update hover state. Only rebuilds the highlight layer if the base layer
+   * already exists -- avoids the expensive full base-layer rebuild.
+   *
+   * Returns true if a hover-only update was performed (no full redraw needed).
+   */
+  setHoveredNode(hoveredNodeId: string | null): boolean {
+    this._hoveredNodeId = hoveredNodeId;
+
+    if (!this.baseLayer || !this._lastEdgeLayer) {
+      // No base layer yet -- caller should trigger a full redraw
+      return false;
+    }
+
+    // Destroy old highlight layer
+    this.destroyHighlightLayer();
+
+    if (hoveredNodeId && this.highlightedEdgeIndices.size > 0) {
+      // Dim base layer and draw highlighted edges
+      this.baseLayer.alpha = 0.15;
+      this.rebuildHighlightLayer();
+    } else {
+      // Restore base layer to full opacity
+      this.baseLayer.alpha = 1.0;
+    }
+
+    return true;
+  }
+
+  /**
+   * Rebuild only the highlight layer with the currently highlighted edges.
+   * Uses the stashed state from the last full redraw.
+   */
+  private rebuildHighlightLayer(): void {
+    if (
+      !this._lastEdgeLayer ||
+      !this._lastGetRef ||
+      this.highlightedEdgeIndices.size === 0
+    ) {
+      return;
+    }
+
+    const gfx = new Graphics();
+    const getRef = this._lastGetRef;
+    const currentLOD = this._lastLOD;
+    const visibleNodes = this._lastVisibleNodes;
+
+    for (const idx of this.highlightedEdgeIndices) {
+      const edge = this.edgeData[idx];
+      if (!edge) continue;
+
+      if (!visibleNodes.has(edge.source) || !visibleNodes.has(edge.target)) {
+        continue;
+      }
+
+      const points = resolveEdgePoints(edge, getRef);
+      if (!points) continue;
+
+      const style = edge.kind ? EDGE_STYLES[edge.kind] : DEFAULT_EDGE_STYLE;
+      const color = parseInt(edge.color.replace("#", ""), 16);
+      const alpha = 1.0;
+      const width = style.width + 1;
+
+      renderSingleEdge(gfx, points, color, alpha, width, currentLOD !== "minimap");
+    }
+
+    this._lastEdgeLayer.addChild(gfx);
+    this.highlightLayer = gfx;
   }
 
   /**
@@ -272,17 +343,48 @@ export class EdgeDrawingManager {
   }
 
   /**
-   * Clean up the edge graphics and cancel pending redraws.
+   * Clean up all edge graphics and cancel pending redraws.
    */
   destroyEdgeGraphics(): void {
     if (this.edgeRedrawFrame !== null) {
       window.cancelAnimationFrame(this.edgeRedrawFrame);
       this.edgeRedrawFrame = null;
     }
-    if (this.edgeGraphics) {
-      this.edgeGraphics.destroy();
-      this.edgeGraphics = null;
+    this.destroyBaseLayer();
+    this.destroyHighlightLayer();
+    this._lastEdgeLayer = null;
+    this._lastGetRef = null;
+  }
+
+  private destroyBaseLayer(): void {
+    if (this.baseLayer) {
+      this.baseLayer.destroy();
+      this.baseLayer = null;
     }
+  }
+
+  private destroyHighlightLayer(): void {
+    if (this.highlightLayer) {
+      this.highlightLayer.destroy();
+      this.highlightLayer = null;
+    }
+  }
+
+  // --- Test helpers (internal use only) ---
+
+  /** @internal Exposed for testing: whether the base layer exists */
+  get _hasBaseLayer(): boolean {
+    return this.baseLayer !== null;
+  }
+
+  /** @internal Exposed for testing: whether the highlight layer exists */
+  get _hasHighlightLayer(): boolean {
+    return this.highlightLayer !== null;
+  }
+
+  /** @internal Exposed for testing: the base layer alpha value */
+  get _baseLayerAlpha(): number | null {
+    return this.baseLayer?.alpha ?? null;
   }
 }
 
