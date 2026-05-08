@@ -21,10 +21,10 @@ export function buildParentMap(graph: CodeGraph): Map<string, string> {
 export function getNodeSize(node: CodeNode): { width: number; height: number } {
   switch (node.type) {
     case "Directory":
-      return { width: 200, height: 60 };
+      return { width: 220, height: 70 };
     case "File":
-      return { width: 180, height: 40 };
+      return { width: 180, height: 44 };
     case "CodeBlock":
-      return { width: 160, height: 32 };
+      return { width: 150, height: 28 };
   }
 }

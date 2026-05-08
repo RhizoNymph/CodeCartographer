@@ -181,6 +181,7 @@ export class EdgeDrawingManager {
         originalPoints: e.points.map((p) => ({ x: p.x, y: p.y })),
         sourceAnchor: e.sourceAnchor,
         targetAnchor: e.targetAnchor,
+        count: 1,
       };
     });
   }
@@ -229,7 +230,9 @@ export class EdgeDrawingManager {
       const style = edge.kind ? EDGE_STYLES[edge.kind] : DEFAULT_EDGE_STYLE;
       const color = parseInt(edge.color.replace("#", ""), 16);
       const alpha = style.baseAlpha * lodOpacityMultiplier;
-      const width = style.width * getLODEdgeWidthMultiplier(currentLOD);
+      // Scale width by edge count (log scale so bundled edges are visually thicker)
+      const countScale = edge.count > 1 ? 1 + Math.log2(edge.count) * 0.4 : 1;
+      const width = style.width * getLODEdgeWidthMultiplier(currentLOD) * countScale;
 
       // Skip edges that are too faint
       if (alpha < 0.05) continue;

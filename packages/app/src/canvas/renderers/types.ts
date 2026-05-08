@@ -36,6 +36,8 @@ export interface EdgeDatum {
   originalPoints: Point[];
   sourceAnchor: EdgeAnchor;
   targetAnchor: EdgeAnchor;
+  /** Number of underlying edges this datum represents (>1 for bundled edges). */
+  count: number;
 }
 
 /**
