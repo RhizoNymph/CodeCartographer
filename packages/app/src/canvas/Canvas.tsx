@@ -85,6 +85,15 @@ export function Canvas() {
     }
   }, [hoveredNodeId]);
 
+  // Watch for pending zoom-to-node requests
+  const pendingZoomNodeId = useGraphStore((s) => s.pendingZoomNodeId);
+  useEffect(() => {
+    if (rendererRef.current && pendingZoomNodeId) {
+      rendererRef.current.zoomToNode(pendingZoomNodeId);
+      useGraphStore.getState().requestZoomToNode(null);
+    }
+  }, [pendingZoomNodeId]);
+
   // Redraw edges when LOD settings change
   const edgeLODSettings = useViewportStore((s) => s.edgeLODSettings);
   useEffect(() => {

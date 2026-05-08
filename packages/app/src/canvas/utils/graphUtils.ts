@@ -28,3 +28,21 @@ export function getNodeSize(node: CodeNode): { width: number; height: number } {
       return { width: 160, height: 32 };
   }
 }
+
+/**
+ * Walk the parent chain from a given node to the root, returning
+ * an ordered path from root to the node (inclusive).
+ */
+export function getNodeAncestorPath(nodeId: string, graph: CodeGraph): string[] {
+  const parentMap = buildParentMap(graph);
+  const path: string[] = [];
+  let current: string | undefined = nodeId;
+
+  while (current) {
+    path.push(current);
+    current = parentMap.get(current);
+  }
+
+  path.reverse();
+  return path;
+}

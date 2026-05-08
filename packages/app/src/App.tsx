@@ -4,6 +4,10 @@ import { Sidebar } from "./sidebar/Sidebar";
 import { Canvas } from "./canvas/Canvas";
 import { Tooltip } from "./canvas/Tooltip";
 import { ErrorBoundary } from "./components/ErrorBoundary";
+import { WelcomeScreen } from "./components/WelcomeScreen";
+import { Breadcrumbs } from "./components/Breadcrumbs";
+import { EdgeLegend } from "./components/EdgeLegend";
+import { DetailsPanel } from "./panels/DetailsPanel";
 import { useGraphStore } from "./stores/graphStore";
 
 export function App() {
@@ -32,16 +36,29 @@ export function App() {
       <ErrorBoundary fallbackMessage="Toolbar error">
         <Toolbar />
       </ErrorBoundary>
-      <div style={{ display: "flex", flex: 1, overflow: "hidden", position: "relative" }}>
-        {isLoaded && (
-          <ErrorBoundary fallbackMessage="Sidebar error">
-            <Sidebar />
-          </ErrorBoundary>
-        )}
-        <ErrorBoundary fallbackMessage="Canvas failed to render">
-          <Canvas />
+      {isLoaded && (
+        <ErrorBoundary fallbackMessage="Breadcrumbs error">
+          <Breadcrumbs />
         </ErrorBoundary>
-        <Tooltip />
+      )}
+      <div style={{ display: "flex", flex: 1, overflow: "hidden", position: "relative" }}>
+        {isLoaded ? (
+          <>
+            <ErrorBoundary fallbackMessage="Sidebar error">
+              <Sidebar />
+            </ErrorBoundary>
+            <ErrorBoundary fallbackMessage="Canvas failed to render">
+              <Canvas />
+            </ErrorBoundary>
+            <Tooltip />
+            <EdgeLegend />
+            <ErrorBoundary fallbackMessage="Details panel error">
+              <DetailsPanel />
+            </ErrorBoundary>
+          </>
+        ) : (
+          <WelcomeScreen />
+        )}
       </div>
     </div>
   );

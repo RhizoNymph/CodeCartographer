@@ -2,6 +2,7 @@ import { useGraphStore } from "../stores/graphStore";
 import type { CodeNode } from "../api/types";
 import { memo, useState, useMemo, useDeferredValue } from "react";
 import { computeMatchingNodeIds } from "./searchUtils";
+import { getIcon } from "../utils/nodeIcons";
 
 interface TreeItemProps {
   nodeId: string;
@@ -152,29 +153,6 @@ function highlightMatch(text: string, query: string): React.ReactNode {
       {text.slice(idx + query.length)}
     </>
   );
-}
-
-function getIcon(node: CodeNode): string {
-  switch (node.type) {
-    case "Directory":
-      return "\ud83d\udcc1";
-    case "File":
-      return "\ud83d\udcc4";
-    case "CodeBlock":
-      switch (node.kind) {
-        case "Function": return "\u0192";
-        case "Class": return "C";
-        case "Struct": return "S";
-        case "Enum": return "E";
-        case "Trait": return "T";
-        case "Interface": return "I";
-        case "Impl": return "\u21d2";
-        case "Module": return "M";
-        case "Constant": return "K";
-        case "TypeAlias": return "\u2261";
-        default: return "\u2022";
-      }
-  }
 }
 
 function getTextColor(node: CodeNode): string {

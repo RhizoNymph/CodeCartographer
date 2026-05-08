@@ -40,6 +40,10 @@ interface GraphState {
   needsRelayout: boolean;
   layoutVersion: number; // Incremented when relayout should happen
 
+  // Details panel state
+  detailsPanelOpen: boolean;
+  pendingZoomNodeId: string | null;
+
   // Actions
   setRepoPath: (path: string) => void;
   setGraph: (graph: CodeGraph, restoreState?: boolean) => void;
@@ -54,6 +58,8 @@ interface GraphState {
   getVisibleNodeIds: () => string[];
   requestRelayout: () => void;
   saveCurrentState: () => void;
+  toggleDetailsPanel: () => void;
+  requestZoomToNode: (id: string | null) => void;
 }
 
 const ALL_EDGE_KINDS: EdgeKind[] = [
@@ -78,6 +84,8 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   enabledEdgeKinds: new Set<EdgeKind>(ALL_EDGE_KINDS),
   needsRelayout: false,
   layoutVersion: 0,
+  detailsPanelOpen: true,
+  pendingZoomNodeId: null,
 
   setRepoPath: (path) => set({ repoPath: path }),
 
@@ -281,4 +289,9 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       saveFolderState(state.repoPath, state.expandedNodes, state.visibleNodes);
     }
   },
+
+  toggleDetailsPanel: () =>
+    set((state) => ({ detailsPanelOpen: !state.detailsPanelOpen })),
+
+  requestZoomToNode: (id) => set({ pendingZoomNodeId: id }),
 }));

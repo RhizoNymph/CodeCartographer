@@ -1,13 +1,12 @@
-import { useState, useEffect, useCallback, useRef } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
-import { scanRepo, parseRepo, cloneGithubRepo } from "../api/commands";
+import { useState, useEffect, useRef } from "react";
 import { useGraphStore } from "../stores/graphStore";
 import { useViewportStore } from "../stores/viewportStore";
 import type { EdgeKind } from "../api/types";
-import { saveLastFolder, getLastFolder, clearLastFolder } from "../stores/persistenceStore";
+import { getLastFolder, clearLastFolder } from "../stores/persistenceStore";
 import { checkNorestore } from "../api/commands";
 import { EdgeToggleButton } from "./EdgeToggleButton";
 import { LODSettingsPanel } from "./LODSettingsPanel";
+import { useRepoActions } from "../hooks/useRepoActions";
 
 const ALL_EDGE_KINDS: EdgeKind[] = [
   "Import",
@@ -24,44 +23,23 @@ export function Toolbar() {
   const graph = useGraphStore((s) => s.graph);
   const isParsing = useGraphStore((s) => s.isParsing);
   const enabledEdgeKinds = useGraphStore((s) => s.enabledEdgeKinds);
-  const setRepoPath = useGraphStore((s) => s.setRepoPath);
-  const setGraph = useGraphStore((s) => s.setGraph);
-  const setIsParsing = useGraphStore((s) => s.setIsParsing);
-  const handleParseEvent = useGraphStore((s) => s.handleParseEvent);
   const toggleEdgeKind = useGraphStore((s) => s.toggleEdgeKind);
 
   const edgeLODSettings = useViewportStore((s) => s.edgeLODSettings);
   const setEdgeLODSettings = useViewportStore((s) => s.setEdgeLODSettings);
 
-  const [showUrlInput, setShowUrlInput] = useState(false);
-  const [repoUrl, setRepoUrl] = useState("");
-  const [isCloning, setIsCloning] = useState(false);
+  const {
+    openAndScan,
+    handleOpenFolder,
+    handleCloneRepo,
+    isCloning,
+    showUrlInput,
+    setShowUrlInput,
+    repoUrl,
+    setRepoUrl,
+  } = useRepoActions();
+
   const [showLODSettings, setShowLODSettings] = useState(false);
-
-  const openAndScan = useCallback(
-    async (path: string) => {
-      setRepoPath(path);
-      saveLastFolder(path);
-      try {
-        const scannedGraph = await scanRepo(path);
-        console.log("Scanned graph edges:", scannedGraph.edges.length);
-        setGraph(scannedGraph);
-
-        setIsParsing(true);
-        const parsedGraph = await parseRepo(
-          path,
-          handleParseEvent
-        );
-        setGraph(parsedGraph);
-        setIsParsing(false);
-      } catch (err) {
-        console.error("Failed to scan/parse repo:", err);
-        setIsParsing(false);
-        alert(`Error: ${err}`);
-      }
-    },
-    [setRepoPath, setGraph, setIsParsing, handleParseEvent]
-  );
 
   // Restore last opened folder on startup (unless --norestore flag was passed)
   const startupRestoredRef = useRef(false);
@@ -87,34 +65,6 @@ export function Toolbar() {
       console.warn("Failed to check norestore flag:", err);
     });
   }, [openAndScan]);
-
-  const handleOpenFolder = async () => {
-    const selected = await open({
-      directory: true,
-      title: "Select Repository",
-    });
-
-    if (selected) {
-      await openAndScan(selected);
-    }
-  };
-
-  const handleCloneRepo = async () => {
-    if (!repoUrl.trim()) return;
-
-    setIsCloning(true);
-    try {
-      const clonedPath = await cloneGithubRepo(repoUrl.trim());
-      setShowUrlInput(false);
-      setRepoUrl("");
-      await openAndScan(clonedPath);
-    } catch (err) {
-      console.error("Failed to clone repo:", err);
-      alert(`Clone failed: ${err}`);
-    } finally {
-      setIsCloning(false);
-    }
-  };
 
   // Keyboard shortcuts
   useEffect(() => {
