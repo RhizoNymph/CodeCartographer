@@ -3,6 +3,7 @@ import { Toolbar } from "./toolbar/Toolbar";
 import { Sidebar } from "./sidebar/Sidebar";
 import { Canvas } from "./canvas/Canvas";
 import { Tooltip } from "./canvas/Tooltip";
+import { ContextMenu } from "./canvas/ContextMenu";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { useGraphStore } from "./stores/graphStore";
 
@@ -32,7 +33,10 @@ export function App() {
       <ErrorBoundary fallbackMessage="Toolbar error">
         <Toolbar />
       </ErrorBoundary>
-      <div style={{ display: "flex", flex: 1, overflow: "hidden", position: "relative" }}>
+      <div
+        style={{ display: "flex", flex: 1, overflow: "hidden", position: "relative" }}
+        onContextMenu={(e) => e.preventDefault()}
+      >
         {isLoaded && (
           <ErrorBoundary fallbackMessage="Sidebar error">
             <Sidebar />
@@ -42,6 +46,7 @@ export function App() {
           <Canvas />
         </ErrorBoundary>
         <Tooltip />
+        <ContextMenu />
       </div>
     </div>
   );

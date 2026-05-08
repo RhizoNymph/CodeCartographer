@@ -1,7 +1,7 @@
 import { useGraphStore } from "../stores/graphStore";
 import type { CodeNode } from "../api/types";
-import { memo, useState, useMemo, useDeferredValue } from "react";
-import { computeMatchingNodeIds } from "./searchUtils";
+import { memo, useState, useMemo, useEffect, useDeferredValue, useCallback } from "react";
+import { computeMatchingNodeIds, computeDirectMatchIds } from "./searchUtils";
 
 interface TreeItemProps {
   nodeId: string;
@@ -18,6 +18,7 @@ const TreeItem = memo(function TreeItem({ nodeId, depth, searchQuery, matchingNo
   const toggleExpanded = useGraphStore((s) => s.toggleExpanded);
   const toggleVisible = useGraphStore((s) => s.toggleVisible);
   const setSelectedNode = useGraphStore((s) => s.setSelectedNode);
+  const requestZoomToNode = useGraphStore((s) => s.requestZoomToNode);
 
   if (!graph) return null;
   const node = graph.nodes[nodeId];
@@ -37,7 +38,7 @@ const TreeItem = memo(function TreeItem({ nodeId, depth, searchQuery, matchingNo
   return (
     <div>
       <div
-        onClick={() => setSelectedNode(nodeId)}
+        onClick={() => { setSelectedNode(nodeId); requestZoomToNode(nodeId); }}
         style={{
           display: "flex",
           alignItems: "center",
@@ -194,6 +195,11 @@ export function Sidebar() {
   const isParsing = useGraphStore((s) => s.isParsing);
   const needsRelayout = useGraphStore((s) => s.needsRelayout);
   const requestRelayout = useGraphStore((s) => s.requestRelayout);
+  const setSearchResults = useGraphStore((s) => s.setSearchResults);
+  const clearSearch = useGraphStore((s) => s.clearSearch);
+  const navigateSearchResult = useGraphStore((s) => s.navigateSearchResult);
+  const searchResultIndex = useGraphStore((s) => s.searchResultIndex);
+  const searchResultOrder = useGraphStore((s) => s.searchResultOrder);
   const [searchInput, setSearchInput] = useState("");
   const searchQuery = useDeferredValue(searchInput);
 
@@ -201,6 +207,31 @@ export function Sidebar() {
     () => graph ? computeMatchingNodeIds(graph, searchQuery) : new Set<string>(),
     [graph, searchQuery]
   );
+
+  const directMatchIds = useMemo(
+    () => graph ? computeDirectMatchIds(graph, searchQuery) : [],
+    [graph, searchQuery]
+  );
+
+  // Sync search results to graph store for canvas highlighting
+  useEffect(() => {
+    if (searchQuery.trim()) {
+      setSearchResults(matchingNodeIds, directMatchIds);
+    } else {
+      clearSearch();
+    }
+  }, [matchingNodeIds, directMatchIds, searchQuery, setSearchResults, clearSearch]);
+
+  const handleSearchKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (e.key === "Enter") {
+      e.preventDefault();
+      if (e.shiftKey) {
+        navigateSearchResult("prev");
+      } else {
+        navigateSearchResult("next");
+      }
+    }
+  }, [navigateSearchResult]);
 
   if (!graph) return null;
 
@@ -223,28 +254,73 @@ export function Sidebar() {
     >
       {/* Search and Relayout */}
       <div style={{ padding: "8px 12px", borderBottom: "1px solid #334155" }}>
-        <input
-          type="text"
-          placeholder="Search symbols..."
-          value={searchInput}
-          onChange={(e) => setSearchInput(e.target.value)}
-          style={{
-            width: "100%",
-            padding: "6px 10px",
-            background: "#0f172a",
-            border: "1px solid #334155",
-            borderRadius: 6,
-            color: "#e2e8f0",
-            fontSize: 13,
-            outline: "none",
-          }}
-          onFocus={(e) =>
-            (e.currentTarget.style.borderColor = "#3b82f6")
-          }
-          onBlur={(e) =>
-            (e.currentTarget.style.borderColor = "#334155")
-          }
-        />
+        <div style={{ display: "flex", gap: 4, alignItems: "center" }}>
+          <input
+            type="text"
+            placeholder="Search symbols..."
+            value={searchInput}
+            onChange={(e) => setSearchInput(e.target.value)}
+            onKeyDown={handleSearchKeyDown}
+            style={{
+              flex: 1,
+              padding: "6px 10px",
+              background: "#0f172a",
+              border: "1px solid #334155",
+              borderRadius: 6,
+              color: "#e2e8f0",
+              fontSize: 13,
+              outline: "none",
+              minWidth: 0,
+            }}
+            onFocus={(e) =>
+              (e.currentTarget.style.borderColor = "#3b82f6")
+            }
+            onBlur={(e) =>
+              (e.currentTarget.style.borderColor = "#334155")
+            }
+          />
+          {searchQuery.trim() && searchResultOrder.length > 0 && (
+            <>
+              <span style={{ fontSize: 11, color: "#94a3b8", whiteSpace: "nowrap", flexShrink: 0 }}>
+                {searchResultIndex + 1}/{searchResultOrder.length}
+              </span>
+              <button
+                onClick={() => navigateSearchResult("prev")}
+                style={{
+                  background: "#334155",
+                  border: "none",
+                  borderRadius: 4,
+                  color: "#e2e8f0",
+                  cursor: "pointer",
+                  padding: "2px 6px",
+                  fontSize: 12,
+                  lineHeight: 1,
+                  flexShrink: 0,
+                }}
+                title="Previous match (Shift+Enter)"
+              >
+                &#9650;
+              </button>
+              <button
+                onClick={() => navigateSearchResult("next")}
+                style={{
+                  background: "#334155",
+                  border: "none",
+                  borderRadius: 4,
+                  color: "#e2e8f0",
+                  cursor: "pointer",
+                  padding: "2px 6px",
+                  fontSize: 12,
+                  lineHeight: 1,
+                  flexShrink: 0,
+                }}
+                title="Next match (Enter)"
+              >
+                &#9660;
+              </button>
+            </>
+          )}
+        </div>
         {needsRelayout && (
           <button
             onClick={requestRelayout}

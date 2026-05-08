@@ -148,6 +148,30 @@ export class PixiRenderer {
       }
     });
 
+    // Interactive minimap: click/drag to navigate viewport
+    this.app.stage.on("pointerdown", (e) => {
+      const bounds = this.minimapRenderer.getMinimapBounds();
+      if (!bounds) return;
+      const { x, y } = e.global;
+      if (
+        x >= bounds.x &&
+        x <= bounds.x + bounds.width &&
+        y >= bounds.y &&
+        y <= bounds.y + bounds.height
+      ) {
+        e.stopPropagation();
+        const worldPos = this.minimapRenderer.screenToWorld(x, y);
+        if (worldPos) {
+          this.viewport.animate({
+            position: worldPos,
+            time: 300,
+            ease: "easeInOutQuad",
+          });
+        }
+      }
+    });
+    this.app.stage.eventMode = "static";
+
     this.initialized = true;
 
     // Process any pending update
@@ -329,6 +353,17 @@ export class PixiRenderer {
 
     // Click handler
     display.container.on("pointerdown", (e) => {
+      // Right-click: open context menu
+      if (e.button === 2) {
+        e.stopPropagation();
+        useGraphStore.getState().setContextMenu({
+          nodeId,
+          screenX: e.global.x,
+          screenY: e.global.y,
+        });
+        return;
+      }
+
       e.stopPropagation();
       useGraphStore.getState().setSelectedNode(nodeId);
 
@@ -521,6 +556,23 @@ export class PixiRenderer {
     });
 
     useGraphStore.getState().setSelectedNode(nodeId);
+  }
+
+  /**
+   * Highlight/dim nodes based on search results.
+   * Nodes in matchIds are shown at full opacity; others are dimmed.
+   * Pass null to reset all nodes to full opacity.
+   */
+  setSearchHighlight(matchIds: Set<string> | null): void {
+    if (!matchIds || matchIds.size === 0) {
+      for (const [, display] of this.nodeDisplays) {
+        display.container.alpha = 1.0;
+      }
+      return;
+    }
+    for (const [nodeId, display] of this.nodeDisplays) {
+      display.container.alpha = matchIds.has(nodeId) ? 1.0 : 0.25;
+    }
   }
 
   /**

@@ -41,3 +41,43 @@ export function computeMatchingNodeIds(
 
     return matchingIds;
 }
+
+/**
+ * Returns ONLY directly matching node IDs (not ancestors), sorted in
+ * tree-traversal (depth-first) order. Used for prev/next navigation.
+ */
+export function computeDirectMatchIds(
+    graph: CodeGraph,
+    query: string
+): string[] {
+    if (!query.trim()) return [];
+
+    const lowerQuery = query.toLowerCase();
+
+    // Collect direct matches
+    const directMatches = new Set<string>();
+    for (const [id, node] of Object.entries(graph.nodes)) {
+        if (node.name.toLowerCase().includes(lowerQuery)) {
+            directMatches.add(id);
+        }
+    }
+
+    if (directMatches.size === 0) return [];
+
+    // Sort in tree-traversal (depth-first) order
+    const ordered: string[] = [];
+    const traverse = (nodeId: string) => {
+        if (directMatches.has(nodeId)) {
+            ordered.push(nodeId);
+        }
+        const node = graph.nodes[nodeId];
+        if (node) {
+            for (const childId of node.children) {
+                traverse(childId);
+            }
+        }
+    };
+    traverse(graph.root);
+
+    return ordered;
+}

@@ -40,6 +40,17 @@ interface GraphState {
   needsRelayout: boolean;
   layoutVersion: number; // Incremented when relayout should happen
 
+  // Search state
+  searchMatchIds: Set<string>;
+  searchResultOrder: string[];
+  searchResultIndex: number;
+
+  // Zoom target (for sidebar -> canvas communication)
+  pendingZoomNodeId: string | null;
+
+  // Context menu state
+  contextMenu: { nodeId: string; screenX: number; screenY: number } | null;
+
   // Actions
   setRepoPath: (path: string) => void;
   setGraph: (graph: CodeGraph, restoreState?: boolean) => void;
@@ -54,6 +65,15 @@ interface GraphState {
   getVisibleNodeIds: () => string[];
   requestRelayout: () => void;
   saveCurrentState: () => void;
+  setSearchResults: (matchIds: Set<string>, directMatchOrder: string[]) => void;
+  navigateSearchResult: (direction: "next" | "prev") => void;
+  clearSearch: () => void;
+  requestZoomToNode: (id: string | null) => void;
+  setContextMenu: (menu: { nodeId: string; screenX: number; screenY: number } | null) => void;
+  expandSubtree: (nodeId: string) => void;
+  collapseSubtree: (nodeId: string) => void;
+  hideSubtree: (nodeId: string) => void;
+  showOnlyDependencies: (nodeId: string) => void;
 }
 
 const ALL_EDGE_KINDS: EdgeKind[] = [
@@ -78,6 +98,11 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   enabledEdgeKinds: new Set<EdgeKind>(ALL_EDGE_KINDS),
   needsRelayout: false,
   layoutVersion: 0,
+  searchMatchIds: new Set<string>(),
+  searchResultOrder: [],
+  searchResultIndex: -1,
+  pendingZoomNodeId: null,
+  contextMenu: null,
 
   setRepoPath: (path) => set({ repoPath: path }),
 
@@ -280,5 +305,117 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     if (state.repoPath) {
       saveFolderState(state.repoPath, state.expandedNodes, state.visibleNodes);
     }
+  },
+
+  setSearchResults: (matchIds, directMatchOrder) => {
+    set({
+      searchMatchIds: matchIds,
+      searchResultOrder: directMatchOrder,
+      searchResultIndex: directMatchOrder.length > 0 ? 0 : -1,
+    });
+  },
+
+  navigateSearchResult: (direction) => {
+    const { searchResultOrder, searchResultIndex } = get();
+    if (searchResultOrder.length === 0) return;
+
+    let newIndex: number;
+    if (direction === "next") {
+      newIndex = (searchResultIndex + 1) % searchResultOrder.length;
+    } else {
+      newIndex = (searchResultIndex - 1 + searchResultOrder.length) % searchResultOrder.length;
+    }
+    const nodeId = searchResultOrder[newIndex];
+    set({
+      searchResultIndex: newIndex,
+      selectedNodeId: nodeId,
+      pendingZoomNodeId: nodeId,
+    });
+  },
+
+  clearSearch: () => {
+    set({
+      searchMatchIds: new Set<string>(),
+      searchResultOrder: [],
+      searchResultIndex: -1,
+    });
+  },
+
+  requestZoomToNode: (id) => {
+    set({ pendingZoomNodeId: id });
+  },
+
+  setContextMenu: (menu) => {
+    set({ contextMenu: menu });
+  },
+
+  expandSubtree: (nodeId) => {
+    const graph = get().graph;
+    if (!graph) return;
+    const expanded = new Set(get().expandedNodes);
+    const addRecursive = (id: string) => {
+      const node = graph.nodes[id];
+      if (!node || node.children.length === 0) return;
+      expanded.add(id);
+      for (const childId of node.children) addRecursive(childId);
+    };
+    addRecursive(nodeId);
+    set({ expandedNodes: expanded, needsRelayout: true });
+  },
+
+  collapseSubtree: (nodeId) => {
+    const graph = get().graph;
+    if (!graph) return;
+    const expanded = new Set(get().expandedNodes);
+    const removeRecursive = (id: string) => {
+      expanded.delete(id);
+      const node = graph.nodes[id];
+      if (node) {
+        for (const childId of node.children) removeRecursive(childId);
+      }
+    };
+    removeRecursive(nodeId);
+    set({ expandedNodes: expanded, needsRelayout: true });
+  },
+
+  hideSubtree: (nodeId) => {
+    const graph = get().graph;
+    if (!graph) return;
+    const visible = new Set(get().visibleNodes);
+    const removeRecursive = (id: string) => {
+      visible.delete(id);
+      const node = graph.nodes[id];
+      if (node) {
+        for (const childId of node.children) removeRecursive(childId);
+      }
+    };
+    removeRecursive(nodeId);
+    set({ visibleNodes: visible, needsRelayout: true });
+  },
+
+  showOnlyDependencies: (nodeId) => {
+    const graph = get().graph;
+    if (!graph) return;
+    const enabledKinds = get().enabledEdgeKinds;
+    const connected = new Set<string>([nodeId]);
+    for (const edge of graph.edges) {
+      if (!enabledKinds.has(edge.kind)) continue;
+      if (edge.source === nodeId) connected.add(edge.target);
+      if (edge.target === nodeId) connected.add(edge.source);
+    }
+    // Add ancestor paths for connected nodes
+    const parentMap = new Map<string, string>();
+    for (const [id, node] of Object.entries(graph.nodes)) {
+      for (const childId of node.children) parentMap.set(childId, id);
+    }
+    const withAncestors = new Set(connected);
+    for (const id of connected) {
+      let current = parentMap.get(id);
+      while (current) {
+        withAncestors.add(current);
+        current = parentMap.get(current);
+      }
+    }
+    set({ visibleNodes: withAncestors, needsRelayout: true });
   },
 }));

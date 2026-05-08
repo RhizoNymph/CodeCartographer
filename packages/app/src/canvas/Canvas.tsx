@@ -27,6 +27,8 @@ export function Canvas() {
       layoutVersion: s.layoutVersion,
     }))
   );
+  const searchMatchIds = useGraphStore((s) => s.searchMatchIds);
+  const pendingZoomNodeId = useGraphStore((s) => s.pendingZoomNodeId);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -84,6 +86,23 @@ export function Canvas() {
       rendererRef.current.setHoveredNode(hoveredNodeId);
     }
   }, [hoveredNodeId]);
+
+  // Search highlight
+  useEffect(() => {
+    if (rendererRef.current) {
+      rendererRef.current.setSearchHighlight(
+        searchMatchIds.size > 0 ? searchMatchIds : null
+      );
+    }
+  }, [searchMatchIds]);
+
+  // Zoom to node (triggered from sidebar click or search navigation)
+  useEffect(() => {
+    if (rendererRef.current && pendingZoomNodeId) {
+      rendererRef.current.zoomToNode(pendingZoomNodeId);
+      useGraphStore.getState().requestZoomToNode(null);
+    }
+  }, [pendingZoomNodeId]);
 
   // Redraw edges when LOD settings change
   const edgeLODSettings = useViewportStore((s) => s.edgeLODSettings);

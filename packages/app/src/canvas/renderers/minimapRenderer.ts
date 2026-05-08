@@ -20,6 +20,7 @@ export class MinimapRenderer {
   private _minimapNodesGfx: Graphics | null = null;
   private _minimapViewportGfx: Graphics | null = null;
   private _minimapLayoutVersion: LayoutResult | null = null;
+  private lastGeometry: MinimapGeometry | null = null;
 
   /**
    * Compute minimap geometry (world bounds and scale) from a layout.
@@ -52,7 +53,33 @@ export class MinimapRenderer {
     const scaleY = (mmHeight - 8) / worldH;
     const mmScale = Math.min(scaleX, scaleY);
 
-    return { mmX, mmY, mmWidth, mmHeight, minX, minY, mmScale };
+    const geo = { mmX, mmY, mmWidth, mmHeight, minX, minY, mmScale };
+    this.lastGeometry = geo;
+    return geo;
+  }
+
+  /**
+   * Returns screen-space bounds of the minimap rectangle, or null if not computed.
+   */
+  getMinimapBounds(): { x: number; y: number; width: number; height: number } | null {
+    if (!this.lastGeometry) return null;
+    return {
+      x: this.lastGeometry.mmX,
+      y: this.lastGeometry.mmY,
+      width: this.lastGeometry.mmWidth,
+      height: this.lastGeometry.mmHeight,
+    };
+  }
+
+  /**
+   * Converts a screen-space click within the minimap to world coordinates.
+   */
+  screenToWorld(screenX: number, screenY: number): { x: number; y: number } | null {
+    if (!this.lastGeometry) return null;
+    const { mmX, mmY, mmScale, minX, minY } = this.lastGeometry;
+    const worldX = (screenX - mmX - 4) / mmScale + minX;
+    const worldY = (screenY - mmY - 4) / mmScale + minY;
+    return { x: worldX, y: worldY };
   }
 
   /**
@@ -94,6 +121,9 @@ export class MinimapRenderer {
       gfx.rect(rx, ry, rw, rh);
       gfx.fill({ color: 0x3b82f6, alpha: 0.5 });
     }
+
+    gfx.eventMode = "static";
+    gfx.cursor = "pointer";
 
     app.stage.addChild(gfx);
     this._minimapNodesGfx = gfx;
