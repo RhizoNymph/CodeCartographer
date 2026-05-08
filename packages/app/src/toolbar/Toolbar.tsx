@@ -8,6 +8,7 @@ import { saveLastFolder, getLastFolder, clearLastFolder } from "../stores/persis
 import { checkNorestore } from "../api/commands";
 import { EdgeToggleButton } from "./EdgeToggleButton";
 import { LODSettingsPanel } from "./LODSettingsPanel";
+import { VisualizationModeSelector } from "./VisualizationModeSelector";
 
 const ALL_EDGE_KINDS: EdgeKind[] = [
   "Import",
@@ -261,6 +262,9 @@ export function Toolbar() {
 
       {/* Spacer */}
       <div style={{ flex: 1 }} />
+
+      {/* Visualization mode selector */}
+      {graph && <VisualizationModeSelector />}
 
       {/* Edge type toggles */}
       {graph && graph.edges.length > 0 && (

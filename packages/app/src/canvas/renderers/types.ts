@@ -36,6 +36,7 @@ export interface EdgeDatum {
   originalPoints: Point[];
   sourceAnchor: EdgeAnchor;
   targetAnchor: EdgeAnchor;
+  count?: number; // aggregated edge count (>1 when multiple edges collapsed into one)
 }
 
 /**

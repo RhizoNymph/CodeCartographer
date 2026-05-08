@@ -181,6 +181,7 @@ export class EdgeDrawingManager {
         originalPoints: e.points.map((p) => ({ x: p.x, y: p.y })),
         sourceAnchor: e.sourceAnchor,
         targetAnchor: e.targetAnchor,
+        ...(e.count !== undefined && { count: e.count }),
       };
     });
   }
@@ -229,7 +230,12 @@ export class EdgeDrawingManager {
       const style = edge.kind ? EDGE_STYLES[edge.kind] : DEFAULT_EDGE_STYLE;
       const color = parseInt(edge.color.replace("#", ""), 16);
       const alpha = style.baseAlpha * lodOpacityMultiplier;
-      const width = style.width * getLODEdgeWidthMultiplier(currentLOD);
+      let width = style.width * getLODEdgeWidthMultiplier(currentLOD);
+
+      // Scale width for aggregated edges (count > 1)
+      if (edge.count && edge.count > 1) {
+        width *= Math.min(Math.log2(edge.count) + 1, 4);
+      }
 
       // Skip edges that are too faint
       if (alpha < 0.05) continue;
@@ -308,7 +314,12 @@ export class EdgeDrawingManager {
       const style = edge.kind ? EDGE_STYLES[edge.kind] : DEFAULT_EDGE_STYLE;
       const color = parseInt(edge.color.replace("#", ""), 16);
       const alpha = 1.0;
-      const width = style.width + 1;
+      let width = style.width + 1;
+
+      // Scale width for aggregated edges (count > 1)
+      if (edge.count && edge.count > 1) {
+        width *= Math.min(Math.log2(edge.count) + 1, 4);
+      }
 
       renderSingleEdge(gfx, points, color, alpha, width, currentLOD !== "minimap");
     }

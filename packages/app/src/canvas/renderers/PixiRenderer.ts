@@ -531,6 +531,40 @@ export class PixiRenderer {
   }
 
   /**
+   * Apply dependency flow highlighting: dim all nodes not in the chain.
+   * Pass null to clear highlighting.
+   */
+  setDependencyHighlight(chainNodes: Set<string> | null): void {
+    for (const [nodeId, display] of this.nodeDisplays) {
+      if (chainNodes) {
+        display.container.alpha = chainNodes.has(nodeId) ? 1.0 : 0.15;
+      } else {
+        display.container.alpha = 1.0;
+      }
+    }
+  }
+
+  /**
+   * Apply hotspot coloring to nodes based on normalized metric values.
+   * Interpolates from base node color toward red (#ef4444) based on value.
+   * Pass null to clear hotspot coloring.
+   */
+  setHotspotColors(hotspotValues: Map<string, number> | null): void {
+    for (const [nodeId, display] of this.nodeDisplays) {
+      if (hotspotValues && hotspotValues.has(nodeId)) {
+        const value = hotspotValues.get(nodeId)!;
+        // Interpolate from base blue-ish (#1e293b) toward red (#ef4444)
+        const r = Math.floor(0x1e + value * (0xef - 0x1e));
+        const g = Math.floor(0x29 + value * (0x44 - 0x29));
+        const b = Math.floor(0x3b + value * (0x44 - 0x3b));
+        display.bg.tint = (r << 16) | (g << 8) | b;
+      } else {
+        display.bg.tint = 0xffffff;
+      }
+    }
+  }
+
+  /**
    * Unified method to trigger an edge redraw with current state.
    */
   private triggerEdgeRedraw() {

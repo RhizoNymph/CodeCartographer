@@ -47,10 +47,10 @@ function computeAggregatedEdges(
   elkNodeIds: Set<string>,
   parentMap: Map<string, string>,
   enabledEdgeKinds?: Set<EdgeKind>
-): Array<{ source: string; target: string; color: string; kind: EdgeKind | null }> {
+): Array<{ source: string; target: string; color: string; kind: EdgeKind | null; count: number }> {
   // Use a Map to deduplicate edges by source-target pair
-  // Key: "source->target", Value: { color, kind } (we pick one, could aggregate later)
-  const aggregatedMap = new Map<string, { color: string; kind: EdgeKind }>();
+  // Key: "source->target", Value: { color, kind, count }
+  const aggregatedMap = new Map<string, { color: string; kind: EdgeKind; count: number }>();
 
   // Filter edges by enabled kinds
   const filteredEdges = enabledEdgeKinds
@@ -80,18 +80,21 @@ function computeAggregatedEdges(
       continue;
     }
 
-    // Create aggregated edge key and store
+    // Create aggregated edge key and store, incrementing count on collision
     const key = `${visibleSource}->${visibleTarget}`;
-    if (!aggregatedMap.has(key)) {
-      aggregatedMap.set(key, { color: EDGE_COLORS[edge.kind] || "#64748b", kind: edge.kind });
+    const existing = aggregatedMap.get(key);
+    if (existing) {
+      existing.count++;
+    } else {
+      aggregatedMap.set(key, { color: EDGE_COLORS[edge.kind] || "#64748b", kind: edge.kind, count: 1 });
     }
   }
 
   // Convert to array
-  const result: Array<{ source: string; target: string; color: string; kind: EdgeKind | null }> = [];
-  for (const [key, { color, kind }] of aggregatedMap) {
+  const result: Array<{ source: string; target: string; color: string; kind: EdgeKind | null; count: number }> = [];
+  for (const [key, { color, kind, count }] of aggregatedMap) {
     const [source, target] = key.split("->");
-    result.push({ source, target, color, kind });
+    result.push({ source, target, color, kind, count });
   }
 
   return result;
@@ -112,6 +115,7 @@ export interface LayoutEdge {
   points: Point[];
   sourceAnchor: EdgeAnchor;
   targetAnchor: EdgeAnchor;
+  count?: number; // aggregated edge count (>1 when multiple edges collapsed into one)
 }
 
 export interface LayoutResult {
@@ -277,9 +281,9 @@ export async function layoutGraph(
   }
 
   // Build aggregated edge info map for extractLayout
-  const aggregatedEdgeInfo = new Map<string, { color: string; kind: EdgeKind | null }>();
+  const aggregatedEdgeInfo = new Map<string, { color: string; kind: EdgeKind | null; count: number }>();
   for (const ae of aggregatedEdges) {
-    aggregatedEdgeInfo.set(`${ae.source}->${ae.target}`, { color: ae.color, kind: ae.kind });
+    aggregatedEdgeInfo.set(`${ae.source}->${ae.target}`, { color: ae.color, kind: ae.kind, count: ae.count });
   }
 
   try {
@@ -328,7 +332,7 @@ export async function layoutGraph(
 function extractLayout(
   elkNode: ElkNode,
   graph: CodeGraph,
-  aggregatedEdgeInfo: Map<string, { color: string; kind: EdgeKind | null }>
+  aggregatedEdgeInfo: Map<string, { color: string; kind: EdgeKind | null; count: number }>
 ): LayoutResult {
   const result: LayoutResult = { nodes: {}, edges: [] };
 
@@ -373,9 +377,11 @@ function extractLayout(
 
         let color: string;
         let kind: EdgeKind | null;
+        let count: number | undefined;
         if (aggInfo) {
           color = aggInfo.color;
           kind = aggInfo.kind;
+          count = aggInfo.count > 1 ? aggInfo.count : undefined;
         } else {
           const graphEdge = edgeLookup.get(`${sourceId}->${targetId}`);
           color = graphEdge
@@ -456,6 +462,7 @@ function extractLayout(
             ),
             sourceAnchor,
             targetAnchor,
+            ...(count !== undefined && { count }),
           });
         }
       }
