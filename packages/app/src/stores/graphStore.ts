@@ -2,6 +2,8 @@ import { create } from "zustand";
 import type { CodeGraph, CodeNode, EdgeKind, ParseEvent } from "../api/types";
 import { saveFolderState, loadFolderState } from "./persistenceStore";
 import { useDebugStore } from "./debugStore";
+import { useHistoryStore } from "./historyStore";
+import type { Preset } from "../toolbar/PresetButtons";
 
 interface ParseProgress {
   totalFiles: number;
@@ -36,6 +38,9 @@ interface GraphState {
   // Edge filter state
   enabledEdgeKinds: Set<EdgeKind>;
 
+  // Preset state
+  activePreset: string | null;
+
   // Layout state - manual relayout
   needsRelayout: boolean;
   layoutVersion: number; // Incremented when relayout should happen
@@ -54,6 +59,8 @@ interface GraphState {
   getVisibleNodeIds: () => string[];
   requestRelayout: () => void;
   saveCurrentState: () => void;
+  applyPreset: (preset: Preset) => void;
+  applySnapshot: (snapshot: { visibleNodes: Set<string>; expandedNodes: Set<string>; enabledEdgeKinds: Set<EdgeKind> }) => void;
 }
 
 const ALL_EDGE_KINDS: EdgeKind[] = [
@@ -76,6 +83,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   selectedNodeId: null,
   hoveredNodeId: null,
   enabledEdgeKinds: new Set<EdgeKind>(ALL_EDGE_KINDS),
+  activePreset: null,
   needsRelayout: false,
   layoutVersion: 0,
 
@@ -215,9 +223,17 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   },
 
   toggleVisible: (nodeId) => {
-    const visible = new Set(get().visibleNodes);
-    const graph = get().graph;
+    const state = get();
+    const visible = new Set(state.visibleNodes);
+    const graph = state.graph;
     if (!graph) return;
+
+    // Push history snapshot before mutating
+    useHistoryStore.getState().pushSnapshot({
+      visibleNodes: new Set(state.visibleNodes),
+      expandedNodes: new Set(state.expandedNodes),
+      enabledEdgeKinds: new Set(state.enabledEdgeKinds),
+    });
 
     const toggleRecursive = (id: string, show: boolean) => {
       if (show) {
@@ -235,14 +251,23 @@ export const useGraphStore = create<GraphState>((set, get) => ({
 
     const shouldShow = !visible.has(nodeId);
     toggleRecursive(nodeId, shouldShow);
-    set({ visibleNodes: visible, needsRelayout: true });
+    set({ visibleNodes: visible, needsRelayout: true, activePreset: null });
   },
 
   setSelectedNode: (nodeId) => set({ selectedNodeId: nodeId }),
   setHoveredNode: (nodeId) => set({ hoveredNodeId: nodeId }),
 
   toggleEdgeKind: (kind) => {
-    const kinds = new Set(get().enabledEdgeKinds);
+    const state = get();
+
+    // Push history snapshot before mutating
+    useHistoryStore.getState().pushSnapshot({
+      visibleNodes: new Set(state.visibleNodes),
+      expandedNodes: new Set(state.expandedNodes),
+      enabledEdgeKinds: new Set(state.enabledEdgeKinds),
+    });
+
+    const kinds = new Set(state.enabledEdgeKinds);
     if (kinds.has(kind)) {
       kinds.delete(kind);
     } else {
@@ -251,7 +276,8 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     // Trigger relayout since edge filtering affects layout
     set({
       enabledEdgeKinds: kinds,
-      layoutVersion: get().layoutVersion + 1,
+      activePreset: null,
+      layoutVersion: state.layoutVersion + 1,
     });
   },
 
@@ -280,5 +306,96 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     if (state.repoPath) {
       saveFolderState(state.repoPath, state.expandedNodes, state.visibleNodes);
     }
+  },
+
+  applyPreset: (preset) => {
+    const state = get();
+    const graph = state.graph;
+    if (!graph) return;
+
+    // Push history snapshot before mutating
+    useHistoryStore.getState().pushSnapshot({
+      visibleNodes: new Set(state.visibleNodes),
+      expandedNodes: new Set(state.expandedNodes),
+      enabledEdgeKinds: new Set(state.enabledEdgeKinds),
+    });
+
+    const newEdgeKinds = new Set<EdgeKind>(preset.edgeKinds);
+
+    // Compute expand depth: walk tree and expand nodes at depth <= maxDepth
+    const newExpanded = new Set<string>();
+    const newVisible = new Set<string>();
+
+    const walkTree = (nodeId: string, depth: number) => {
+      const node = graph.nodes[nodeId];
+      if (!node) return;
+
+      // For "publicApi" preset, only show public symbols
+      if (preset.name === "publicApi") {
+        if (node.type === "CodeBlock" && node.visibility !== "Public") {
+          return;
+        }
+      }
+
+      newVisible.add(nodeId);
+
+      if (
+        (node.type === "Directory" || node.type === "File") &&
+        node.children.length > 0
+      ) {
+        if (preset.maxDepth === null || depth < preset.maxDepth) {
+          newExpanded.add(nodeId);
+        }
+        for (const childId of node.children) {
+          walkTree(childId, depth + 1);
+        }
+      } else if (node.type === "CodeBlock" && node.children.length > 0) {
+        // Also expand code blocks if within depth
+        if (preset.maxDepth === null || depth < preset.maxDepth) {
+          newExpanded.add(nodeId);
+        }
+        for (const childId of node.children) {
+          walkTree(childId, depth + 1);
+        }
+      }
+    };
+
+    if (graph.root) {
+      walkTree(graph.root, 0);
+    }
+
+    // For publicApi preset, ensure ancestor directories/files are visible
+    if (preset.name === "publicApi") {
+      for (const [nodeId, node] of Object.entries(graph.nodes)) {
+        if (node.type === "Directory" || node.type === "File") {
+          // Check if any descendant is visible
+          const hasVisibleChild = node.children.some((c) => newVisible.has(c));
+          if (hasVisibleChild) {
+            newVisible.add(nodeId);
+          }
+        }
+      }
+    }
+
+    set({
+      enabledEdgeKinds: newEdgeKinds,
+      expandedNodes: newExpanded,
+      visibleNodes: newVisible,
+      activePreset: preset.name,
+      needsRelayout: false,
+      layoutVersion: state.layoutVersion + 1,
+    });
+  },
+
+  applySnapshot: (snapshot) => {
+    const state = get();
+    set({
+      visibleNodes: new Set(snapshot.visibleNodes),
+      expandedNodes: new Set(snapshot.expandedNodes),
+      enabledEdgeKinds: new Set(snapshot.enabledEdgeKinds),
+      activePreset: null,
+      needsRelayout: false,
+      layoutVersion: state.layoutVersion + 1,
+    });
   },
 }));

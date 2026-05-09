@@ -2,6 +2,7 @@ import { create } from "zustand";
 import type { EdgeKind } from "../api/types";
 
 export type LODLevel = "minimap" | "overview" | "detail";
+export type ViewMode = "full" | "files" | "folders" | "overview";
 
 // LOD settings for edge visibility/opacity
 export interface EdgeLODSettings {
@@ -29,11 +30,15 @@ interface ViewportState {
   // LOD level based on zoom
   lodLevel: LODLevel;
 
+  // View mode (UI label for detail level)
+  viewMode: ViewMode;
+
   // Edge LOD settings
   edgeLODSettings: EdgeLODSettings;
 
   // Actions
   updateViewport: (x: number, y: number, w: number, h: number, scale: number) => void;
+  setViewMode: (mode: ViewMode) => void;
   setEdgeLODSettings: (settings: Partial<EdgeLODSettings>) => void;
 }
 
@@ -88,6 +93,7 @@ export const useViewportStore = create<ViewportState>((set, get) => ({
   height: 0,
   scale: 1,
   lodLevel: "detail",
+  viewMode: "full",
   edgeLODSettings: loadEdgeLODSettings(),
 
   updateViewport: (x, y, width, height, scale) =>
@@ -99,6 +105,8 @@ export const useViewportStore = create<ViewportState>((set, get) => ({
       scale,
       lodLevel: getLODLevel(scale),
     }),
+
+  setViewMode: (mode) => set({ viewMode: mode }),
 
   setEdgeLODSettings: (newSettings) => {
     const current = get().edgeLODSettings;
