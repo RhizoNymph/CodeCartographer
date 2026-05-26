@@ -2,8 +2,12 @@ import { Container, Graphics } from "pixi.js";
 import type { EdgeKind } from "../../api/types";
 import {
   anchorEdgePolyline,
+  inferEdgeAnchor,
+  inferEdgeAnchorFromPoint,
   rerouteOrthogonalEdge,
   translatePolyline,
+  type EdgeAnchor,
+  type NodeBox,
   type Point,
 } from "../layout/edgeGeometry";
 import type { LayoutResult } from "../layout/elkLayout";
@@ -17,6 +21,34 @@ import {
 
 // Re-export types for backwards compatibility with existing imports
 export type { EdgeDatum, NodeDisplayRef } from "./types";
+
+function getBoxCenter(box: NodeBox): Point {
+  return {
+    x: box.x + box.width / 2,
+    y: box.y + box.height / 2,
+  };
+}
+
+function inferAnchorsFromPolyline(
+  points: Point[],
+  sourceBox: NodeBox,
+  targetBox: NodeBox
+): { sourceAnchor: EdgeAnchor; targetAnchor: EdgeAnchor } {
+  const sourceAnchor =
+    points.length >= 2
+      ? inferEdgeAnchor(sourceBox, points[0], points[1])
+      : inferEdgeAnchorFromPoint(sourceBox, getBoxCenter(targetBox));
+  const targetAnchor =
+    points.length >= 2
+      ? inferEdgeAnchor(
+          targetBox,
+          points[points.length - 1],
+          points[points.length - 2]
+        )
+      : inferEdgeAnchorFromPoint(targetBox, getBoxCenter(sourceBox));
+
+  return { sourceAnchor, targetAnchor };
+}
 
 /**
  * Resolves edge routing points for a single edge given current node positions.
@@ -52,35 +84,40 @@ function resolveEdgePoints(
 
   let points: Point[];
   if (!sourceMoved && !targetMoved) {
+    const anchors = inferAnchorsFromPolyline(edge.originalPoints, sourceBox, targetBox);
     points = anchorEdgePolyline(
       edge.originalPoints,
       sourceBox,
       targetBox,
-      edge.sourceAnchor,
-      edge.targetAnchor
+      anchors.sourceAnchor,
+      anchors.targetAnchor
     );
   } else if (
     Math.abs(sourceDx - targetDx) <= 1 &&
     Math.abs(sourceDy - targetDy) <= 1
   ) {
+    const translatedPoints = translatePolyline(
+      edge.originalPoints,
+      (sourceDx + targetDx) / 2,
+      (sourceDy + targetDy) / 2
+    );
+    const anchors = inferAnchorsFromPolyline(translatedPoints, sourceBox, targetBox);
     points = anchorEdgePolyline(
-      translatePolyline(
-        edge.originalPoints,
-        (sourceDx + targetDx) / 2,
-        (sourceDy + targetDy) / 2
-      ),
+      translatedPoints,
       sourceBox,
       targetBox,
-      edge.sourceAnchor,
-      edge.targetAnchor
+      anchors.sourceAnchor,
+      anchors.targetAnchor
     );
   } else {
+    const sourceAnchor = inferEdgeAnchorFromPoint(sourceBox, getBoxCenter(targetBox));
+    const targetAnchor = inferEdgeAnchorFromPoint(targetBox, getBoxCenter(sourceBox));
     points = rerouteOrthogonalEdge(
       edge.originalPoints,
       sourceBox,
       targetBox,
-      edge.sourceAnchor,
-      edge.targetAnchor
+      sourceAnchor,
+      targetAnchor
     );
   }
 

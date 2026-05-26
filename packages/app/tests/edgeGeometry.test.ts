@@ -3,6 +3,9 @@ import test from "node:test";
 
 import {
   anchorEdgePolyline,
+  getAnchorPoint,
+  inferEdgeAnchor,
+  inferEdgeAnchorFromPoint,
   rerouteOrthogonalEdge,
   type EdgeAnchor,
   type EdgeAnchorSide,
@@ -129,4 +132,87 @@ test("anchorEdgePolyline reroutes when endpoint anchoring would approach from th
   assertLeavesFromSide(points, "left");
   assertApproachesFromSide(points, "left");
   assert.ok(points.some((point) => point.y !== 20));
+});
+
+test("inferEdgeAnchor prefers top or bottom for vertical approaches at a side boundary", () => {
+  const box: NodeBox = { x: 100, y: 100, width: 80, height: 40 };
+
+  const fromAbove = inferEdgeAnchor(
+    box,
+    { x: 100, y: 120 },
+    { x: 100, y: 40 }
+  );
+  assert.equal(fromAbove.side, "top");
+  assert.deepEqual(getAnchorPoint(box, fromAbove), { x: 100, y: 100 });
+
+  const fromBelow = inferEdgeAnchor(
+    box,
+    { x: 100, y: 120 },
+    { x: 100, y: 180 }
+  );
+  assert.equal(fromBelow.side, "bottom");
+  assert.deepEqual(getAnchorPoint(box, fromBelow), { x: 100, y: 140 });
+});
+
+test("inferEdgeAnchor keeps side anchors for horizontal approaches", () => {
+  const box: NodeBox = { x: 100, y: 100, width: 80, height: 40 };
+
+  const fromLeft = inferEdgeAnchor(
+    box,
+    { x: 100, y: 120 },
+    { x: 40, y: 120 }
+  );
+  assert.equal(fromLeft.side, "left");
+  assert.deepEqual(getAnchorPoint(box, fromLeft), { x: 100, y: 120 });
+
+  const fromRight = inferEdgeAnchor(
+    box,
+    { x: 180, y: 120 },
+    { x: 240, y: 120 }
+  );
+  assert.equal(fromRight.side, "right");
+  assert.deepEqual(getAnchorPoint(box, fromRight), { x: 180, y: 120 });
+});
+
+test("inferEdgeAnchorFromPoint chooses vertical anchors when another node is above or below", () => {
+  const box: NodeBox = { x: 100, y: 100, width: 80, height: 40 };
+
+  const towardAbove = inferEdgeAnchorFromPoint(box, { x: 140, y: 20 });
+  assert.equal(towardAbove.side, "top");
+  assert.deepEqual(getAnchorPoint(box, towardAbove), { x: 140, y: 100 });
+
+  const towardBelow = inferEdgeAnchorFromPoint(box, { x: 140, y: 220 });
+  assert.equal(towardBelow.side, "bottom");
+  assert.deepEqual(getAnchorPoint(box, towardBelow), { x: 140, y: 140 });
+});
+
+test("rerouteOrthogonalEdge uses dynamically inferred vertical anchors for moved nodes", () => {
+  const upperBox: NodeBox = { x: 100, y: 100, width: 80, height: 40 };
+  const lowerBox: NodeBox = { x: 100, y: 280, width: 80, height: 40 };
+  const upperCenter = {
+    x: upperBox.x + upperBox.width / 2,
+    y: upperBox.y + upperBox.height / 2,
+  };
+  const lowerCenter = {
+    x: lowerBox.x + lowerBox.width / 2,
+    y: lowerBox.y + lowerBox.height / 2,
+  };
+  const sourceAnchor = inferEdgeAnchorFromPoint(upperBox, lowerCenter);
+  const targetAnchor = inferEdgeAnchorFromPoint(lowerBox, upperCenter);
+
+  const points = rerouteOrthogonalEdge(
+    [
+      { x: 180, y: 120 },
+      { x: 260, y: 120 },
+      { x: 260, y: 300 },
+      { x: 180, y: 300 },
+    ],
+    upperBox,
+    lowerBox,
+    sourceAnchor,
+    targetAnchor
+  );
+
+  assertLeavesFromSide(points, "bottom");
+  assertApproachesFromSide(points, "top");
 });

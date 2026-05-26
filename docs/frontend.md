@@ -57,7 +57,7 @@ interface GraphState {
 ```
 
 **Key Actions:**
-- `setGraph()` - Load graph, auto-expand directories/files
+- `setGraph()` - Load graph, auto-expand directories while files stay collapsed by default
 - `handleParseEvent()` - Update progress from streaming events
 - `toggleExpanded()` - Expand/collapse node children
 - `toggleVisible()` - Toggle node visibility (recursive)

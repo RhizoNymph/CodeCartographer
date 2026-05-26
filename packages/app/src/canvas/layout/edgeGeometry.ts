@@ -40,6 +40,10 @@ function nearlyEqual(a: number, b: number, tolerance = POINT_TOLERANCE): boolean
   return Math.abs(a - b) <= tolerance;
 }
 
+function withinRange(value: number, min: number, max: number): boolean {
+  return value >= min - BOUNDARY_TOLERANCE && value <= max + BOUNDARY_TOLERANCE;
+}
+
 export function isHorizontalSide(side: EdgeAnchorSide): boolean {
   return side === "left" || side === "right";
 }
@@ -48,11 +52,53 @@ function isVerticalSide(side: EdgeAnchorSide): boolean {
   return side === "top" || side === "bottom";
 }
 
+function inferApproachSide(
+  nodeBox: NodeBox,
+  boundaryPoint: Point,
+  adjacentPoint: Point
+): EdgeAnchorSide | null {
+  const dx = adjacentPoint.x - boundaryPoint.x;
+  const dy = adjacentPoint.y - boundaryPoint.y;
+  const xWithinNode = withinRange(boundaryPoint.x, nodeBox.x, nodeBox.x + nodeBox.width);
+  const yWithinNode = withinRange(boundaryPoint.y, nodeBox.y, nodeBox.y + nodeBox.height);
+  const verticalApproach =
+    Math.abs(dy) > POINT_TOLERANCE &&
+    (Math.abs(dy) >= Math.abs(dx) || nearlyEqual(boundaryPoint.x, adjacentPoint.x, BOUNDARY_TOLERANCE));
+  const horizontalApproach =
+    Math.abs(dx) > POINT_TOLERANCE &&
+    (Math.abs(dx) > Math.abs(dy) || nearlyEqual(boundaryPoint.y, adjacentPoint.y, BOUNDARY_TOLERANCE));
+
+  if (verticalApproach && xWithinNode) {
+    if (dy < 0 && adjacentPoint.y <= nodeBox.y + BOUNDARY_TOLERANCE) {
+      return "top";
+    }
+    if (dy > 0 && adjacentPoint.y >= nodeBox.y + nodeBox.height - BOUNDARY_TOLERANCE) {
+      return "bottom";
+    }
+  }
+
+  if (horizontalApproach && yWithinNode) {
+    if (dx < 0 && adjacentPoint.x <= nodeBox.x + BOUNDARY_TOLERANCE) {
+      return "left";
+    }
+    if (dx > 0 && adjacentPoint.x >= nodeBox.x + nodeBox.width - BOUNDARY_TOLERANCE) {
+      return "right";
+    }
+  }
+
+  return null;
+}
+
 function inferAnchorSide(
   nodeBox: NodeBox,
   boundaryPoint: Point,
   adjacentPoint: Point
 ): EdgeAnchorSide {
+  const approachSide = inferApproachSide(nodeBox, boundaryPoint, adjacentPoint);
+  if (approachSide) {
+    return approachSide;
+  }
+
   if (Math.abs(boundaryPoint.x - nodeBox.x) <= BOUNDARY_TOLERANCE) {
     return "left";
   }
@@ -88,6 +134,34 @@ export function inferEdgeAnchor(
       side === "left" || side === "right"
         ? clamp(boundaryPoint.y - nodeBox.y, 0, nodeBox.height)
         : clamp(boundaryPoint.x - nodeBox.x, 0, nodeBox.width),
+  };
+}
+
+export function inferEdgeAnchorFromPoint(
+  nodeBox: NodeBox,
+  externalPoint: Point
+): EdgeAnchor {
+  const center = {
+    x: nodeBox.x + nodeBox.width / 2,
+    y: nodeBox.y + nodeBox.height / 2,
+  };
+  const dx = externalPoint.x - center.x;
+  const dy = externalPoint.y - center.y;
+  const halfWidth = Math.max(nodeBox.width / 2, 1);
+  const halfHeight = Math.max(nodeBox.height / 2, 1);
+  const scaledX = Math.abs(dx) / halfWidth;
+  const scaledY = Math.abs(dy) / halfHeight;
+
+  if (scaledY > scaledX) {
+    return {
+      side: dy >= 0 ? "bottom" : "top",
+      offset: clamp(externalPoint.x - nodeBox.x, 0, nodeBox.width),
+    };
+  }
+
+  return {
+    side: dx >= 0 ? "right" : "left",
+    offset: clamp(externalPoint.y - nodeBox.y, 0, nodeBox.height),
   };
 }
 
