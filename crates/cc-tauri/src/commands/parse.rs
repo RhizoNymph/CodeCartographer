@@ -176,7 +176,19 @@ pub async fn get_subgraph(
         .ok_or_else(|| "No graph in state. Run scan_repo first.".to_string())?;
 
     let visible: Vec<NodeId> = visible_ids.into_iter().map(NodeId).collect();
-    let kinds: HashSet<EdgeKind> = edge_kinds.into_iter().collect();
+    let kinds: HashSet<EdgeKind> = edge_kinds
+        .into_iter()
+        .map(|s| match s.as_str() {
+            "Import" => Ok(EdgeKind::Import),
+            "FunctionCall" => Ok(EdgeKind::FunctionCall),
+            "MethodCall" => Ok(EdgeKind::MethodCall),
+            "TypeReference" => Ok(EdgeKind::TypeReference),
+            "Inheritance" => Ok(EdgeKind::Inheritance),
+            "TraitImpl" => Ok(EdgeKind::TraitImpl),
+            "VariableUsage" => Ok(EdgeKind::VariableUsage),
+            other => Err(format!("Unknown edge kind: {}", other)),
+        })
+        .collect::<Result<_, _>>()?;
 
     Ok(SubGraph::from_graph(graph, &visible, &kinds))
 }
