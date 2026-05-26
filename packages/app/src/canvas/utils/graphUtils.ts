@@ -14,6 +14,23 @@ export function buildParentMap(graph: CodeGraph): Map<string, string> {
   return parentMap;
 }
 
+export function isAncestorOf(
+  maybeAncestor: string,
+  nodeId: string,
+  parentMap: Map<string, string>
+): boolean {
+  let current = parentMap.get(nodeId);
+
+  while (current) {
+    if (current === maybeAncestor) {
+      return true;
+    }
+    current = parentMap.get(current);
+  }
+
+  return false;
+}
+
 /**
  * Get the minimum size for a node based on its type.
  * Shared by elkLayout and PixiRenderer.

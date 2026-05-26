@@ -7,6 +7,7 @@ import {
   inferEdgeAnchor,
   inferEdgeAnchorFromPoint,
   rerouteOrthogonalEdge,
+  routePolylineAroundObstacles,
   type EdgeAnchor,
   type EdgeAnchorSide,
   type NodeBox,
@@ -81,6 +82,50 @@ function assertApproachesFromSide(points: Point[], side: EdgeAnchorSide) {
   }
 }
 
+function horizontalSegmentCrossesBox(a: Point, b: Point, box: NodeBox): boolean {
+  if (a.y !== b.y) return false;
+  const minX = Math.min(a.x, b.x);
+  const maxX = Math.max(a.x, b.x);
+  return (
+    a.y > box.y &&
+    a.y < box.y + box.height &&
+    maxX > box.x &&
+    minX < box.x + box.width
+  );
+}
+
+function verticalSegmentCrossesBox(a: Point, b: Point, box: NodeBox): boolean {
+  if (a.x !== b.x) return false;
+  const minY = Math.min(a.y, b.y);
+  const maxY = Math.max(a.y, b.y);
+  return (
+    a.x > box.x &&
+    a.x < box.x + box.width &&
+    maxY > box.y &&
+    minY < box.y + box.height
+  );
+}
+
+function assertPolylineAvoidsBox(points: Point[], box: NodeBox) {
+  for (let i = 0; i < points.length - 1; i++) {
+    assert.equal(
+      horizontalSegmentCrossesBox(points[i], points[i + 1], box) ||
+        verticalSegmentCrossesBox(points[i], points[i + 1], box),
+      false,
+      `segment ${i} crosses obstacle`
+    );
+  }
+}
+
+function assertPolylineIsOrthogonal(points: Point[]) {
+  for (let i = 0; i < points.length - 1; i++) {
+    assert.ok(
+      points[i].x === points[i + 1].x || points[i].y === points[i + 1].y,
+      `segment ${i} is diagonal: ${JSON.stringify([points[i], points[i + 1]])}`
+    );
+  }
+}
+
 test("rerouteOrthogonalEdge detours same-side horizontal anchors on the same row", () => {
   const points = rerouteOrthogonalEdge(
     [
@@ -132,6 +177,81 @@ test("anchorEdgePolyline reroutes when endpoint anchoring would approach from th
   assertLeavesFromSide(points, "left");
   assertApproachesFromSide(points, "left");
   assert.ok(points.some((point) => point.y !== 20));
+});
+
+test("anchorEdgePolyline erases loops from stale bends after a node crosses them", () => {
+  const points = anchorEdgePolyline(
+    [
+      { x: 40, y: 20 },
+      { x: 160, y: 20 },
+      { x: 160, y: 100 },
+      { x: 80, y: 100 },
+      { x: 80, y: 20 },
+      { x: 200, y: 20 },
+    ],
+    sourceBox,
+    targetBox,
+    { side: "right", offset: 20 },
+    { side: "left", offset: 20 }
+  );
+
+  assert.deepEqual(points, [
+    { x: 40, y: 20 },
+    { x: 200, y: 20 },
+  ]);
+});
+
+test("routePolylineAroundObstacles detours horizontal segments around node boxes", () => {
+  const obstacle: NodeBox = { x: 80, y: 0, width: 40, height: 40 };
+  const points = routePolylineAroundObstacles(
+    [
+      { x: 0, y: 20 },
+      { x: 200, y: 20 },
+    ],
+    [obstacle]
+  );
+
+  assert.deepEqual(points[0], { x: 0, y: 20 });
+  assert.deepEqual(points[points.length - 1], { x: 200, y: 20 });
+  assert.ok(points.some((point) => point.y < obstacle.y || point.y > obstacle.y + obstacle.height));
+  assertPolylineAvoidsBox(points, obstacle);
+});
+
+test("routePolylineAroundObstacles does not shortcut across the graph", () => {
+  const obstacle: NodeBox = { x: 80, y: -20, width: 40, height: 40 };
+  const points = routePolylineAroundObstacles(
+    [
+      { x: 0, y: 100 },
+      { x: 0, y: 0 },
+      { x: 200, y: 0 },
+      { x: 200, y: 100 },
+    ],
+    [obstacle]
+  );
+
+  assert.deepEqual(points[0], { x: 0, y: 100 });
+  assert.deepEqual(points[points.length - 1], { x: 200, y: 100 });
+  assert.ok(
+    points.some((point) => point.y < 60),
+    `expected route to preserve the local angled path: ${JSON.stringify(points)}`
+  );
+  assertPolylineAvoidsBox(points, obstacle);
+});
+
+test("routePolylineAroundObstacles converts diagonal fallback segments before avoiding nodes", () => {
+  const obstacle: NodeBox = { x: 80, y: 0, width: 40, height: 40 };
+  const points = routePolylineAroundObstacles(
+    [
+      { x: 0, y: 20 },
+      { x: 200, y: 80 },
+    ],
+    [obstacle]
+  );
+
+  assert.deepEqual(points[0], { x: 0, y: 20 });
+  assert.deepEqual(points[points.length - 1], { x: 200, y: 80 });
+  assertPolylineIsOrthogonal(points);
+  assertPolylineAvoidsBox(points, obstacle);
 });
 
 test("inferEdgeAnchor prefers top or bottom for vertical approaches at a side boundary", () => {

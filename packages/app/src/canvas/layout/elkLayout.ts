@@ -9,7 +9,7 @@ import {
   type EdgeAnchor,
   type Point,
 } from "./edgeGeometry";
-import { buildParentMap, getNodeSize } from "../utils/graphUtils";
+import { buildParentMap, getNodeSize, isAncestorOf } from "../utils/graphUtils";
 
 const elk = new ELK();
 
@@ -77,6 +77,16 @@ function computeAggregatedEdges(
 
     // Skip self-loops (both endpoints resolve to same collapsed container)
     if (visibleSource === visibleTarget) {
+      continue;
+    }
+
+    // If collapsing one endpoint resolves it to a visible container that already
+    // contains the other endpoint, drawing child -> parent creates misleading
+    // arrows into the node's own container. Hide those collapsed internal edges.
+    if (
+      isAncestorOf(visibleSource, visibleTarget, parentMap) ||
+      isAncestorOf(visibleTarget, visibleSource, parentMap)
+    ) {
       continue;
     }
 
