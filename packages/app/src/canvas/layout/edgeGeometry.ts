@@ -23,7 +23,7 @@ const MIN_LEAD_DISTANCE = 18;
 const MAX_LEAD_DISTANCE = 72;
 const DETOUR_GUTTER = 28;
 const NODE_OBSTACLE_MARGIN = 14;
-const MAX_OBSTACLE_REROUTE_PASSES = 12;
+const MAX_OBSTACLE_REROUTE_PASSES = 32;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
@@ -444,20 +444,73 @@ function findFirstObstacleCrossing(
   return null;
 }
 
+function boundingBox(boxes: NodeBox[]): NodeBox {
+  const left = Math.min(...boxes.map((box) => box.x));
+  const top = Math.min(...boxes.map((box) => box.y));
+  const right = Math.max(...boxes.map((box) => box.x + box.width));
+  const bottom = Math.max(...boxes.map((box) => box.y + box.height));
+
+  return {
+    x: left,
+    y: top,
+    width: right - left,
+    height: bottom - top,
+  };
+}
+
+function pointAtSegmentEndpoint(point: Point, a: Point, b: Point): boolean {
+  return samePoint(point, a) || samePoint(point, b);
+}
+
+function countPolylineCrossings(points: Point[], referencePolylines: Point[][]): number {
+  let crossings = 0;
+
+  for (let i = 0; i < points.length - 1; i++) {
+    const a = points[i];
+    const b = points[i + 1];
+
+    for (const reference of referencePolylines) {
+      for (let j = 0; j < reference.length - 1; j++) {
+        const c = reference[j];
+        const d = reference[j + 1];
+        const intersection = segmentIntersection(a, b, c, d);
+
+        if (!intersection) {
+          continue;
+        }
+
+        if (
+          pointAtSegmentEndpoint(intersection, a, b) &&
+          pointAtSegmentEndpoint(intersection, c, d)
+        ) {
+          continue;
+        }
+
+        crossings++;
+      }
+    }
+  }
+
+  return crossings;
+}
+
 function chooseObstacleDetour(
   a: Point,
   b: Point,
   obstacle: NodeBox,
-  obstacles: NodeBox[]
+  obstacles: NodeBox[],
+  referencePolylines: Point[][]
 ): Point[] {
   const candidates: Point[][] = [];
+  const crossedObstacles = obstacles.filter((box) => segmentCrossesBox(a, b, box));
+  const detourBox = boundingBox(crossedObstacles.length > 0 ? crossedObstacles : [obstacle]);
 
   if (nearlyEqual(a.y, b.y)) {
     const movingPositive = b.x >= a.x;
-    const entryX = movingPositive ? obstacle.x : obstacle.x + obstacle.width;
-    const exitX = movingPositive ? obstacle.x + obstacle.width : obstacle.x;
+    const entryX = movingPositive ? detourBox.x : detourBox.x + detourBox.width;
+    const exitX = movingPositive ? detourBox.x + detourBox.width : detourBox.x;
 
-    for (const y of [obstacle.y, obstacle.y + obstacle.height]) {
+    for (const y of [detourBox.y, detourBox.y + detourBox.height]) {
       candidates.push(simplifyOrthogonalPolyline([
         a,
         { x: entryX, y: a.y },
@@ -469,10 +522,10 @@ function chooseObstacleDetour(
     }
   } else if (nearlyEqual(a.x, b.x)) {
     const movingPositive = b.y >= a.y;
-    const entryY = movingPositive ? obstacle.y : obstacle.y + obstacle.height;
-    const exitY = movingPositive ? obstacle.y + obstacle.height : obstacle.y;
+    const entryY = movingPositive ? detourBox.y : detourBox.y + detourBox.height;
+    const exitY = movingPositive ? detourBox.y + detourBox.height : detourBox.y;
 
-    for (const x of [obstacle.x, obstacle.x + obstacle.width]) {
+    for (const x of [detourBox.x, detourBox.x + detourBox.width]) {
       candidates.push(simplifyOrthogonalPolyline([
         a,
         { x: a.x, y: entryY },
@@ -495,6 +548,13 @@ function chooseObstacleDetour(
       return crossingDelta;
     }
 
+    const edgeCrossingDelta =
+      countPolylineCrossings(left, referencePolylines) -
+      countPolylineCrossings(right, referencePolylines);
+    if (edgeCrossingDelta !== 0) {
+      return edgeCrossingDelta;
+    }
+
     const leftLength = polylineManhattanLength(left);
     const rightLength = polylineManhattanLength(right);
     return leftLength - rightLength;
@@ -511,7 +571,8 @@ function polylineManhattanLength(points: Point[]): number {
 
 function routeByLocalObstacleDetours(
   points: Point[],
-  obstacles: NodeBox[]
+  obstacles: NodeBox[],
+  referencePolylines: Point[][]
 ): Point[] {
   let routed = normalizeRoutedPolyline(points);
 
@@ -523,7 +584,7 @@ function routeByLocalObstacleDetours(
 
     const a = routed[hit.segmentIndex];
     const b = routed[hit.segmentIndex + 1];
-    const detour = chooseObstacleDetour(a, b, hit.obstacle, obstacles);
+    const detour = chooseObstacleDetour(a, b, hit.obstacle, obstacles, referencePolylines);
     routed = normalizeRoutedPolyline([
       ...routed.slice(0, hit.segmentIndex),
       ...detour,
@@ -536,7 +597,8 @@ function routeByLocalObstacleDetours(
 
 export function routePolylineAroundObstacles(
   points: Point[],
-  obstacles: NodeBox[]
+  obstacles: NodeBox[],
+  referencePolylines: Point[][] = []
 ): Point[] {
   if (points.length < 2 || obstacles.length === 0) {
     return normalizeRoutedPolyline(points);
@@ -544,7 +606,7 @@ export function routePolylineAroundObstacles(
 
   const inflatedObstacles = obstacles.map((box) => inflateBox(box, NODE_OBSTACLE_MARGIN));
   const normalized = normalizeRoutedPolyline(points);
-  return routeByLocalObstacleDetours(normalized, inflatedObstacles);
+  return routeByLocalObstacleDetours(normalized, inflatedObstacles, referencePolylines);
 }
 
 function segmentMatchesAnchorAxis(from: Point, to: Point, side: EdgeAnchorSide): boolean {

@@ -217,6 +217,53 @@ test("routePolylineAroundObstacles detours horizontal segments around node boxes
   assertPolylineAvoidsBox(points, obstacle);
 });
 
+test("routePolylineAroundObstacles prefers detours with fewer existing edge crossings", () => {
+  const obstacle: NodeBox = { x: 80, y: 0, width: 40, height: 40 };
+  const points = routePolylineAroundObstacles(
+    [
+      { x: 0, y: 20 },
+      { x: 200, y: 20 },
+    ],
+    [obstacle],
+    [
+      [
+        { x: 100, y: -80 },
+        { x: 100, y: 10 },
+      ],
+    ]
+  );
+
+  assert.deepEqual(points[0], { x: 0, y: 20 });
+  assert.deepEqual(points[points.length - 1], { x: 200, y: 20 });
+  assert.ok(
+    points.some((point) => point.y > obstacle.y + obstacle.height),
+    `expected route below obstacle to avoid crossing existing edge: ${JSON.stringify(points)}`
+  );
+  assertPolylineAvoidsBox(points, obstacle);
+});
+
+test("routePolylineAroundObstacles clears many obstacles crossed by one segment", () => {
+  const obstacles = Array.from({ length: 18 }, (_, index) => ({
+    x: 50 + index * 18,
+    y: 0,
+    width: 8,
+    height: 40,
+  }));
+  const points = routePolylineAroundObstacles(
+    [
+      { x: 0, y: 20 },
+      { x: 400, y: 20 },
+    ],
+    obstacles
+  );
+
+  assert.deepEqual(points[0], { x: 0, y: 20 });
+  assert.deepEqual(points[points.length - 1], { x: 400, y: 20 });
+  for (const obstacle of obstacles) {
+    assertPolylineAvoidsBox(points, obstacle);
+  }
+});
+
 test("routePolylineAroundObstacles does not shortcut across the graph", () => {
   const obstacle: NodeBox = { x: 80, y: -20, width: 40, height: 40 };
   const points = routePolylineAroundObstacles(

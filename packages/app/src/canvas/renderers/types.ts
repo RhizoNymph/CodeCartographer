@@ -5,7 +5,7 @@
  * PixiRenderer, EdgeDrawingManager, DragManager, and nodeCreation all operate on.
  */
 
-import type { EdgeKind } from "../../api/types";
+import type { CodeNode, EdgeKind } from "../../api/types";
 import type { EdgeAnchor, Point } from "../layout/edgeGeometry";
 
 // Re-export NodeDisplay from nodeCreation (canonical definition lives there).
@@ -22,6 +22,12 @@ export interface NodeDisplayRef {
   layoutHeight: number;
   layoutX: number;
   layoutY: number;
+  nodeType: CodeNode["type"];
+  labelX: number;
+  labelY: number;
+  labelWidth: number;
+  labelHeight: number;
+  labelVisible: boolean;
 }
 
 /**

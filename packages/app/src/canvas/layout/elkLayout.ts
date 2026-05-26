@@ -270,9 +270,10 @@ export async function layoutGraph(
     layoutOptions: {
       "elk.algorithm": "layered",
       "elk.direction": "RIGHT",
-      "elk.spacing.nodeNode": "20",
-      "elk.spacing.edgeNode": "15",
-      "elk.layered.spacing.nodeNodeBetweenLayers": "30",
+      "elk.spacing.nodeNode": "26",
+      "elk.spacing.edgeNode": "24",
+      "elk.spacing.edgeEdge": "12",
+      "elk.layered.spacing.nodeNodeBetweenLayers": "44",
       "elk.edgeRouting": "ORTHOGONAL",
       "elk.hierarchyHandling": "INCLUDE_CHILDREN",
       "elk.padding": "[top=30,left=15,bottom=15,right=15]",

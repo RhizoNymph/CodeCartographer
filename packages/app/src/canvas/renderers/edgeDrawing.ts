@@ -61,6 +61,32 @@ function nodeRefToBox(ref: NodeDisplayRef): NodeBox {
   };
 }
 
+function nodeRefToLabelObstacle(ref: NodeDisplayRef): NodeBox | null {
+  if (!ref.labelVisible || ref.nodeType === "CodeBlock" || ref.labelWidth <= 0 || ref.labelHeight <= 0) {
+    return null;
+  }
+
+  const paddingX = 8;
+  const paddingY = 6;
+  const localX = Math.max(0, ref.labelX - paddingX);
+  const localY = Math.max(0, ref.labelY - paddingY);
+  const maxWidth = Math.max(0, ref.layoutWidth - localX);
+  const maxHeight = Math.max(0, ref.layoutHeight - localY);
+  const width = Math.min(maxWidth, ref.labelWidth + paddingX * 2);
+  const height = Math.min(maxHeight, ref.labelHeight + paddingY * 2);
+
+  if (width <= 0 || height <= 0) {
+    return null;
+  }
+
+  return {
+    x: ref.containerX + localX,
+    y: ref.containerY + localY,
+    width,
+    height,
+  };
+}
+
 function inferPointSide(box: NodeBox, point: Point): EdgeAnchor["side"] | null {
   if (nearlyEqual(point.x, box.x)) return "left";
   if (nearlyEqual(point.x, box.x + box.width)) return "right";
@@ -264,12 +290,19 @@ function resolveEdgeDraw(
       continue;
     }
 
-    const box = nodeRefToBox(ref);
-    if (boxContainsPoint(box, sourceCenter) || boxContainsPoint(box, targetCenter)) {
-      continue;
+    const labelObstacle = nodeRefToLabelObstacle(ref);
+    if (
+      labelObstacle &&
+      !boxContainsPoint(labelObstacle, sourceCenter) &&
+      !boxContainsPoint(labelObstacle, targetCenter)
+    ) {
+      obstacles.push(labelObstacle);
     }
 
-    obstacles.push(box);
+    const box = nodeRefToBox(ref);
+    if (!boxContainsPoint(box, sourceCenter) && !boxContainsPoint(box, targetCenter)) {
+      obstacles.push(box);
+    }
   }
 
   let points: Point[];
@@ -311,7 +344,6 @@ function resolveEdgeDraw(
     );
   }
 
-  points = routePolylineAroundObstacles(points, obstacles);
   return points.length >= 2
     ? { index, edge, points, sourceBox, targetBox, obstacles }
     : null;
@@ -463,8 +495,14 @@ export class EdgeDrawingManager {
 
     spreadEndpointLanes(resolvedDraws, true);
     spreadEndpointLanes(resolvedDraws, false);
+    const routedPolylines: Point[][] = [];
     for (const draw of resolvedDraws) {
-      draw.points = routePolylineAroundObstacles(draw.points, draw.obstacles);
+      draw.points = routePolylineAroundObstacles(
+        draw.points,
+        draw.obstacles,
+        routedPolylines
+      );
+      routedPolylines.push(draw.points);
     }
 
     const gfx = new Graphics();

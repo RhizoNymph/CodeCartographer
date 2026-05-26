@@ -586,6 +586,12 @@ export class PixiRenderer {
         layoutHeight: d.layoutPos.height,
         layoutX: d.layoutPos.x,
         layoutY: d.layoutPos.y,
+        nodeType: d.nodeData.type,
+        labelX: d.label.x,
+        labelY: d.label.y,
+        labelWidth: d.label.width,
+        labelHeight: d.label.height,
+        labelVisible: d.label.visible,
       };
     };
 
