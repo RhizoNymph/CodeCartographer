@@ -1,9 +1,10 @@
-import { useRef, useEffect, useState } from "react";
+import { useRef, useEffect, useMemo, useState } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { PixiRenderer } from "./renderers/PixiRenderer";
 import { useGraphStore } from "../stores/graphStore";
 import { useViewportStore } from "../stores/viewportStore";
 import { useDebugStore } from "../stores/debugStore";
+import { computeDisplayVisibleNodes } from "../stores/visibilityFilter";
 
 export function Canvas() {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -15,6 +16,7 @@ export function Canvas() {
     selectedNodeId,
     hoveredNodeId,
     enabledEdgeKinds,
+    hideUnconnectedNodes,
     layoutVersion,
   } = useGraphStore(
     useShallow((s) => ({
@@ -24,10 +26,20 @@ export function Canvas() {
       selectedNodeId: s.selectedNodeId,
       hoveredNodeId: s.hoveredNodeId,
       enabledEdgeKinds: s.enabledEdgeKinds,
+      hideUnconnectedNodes: s.hideUnconnectedNodes,
       layoutVersion: s.layoutVersion,
     }))
   );
   const [error, setError] = useState<string | null>(null);
+  const displayVisibleNodes = useMemo(
+    () => computeDisplayVisibleNodes(
+      graph,
+      visibleNodes,
+      enabledEdgeKinds,
+      hideUnconnectedNodes
+    ),
+    [graph, visibleNodes, enabledEdgeKinds, hideUnconnectedNodes]
+  );
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -62,16 +74,16 @@ export function Canvas() {
       layoutVersion,
     });
     if (rendererRef.current && graph) {
-      rendererRef.current.updateGraph(graph, expandedNodes, visibleNodes, enabledEdgeKinds);
+      rendererRef.current.updateGraph(graph, expandedNodes, displayVisibleNodes, enabledEdgeKinds);
     }
   }, [graph, layoutVersion, enabledEdgeKinds]);
 
   // Update visibility immediately when nodes are checked/unchecked (without full relayout)
   useEffect(() => {
     if (rendererRef.current && graph) {
-      rendererRef.current.updateVisibility(visibleNodes);
+      rendererRef.current.updateVisibility(displayVisibleNodes);
     }
-  }, [graph, visibleNodes]);
+  }, [graph, displayVisibleNodes]);
 
   useEffect(() => {
     if (rendererRef.current) {

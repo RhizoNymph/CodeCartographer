@@ -6,6 +6,7 @@ import { useGraphStore } from "../../stores/graphStore";
 import { useViewportStore, type LODLevel } from "../../stores/viewportStore";
 import { useDebugStore } from "../../stores/debugStore";
 import { buildParentMap } from "../utils/graphUtils";
+import { pointToPolylineDistance } from "../layout/edgeGeometry";
 import { EdgeDrawingManager, type NodeDisplayRef } from "./edgeDrawing";
 import { MinimapRenderer } from "./minimapRenderer";
 import { DragManager, redrawNodeBg, syncDisplayBounds } from "./dragManager";
@@ -36,6 +37,7 @@ export class PixiRenderer {
   private _viewportDirty = false;
   private _viewportRafId: number | null = null;
   private _layoutRequestId = 0;
+  private _edgeHoverRafId: number | null = null;
 
   private pendingUpdate: {
     graph: CodeGraph;
@@ -146,6 +148,46 @@ export class PixiRenderer {
       if (!this.dragManager.dragTarget) {
         useGraphStore.getState().setSelectedNode(null);
       }
+    });
+
+    // Edge hover detection (throttled to once per frame)
+    this.viewport.on("pointermove", (e) => {
+      if (this._edgeHoverRafId !== null) return;
+      this._edgeHoverRafId = requestAnimationFrame(() => {
+        this._edgeHoverRafId = null;
+        if (this.destroyed || !this.initialized) return;
+        // Node hover takes priority over edge hover
+        if (this.hoveredNodeId) {
+          useGraphStore.getState().setHoveredEdge(null);
+          return;
+        }
+        const worldPos = this.viewport.toLocal(e.global);
+        const hitThreshold = 8 / this.viewport.scale.x;
+        let closestEdge: import("./types").EdgeDatum | null = null;
+        let closestDist = hitThreshold;
+        for (const edge of this.edgeManager.edgeData) {
+          if (edge.originalPoints.length < 2) continue;
+          const dist = pointToPolylineDistance(worldPos, edge.originalPoints);
+          if (dist < closestDist) {
+            closestDist = dist;
+            closestEdge = edge;
+          }
+        }
+        if (closestEdge && closestEdge.kind) {
+          const sourceNode = this.currentGraph?.nodes[closestEdge.source];
+          const targetNode = this.currentGraph?.nodes[closestEdge.target];
+          useGraphStore.getState().setHoveredEdge({
+            kind: closestEdge.kind,
+            sourceId: closestEdge.source,
+            targetId: closestEdge.target,
+            sourceName: sourceNode?.name || closestEdge.source,
+            targetName: targetNode?.name || closestEdge.target,
+            count: closestEdge.count || 1,
+          });
+        } else {
+          useGraphStore.getState().setHoveredEdge(null);
+        }
+      });
     });
 
     this.initialized = true;
@@ -544,6 +586,12 @@ export class PixiRenderer {
         layoutHeight: d.layoutPos.height,
         layoutX: d.layoutPos.x,
         layoutY: d.layoutPos.y,
+        nodeType: d.nodeData.type,
+        labelX: d.label.x,
+        labelY: d.label.y,
+        labelWidth: d.label.width,
+        labelHeight: d.label.height,
+        labelVisible: d.label.visible,
       };
     };
 
@@ -562,6 +610,10 @@ export class PixiRenderer {
     if (this._viewportRafId !== null) {
       cancelAnimationFrame(this._viewportRafId);
       this._viewportRafId = null;
+    }
+    if (this._edgeHoverRafId !== null) {
+      cancelAnimationFrame(this._edgeHoverRafId);
+      this._edgeHoverRafId = null;
     }
     this.resizeObserver.disconnect();
     if (!this.initialized) return;

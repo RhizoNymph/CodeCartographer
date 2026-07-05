@@ -1,6 +1,7 @@
 import type { CodeGraph, CodeNode } from "../../api/types";
 import type { LayoutNodePosition, LayoutResult } from "../layout/elkLayout";
-import type { NodeDisplay } from "./nodeCreation";
+import { getNodeColor, type NodeDisplay } from "./nodeCreation";
+import { drawNodeShape } from "./shapes";
 import type { NodePadding } from "./types";
 
 interface DragTarget {
@@ -148,11 +149,11 @@ export class DragManager {
 function getMinimumNodeSize(node: CodeNode): { width: number; height: number } {
   switch (node.type) {
     case "Directory":
-      return { width: 200, height: 60 };
+      return { width: 220, height: 70 };
     case "File":
-      return { width: 180, height: 40 };
+      return { width: 180, height: 44 };
     case "CodeBlock":
-      return { width: 160, height: 32 };
+      return { width: 150, height: 28 };
   }
 }
 
@@ -164,20 +165,23 @@ function getNodePadding(node: CodeNode): NodePadding {
 }
 
 /**
- * Redraw a node's background graphics.
+ * Redraw a node's background graphics using the shared shape drawing.
  */
 export function redrawNodeBg(display: NodeDisplay, selected: boolean): void {
   const bg = display.bg;
   const pos = display.layoutPos;
-  const color = getNodeColorValue(display.nodeData);
+  const color = getNodeColor(display.nodeData);
 
   bg.clear();
-  bg.roundRect(0, 0, pos.width, pos.height, 8);
-  bg.fill({ color });
-  bg.stroke({
-    color: selected ? 0x60a5fa : 0x334155,
-    width: selected ? 3 : 1,
-  });
+  drawNodeShape(
+    bg,
+    display.nodeData,
+    pos.width,
+    pos.height,
+    color,
+    selected ? 0x60a5fa : 0x334155,
+    selected ? 3 : 1
+  );
 }
 
 /**
@@ -206,33 +210,3 @@ export function syncDisplayBounds(
   }
 }
 
-function getNodeColorValue(node: CodeNode): number {
-  // Importing BLOCK_COLORS here would create a dependency; use the same inline logic
-  const BLOCK_COLORS: Record<string, string> = {
-    Function: "#3b82f6",
-    Class: "#8b5cf6",
-    Struct: "#f59e0b",
-    Enum: "#10b981",
-    Trait: "#ec4899",
-    Interface: "#06b6d4",
-    Impl: "#6366f1",
-    Module: "#64748b",
-    Constant: "#f97316",
-    TypeAlias: "#14b8a6",
-  };
-
-  switch (node.type) {
-    case "Directory":
-      return 0x1e293b;
-    case "File":
-      return 0x1e3a5f;
-    case "CodeBlock": {
-      const hex = BLOCK_COLORS[node.kind] || "#334155";
-      const base = parseInt(hex.replace("#", ""), 16);
-      const r = Math.floor(((base >> 16) & 0xff) * 0.25);
-      const g = Math.floor(((base >> 8) & 0xff) * 0.25);
-      const b = Math.floor((base & 0xff) * 0.25);
-      return (r << 16) | (g << 8) | b;
-    }
-  }
-}
