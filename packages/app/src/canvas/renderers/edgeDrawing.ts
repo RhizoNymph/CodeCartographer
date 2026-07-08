@@ -29,6 +29,8 @@ interface ResolvedEdgeDraw {
   points: Point[];
   sourceBox: NodeBox;
   targetBox: NodeBox;
+  sourceLabelObstacle: NodeBox | null;
+  targetLabelObstacle: NodeBox | null;
   obstacles: NodeBox[];
 }
 
@@ -114,6 +116,38 @@ function pointOnSide(box: NodeBox, side: EdgeAnchor["side"], offset: number): Po
   }
 }
 
+function avoidLabelAnchor(
+  anchor: EdgeAnchor,
+  box: NodeBox,
+  labelObstacle: NodeBox | null
+): EdgeAnchor {
+  if (!labelObstacle || !boxContainsPoint(labelObstacle, pointOnSide(box, anchor.side, anchor.offset))) {
+    return anchor;
+  }
+
+  const clearance = 6;
+  switch (anchor.side) {
+    case "left":
+    case "right":
+      return {
+        ...anchor,
+        offset: Math.max(
+          0,
+          Math.min(box.height, labelObstacle.y + labelObstacle.height - box.y + clearance)
+        ),
+      };
+    case "top":
+    case "bottom":
+      return {
+        ...anchor,
+        offset: Math.max(
+          0,
+          Math.min(box.width, labelObstacle.x + labelObstacle.width - box.x + clearance)
+        ),
+      };
+  }
+}
+
 function laneOffset(box: NodeBox, side: EdgeAnchor["side"], index: number, count: number): number {
   const length = sideLength(box, side);
   if (count <= 1) {
@@ -135,6 +169,7 @@ function moveEndpointToLane(
   box: NodeBox,
   side: EdgeAnchor["side"],
   offset: number,
+  labelObstacle: NodeBox | null,
   atEnd: boolean
 ): Point[] {
   if (points.length < 2) {
@@ -142,13 +177,14 @@ function moveEndpointToLane(
   }
 
   const nextPoints = points.map((point) => ({ ...point }));
-  const endpoint = pointOnSide(box, side, offset);
+  const anchor = avoidLabelAnchor({ side, offset }, box, labelObstacle);
+  const endpoint = pointOnSide(box, anchor.side, anchor.offset);
 
   if (atEnd) {
     const prevIndex = nextPoints.length - 2;
     nextPoints[nextPoints.length - 1] = endpoint;
 
-    if (side === "left" || side === "right") {
+    if (anchor.side === "left" || anchor.side === "right") {
       nextPoints[prevIndex] = { ...nextPoints[prevIndex], y: endpoint.y };
     } else {
       nextPoints[prevIndex] = { ...nextPoints[prevIndex], x: endpoint.x };
@@ -156,7 +192,7 @@ function moveEndpointToLane(
   } else {
     nextPoints[0] = endpoint;
 
-    if (side === "left" || side === "right") {
+    if (anchor.side === "left" || anchor.side === "right") {
       nextPoints[1] = { ...nextPoints[1], y: endpoint.y };
     } else {
       nextPoints[1] = { ...nextPoints[1], x: endpoint.x };
@@ -216,10 +252,19 @@ function spreadEndpointLanes(draws: ResolvedEdgeDraw[], atEnd: boolean): void {
         box,
         side,
         laneOffset(box, side, i, group.length),
+        atEnd ? draw.targetLabelObstacle : draw.sourceLabelObstacle,
         atEnd
       );
     }
   }
+}
+
+function polylineManhattanLength(points: Point[]): number {
+  let length = 0;
+  for (let i = 0; i < points.length - 1; i++) {
+    length += Math.abs(points[i].x - points[i + 1].x) + Math.abs(points[i].y - points[i + 1].y);
+  }
+  return length;
 }
 
 function inferAnchorsFromPolyline(
@@ -278,6 +323,8 @@ function resolveEdgeDraw(
   const targetMoved = Math.abs(targetDx) > 1 || Math.abs(targetDy) > 1;
   const sourceCenter = getBoxCenter(sourceBox);
   const targetCenter = getBoxCenter(targetBox);
+  const sourceLabelObstacle = nodeRefToLabelObstacle(sourceRef);
+  const targetLabelObstacle = nodeRefToLabelObstacle(targetRef);
   const obstacles: NodeBox[] = [];
 
   for (const nodeId of visibleNodes) {
@@ -308,12 +355,22 @@ function resolveEdgeDraw(
   let points: Point[];
   if (!sourceMoved && !targetMoved) {
     const anchors = inferAnchorsFromPolyline(edge.originalPoints, sourceBox, targetBox);
+    const sourceAnchor = avoidLabelAnchor(
+      anchors.sourceAnchor,
+      sourceBox,
+      sourceLabelObstacle
+    );
+    const targetAnchor = avoidLabelAnchor(
+      anchors.targetAnchor,
+      targetBox,
+      targetLabelObstacle
+    );
     points = anchorEdgePolyline(
       edge.originalPoints,
       sourceBox,
       targetBox,
-      anchors.sourceAnchor,
-      anchors.targetAnchor
+      sourceAnchor,
+      targetAnchor
     );
   } else if (
     Math.abs(sourceDx - targetDx) <= 1 &&
@@ -325,16 +382,34 @@ function resolveEdgeDraw(
       (sourceDy + targetDy) / 2
     );
     const anchors = inferAnchorsFromPolyline(translatedPoints, sourceBox, targetBox);
+    const sourceAnchor = avoidLabelAnchor(
+      anchors.sourceAnchor,
+      sourceBox,
+      sourceLabelObstacle
+    );
+    const targetAnchor = avoidLabelAnchor(
+      anchors.targetAnchor,
+      targetBox,
+      targetLabelObstacle
+    );
     points = anchorEdgePolyline(
       translatedPoints,
       sourceBox,
       targetBox,
-      anchors.sourceAnchor,
-      anchors.targetAnchor
+      sourceAnchor,
+      targetAnchor
     );
   } else {
-    const sourceAnchor = inferEdgeAnchorFromPoint(sourceBox, getBoxCenter(targetBox));
-    const targetAnchor = inferEdgeAnchorFromPoint(targetBox, getBoxCenter(sourceBox));
+    const sourceAnchor = avoidLabelAnchor(
+      inferEdgeAnchorFromPoint(sourceBox, getBoxCenter(targetBox)),
+      sourceBox,
+      sourceLabelObstacle
+    );
+    const targetAnchor = avoidLabelAnchor(
+      inferEdgeAnchorFromPoint(targetBox, getBoxCenter(sourceBox)),
+      targetBox,
+      targetLabelObstacle
+    );
     points = rerouteOrthogonalEdge(
       edge.originalPoints,
       sourceBox,
@@ -345,7 +420,16 @@ function resolveEdgeDraw(
   }
 
   return points.length >= 2
-    ? { index, edge, points, sourceBox, targetBox, obstacles }
+    ? {
+        index,
+        edge,
+        points,
+        sourceBox,
+        targetBox,
+        sourceLabelObstacle,
+        targetLabelObstacle,
+        obstacles,
+      }
     : null;
 }
 
@@ -495,6 +579,7 @@ export class EdgeDrawingManager {
 
     spreadEndpointLanes(resolvedDraws, true);
     spreadEndpointLanes(resolvedDraws, false);
+    resolvedDraws.sort((a, b) => this.compareRoutingPriority(a, b));
     const routedPolylines: Point[][] = [];
     for (const draw of resolvedDraws) {
       draw.points = routePolylineAroundObstacles(
@@ -660,6 +745,31 @@ export class EdgeDrawingManager {
       this.highlightLayer.destroy();
       this.highlightLayer = null;
     }
+  }
+
+  getResolvedEdgePoints(edgeIndex: number): Point[] | null {
+    return this.resolvedPointsByEdgeIndex.get(edgeIndex) ?? null;
+  }
+
+  private edgeConnectionCount(draw: ResolvedEdgeDraw): number {
+    return (
+      (this.nodeToEdgeIndices.get(draw.edge.source)?.length ?? 0) +
+      (this.nodeToEdgeIndices.get(draw.edge.target)?.length ?? 0)
+    );
+  }
+
+  private compareRoutingPriority(a: ResolvedEdgeDraw, b: ResolvedEdgeDraw): number {
+    const degreeDelta = this.edgeConnectionCount(b) - this.edgeConnectionCount(a);
+    if (degreeDelta !== 0) {
+      return degreeDelta;
+    }
+
+    const lengthDelta = polylineManhattanLength(b.points) - polylineManhattanLength(a.points);
+    if (Math.abs(lengthDelta) > 1) {
+      return lengthDelta;
+    }
+
+    return a.index - b.index;
   }
 
   // --- Test helpers (internal use only) ---

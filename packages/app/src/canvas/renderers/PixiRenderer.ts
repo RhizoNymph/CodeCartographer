@@ -7,7 +7,11 @@ import { useViewportStore, type LODLevel } from "../../stores/viewportStore";
 import { useDebugStore } from "../../stores/debugStore";
 import { buildParentMap } from "../utils/graphUtils";
 import { pointToPolylineDistance } from "../layout/edgeGeometry";
-import { EdgeDrawingManager, type NodeDisplayRef } from "./edgeDrawing";
+import {
+  EdgeDrawingManager,
+  shouldHideEdgeKindAtLOD,
+  type NodeDisplayRef,
+} from "./edgeDrawing";
 import { MinimapRenderer } from "./minimapRenderer";
 import { DragManager, redrawNodeBg, syncDisplayBounds } from "./dragManager";
 import {
@@ -156,6 +160,10 @@ export class PixiRenderer {
       this._edgeHoverRafId = requestAnimationFrame(() => {
         this._edgeHoverRafId = null;
         if (this.destroyed || !this.initialized) return;
+        if (this.dragManager.dragTarget) {
+          useGraphStore.getState().setHoveredEdge(null);
+          return;
+        }
         // Node hover takes priority over edge hover
         if (this.hoveredNodeId) {
           useGraphStore.getState().setHoveredEdge(null);
@@ -165,9 +173,19 @@ export class PixiRenderer {
         const hitThreshold = 8 / this.viewport.scale.x;
         let closestEdge: import("./types").EdgeDatum | null = null;
         let closestDist = hitThreshold;
-        for (const edge of this.edgeManager.edgeData) {
-          if (edge.originalPoints.length < 2) continue;
-          const dist = pointToPolylineDistance(worldPos, edge.originalPoints);
+        for (const [idx, edge] of this.edgeManager.edgeData.entries()) {
+          if (
+            !this.currentVisibleNodes.has(edge.source) ||
+            !this.currentVisibleNodes.has(edge.target) ||
+            shouldHideEdgeKindAtLOD(edge.kind, this.currentLOD)
+          ) {
+            continue;
+          }
+
+          const points = this.edgeManager.getResolvedEdgePoints(idx) ?? edge.originalPoints;
+          if (points.length < 2) continue;
+
+          const dist = pointToPolylineDistance(worldPos, points);
           if (dist < closestDist) {
             closestDist = dist;
             closestEdge = edge;
@@ -373,6 +391,7 @@ export class PixiRenderer {
     display.container.on("pointerdown", (e) => {
       e.stopPropagation();
       useGraphStore.getState().setSelectedNode(nodeId);
+      useGraphStore.getState().setHoveredEdge(null);
 
       const local = this.viewport.toLocal(e.global);
       const descendants = this.dragManager.collectDescendants(
