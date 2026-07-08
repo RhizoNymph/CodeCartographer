@@ -1,4 +1,4 @@
-import { useRef, useEffect, useState, useCallback } from "react";
+import { useRef, useEffect, useMemo, useState, useCallback } from "react";
 import { useShallow } from "zustand/react/shallow";
 import { PixiRenderer } from "./renderers/PixiRenderer";
 import { useGraphStore } from "../stores/graphStore";
@@ -10,6 +10,7 @@ import {
   computeDependencyChain,
   normalizeMetrics,
 } from "./utils/metricsUtils";
+import { createGraphViewModel } from "./view/graphViewModel";
 
 export function Canvas() {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -21,7 +22,9 @@ export function Canvas() {
     selectedNodeId,
     hoveredNodeId,
     enabledEdgeKinds,
+    hideUnconnectedNodes,
     layoutVersion,
+    applyGraphViewPatch,
   } = useGraphStore(
     useShallow((s) => ({
       graph: s.graph,
@@ -30,7 +33,9 @@ export function Canvas() {
       selectedNodeId: s.selectedNodeId,
       hoveredNodeId: s.hoveredNodeId,
       enabledEdgeKinds: s.enabledEdgeKinds,
+      hideUnconnectedNodes: s.hideUnconnectedNodes,
       layoutVersion: s.layoutVersion,
+      applyGraphViewPatch: s.applyGraphViewPatch,
     }))
   );
   const mode = useVisualizationStore((s) => s.mode);
@@ -39,6 +44,16 @@ export function Canvas() {
   const setDependencyFlow = useVisualizationStore((s) => s.setDependencyFlow);
 
   const [error, setError] = useState<string | null>(null);
+  const graphView = useMemo(
+    () => createGraphViewModel({
+      graph,
+      expandedNodes,
+      visibleNodes,
+      enabledEdgeKinds,
+      hideUnconnectedNodes,
+    }),
+    [graph, expandedNodes, visibleNodes, enabledEdgeKinds, hideUnconnectedNodes]
+  );
 
   // --- Visualization mode effects ---
 
@@ -55,12 +70,8 @@ export function Canvas() {
         expanded.add(id);
       }
     }
-    useGraphStore.setState({
-      expandedNodes: expanded,
-      visibleNodes: visible,
-      layoutVersion: useGraphStore.getState().layoutVersion + 1,
-    });
-  }, [graph]);
+    applyGraphViewPatch({ expandedNodes: expanded, visibleNodes: visible }, { relayout: "now" });
+  }, [graph, applyGraphViewPatch]);
 
   // Architecture mode: only root + direct directory children expanded
   const applyArchitectureMode = useCallback(() => {
@@ -92,12 +103,8 @@ export function Canvas() {
       }
     }
 
-    useGraphStore.setState({
-      expandedNodes: expanded,
-      visibleNodes: visible,
-      layoutVersion: useGraphStore.getState().layoutVersion + 1,
-    });
-  }, [graph]);
+    applyGraphViewPatch({ expandedNodes: expanded, visibleNodes: visible }, { relayout: "now" });
+  }, [graph, applyGraphViewPatch]);
 
   // Default mode: restore full expansion
   const applyDefaultMode = useCallback(() => {
@@ -110,12 +117,8 @@ export function Canvas() {
         expanded.add(id);
       }
     }
-    useGraphStore.setState({
-      expandedNodes: expanded,
-      visibleNodes: visible,
-      layoutVersion: useGraphStore.getState().layoutVersion + 1,
-    });
-  }, [graph]);
+    applyGraphViewPatch({ expandedNodes: expanded, visibleNodes: visible }, { relayout: "now" });
+  }, [graph, applyGraphViewPatch]);
 
   // When mode changes, apply the appropriate layout adjustments
   useEffect(() => {
@@ -208,26 +211,27 @@ export function Canvas() {
   // Only relayout when layoutVersion changes (triggered by setGraph or requestRelayout)
   useEffect(() => {
     const codeBlocks = graph ? Object.values(graph.nodes).filter(n => n.type === "CodeBlock").length : 0;
-    const addLog = useDebugStore.getState().addLog;
-    addLog(`Canvas: edges=${graph?.edges.length ?? 0}, codeBlocks=${codeBlocks}, hasRenderer=${!!rendererRef.current}, layoutVersion=${layoutVersion}`);
-    console.log("Canvas layout effect triggered:", {
-      hasRenderer: !!rendererRef.current,
-      hasGraph: !!graph,
-      edges: graph?.edges.length ?? 0,
-      codeBlocks,
-      layoutVersion,
-    });
-    if (rendererRef.current && graph) {
-      rendererRef.current.updateGraph(graph, expandedNodes, visibleNodes, enabledEdgeKinds);
+    if (import.meta.env.DEV) {
+      useDebugStore.getState().addLog(
+        `Canvas: edges=${graph?.edges.length ?? 0}, codeBlocks=${codeBlocks}, hasRenderer=${!!rendererRef.current}, layoutVersion=${layoutVersion}`
+      );
+    }
+    if (rendererRef.current && graphView.graph) {
+      rendererRef.current.updateGraph(
+        graphView.graph,
+        graphView.expandedNodes,
+        graphView.layoutVisibleNodes,
+        graphView.enabledEdgeKinds
+      );
     }
   }, [graph, layoutVersion, enabledEdgeKinds]);
 
   // Update visibility immediately when nodes are checked/unchecked (without full relayout)
   useEffect(() => {
     if (rendererRef.current && graph) {
-      rendererRef.current.updateVisibility(visibleNodes);
+      rendererRef.current.updateVisibility(graphView.layoutVisibleNodes);
     }
-  }, [graph, visibleNodes]);
+  }, [graph, graphView.layoutVisibleNodes]);
 
   useEffect(() => {
     if (rendererRef.current) {

@@ -3,8 +3,10 @@
 const STORAGE_KEY_PREFIX = "codecartographer_";
 const LAST_FOLDER_KEY = `${STORAGE_KEY_PREFIX}lastFolder`;
 const FOLDER_STATE_PREFIX = `${STORAGE_KEY_PREFIX}folder_`;
+const FOLDER_STATE_VERSION = 2;
 
 interface FolderState {
+  version: number;
   expandedNodes: string[];
   visibleNodes: string[];
 }
@@ -53,6 +55,7 @@ export function saveFolderState(
   try {
     const key = FOLDER_STATE_PREFIX + hashPath(folderPath);
     const state: FolderState = {
+      version: FOLDER_STATE_VERSION,
       expandedNodes: Array.from(expandedNodes),
       visibleNodes: Array.from(visibleNodes),
     };
@@ -67,7 +70,16 @@ export function loadFolderState(folderPath: string): FolderState | null {
     const key = FOLDER_STATE_PREFIX + hashPath(folderPath);
     const data = localStorage.getItem(key);
     if (!data) return null;
-    return JSON.parse(data) as FolderState;
+    const state = JSON.parse(data) as Partial<FolderState>;
+    if (
+      state.version !== FOLDER_STATE_VERSION ||
+      !Array.isArray(state.expandedNodes) ||
+      !Array.isArray(state.visibleNodes)
+    ) {
+      localStorage.removeItem(key);
+      return null;
+    }
+    return state as FolderState;
   } catch (e) {
     console.warn("Failed to load folder state:", e);
     return null;

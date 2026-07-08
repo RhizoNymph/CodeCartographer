@@ -5,7 +5,7 @@
  * PixiRenderer, EdgeDrawingManager, DragManager, and nodeCreation all operate on.
  */
 
-import type { EdgeKind } from "../../api/types";
+import type { CodeNode, EdgeKind } from "../../api/types";
 import type { EdgeAnchor, Point } from "../layout/edgeGeometry";
 
 // Re-export NodeDisplay from nodeCreation (canonical definition lives there).
@@ -22,6 +22,12 @@ export interface NodeDisplayRef {
   layoutHeight: number;
   layoutX: number;
   layoutY: number;
+  nodeType: CodeNode["type"];
+  labelX: number;
+  labelY: number;
+  labelWidth: number;
+  labelHeight: number;
+  labelVisible: boolean;
 }
 
 /**
@@ -36,7 +42,8 @@ export interface EdgeDatum {
   originalPoints: Point[];
   sourceAnchor: EdgeAnchor;
   targetAnchor: EdgeAnchor;
-  count?: number; // aggregated edge count (>1 when multiple edges collapsed into one)
+  /** Number of underlying edges this datum represents (>1 for bundled edges). */
+  count: number;
 }
 
 /**

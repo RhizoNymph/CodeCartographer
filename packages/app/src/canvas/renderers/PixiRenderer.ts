@@ -6,6 +6,7 @@ import { useGraphStore } from "../../stores/graphStore";
 import { useViewportStore, type LODLevel } from "../../stores/viewportStore";
 import { useDebugStore } from "../../stores/debugStore";
 import { buildParentMap } from "../utils/graphUtils";
+import { pointToPolylineDistance } from "../layout/edgeGeometry";
 import { EdgeDrawingManager, type NodeDisplayRef } from "./edgeDrawing";
 import { MinimapRenderer } from "./minimapRenderer";
 import { DragManager, redrawNodeBg, syncDisplayBounds } from "./dragManager";
@@ -14,6 +15,16 @@ import {
   getNodeLayer,
   type NodeDisplay,
 } from "./nodeCreation";
+
+export interface NodePresentation {
+  alpha?: number;
+  tint?: number;
+}
+
+export interface NodePresentationLayer {
+  default?: NodePresentation;
+  nodes?: Map<string, NodePresentation>;
+}
 
 export class PixiRenderer {
   private app: Application;
@@ -33,14 +44,17 @@ export class PixiRenderer {
   private lastLayout: LayoutResult | null = null;
   private currentGraph: CodeGraph | null = null;
   private currentVisibleNodes: Set<string> = new Set();
+  private nodePresentationLayers = new Map<string, NodePresentationLayer>();
   private _viewportDirty = false;
   private _viewportRafId: number | null = null;
   private _layoutRequestId = 0;
+  private _edgeHoverRafId: number | null = null;
 
   private pendingUpdate: {
     graph: CodeGraph;
     expanded: Set<string>;
     visible: Set<string>;
+    enabledEdgeKinds?: Set<EdgeKind>;
   } | null = null;
 
   private initPromise: Promise<void>;
@@ -148,13 +162,53 @@ export class PixiRenderer {
       }
     });
 
+    // Edge hover detection (throttled to once per frame)
+    this.viewport.on("pointermove", (e) => {
+      if (this._edgeHoverRafId !== null) return;
+      this._edgeHoverRafId = requestAnimationFrame(() => {
+        this._edgeHoverRafId = null;
+        if (this.destroyed || !this.initialized) return;
+        // Node hover takes priority over edge hover
+        if (this.hoveredNodeId) {
+          useGraphStore.getState().setHoveredEdge(null);
+          return;
+        }
+        const worldPos = this.viewport.toLocal(e.global);
+        const hitThreshold = 8 / this.viewport.scale.x;
+        let closestEdge: import("./types").EdgeDatum | null = null;
+        let closestDist = hitThreshold;
+        for (const edge of this.edgeManager.edgeData) {
+          if (edge.originalPoints.length < 2) continue;
+          const dist = pointToPolylineDistance(worldPos, edge.originalPoints);
+          if (dist < closestDist) {
+            closestDist = dist;
+            closestEdge = edge;
+          }
+        }
+        if (closestEdge && closestEdge.kind) {
+          const sourceNode = this.currentGraph?.nodes[closestEdge.source];
+          const targetNode = this.currentGraph?.nodes[closestEdge.target];
+          useGraphStore.getState().setHoveredEdge({
+            kind: closestEdge.kind,
+            sourceId: closestEdge.source,
+            targetId: closestEdge.target,
+            sourceName: sourceNode?.name || closestEdge.source,
+            targetName: targetNode?.name || closestEdge.target,
+            count: closestEdge.count || 1,
+          });
+        } else {
+          useGraphStore.getState().setHoveredEdge(null);
+        }
+      });
+    });
+
     this.initialized = true;
 
     // Process any pending update
     if (this.pendingUpdate) {
-      const { graph, expanded, visible } = this.pendingUpdate;
+      const { graph, expanded, visible, enabledEdgeKinds } = this.pendingUpdate;
       this.pendingUpdate = null;
-      this.updateGraph(graph, expanded, visible);
+      this.updateGraph(graph, expanded, visible, enabledEdgeKinds);
     }
   }
 
@@ -222,7 +276,12 @@ export class PixiRenderer {
     }
 
     if (!this.initialized) {
-      this.pendingUpdate = { graph, expanded: expandedNodes, visible: visibleNodes };
+      this.pendingUpdate = {
+        graph,
+        expanded: expandedNodes,
+        visible: visibleNodes,
+        enabledEdgeKinds,
+      };
       if (import.meta.env.DEV) {
         useDebugStore.getState().addLog("Pixi not initialized, queuing update");
       }
@@ -290,6 +349,7 @@ export class PixiRenderer {
 
     // Initial LOD update
     this.updateLODVisibility();
+    this.applyNodePresentation();
 
     // Fit viewport to content
     if (this.nodeDisplays.size > 0) {
@@ -413,11 +473,13 @@ export class PixiRenderer {
     // Hover
     display.container.on("pointerover", () => {
       useGraphStore.getState().setHoveredNode(nodeId);
-      display.bg.tint = 0xdddddd;
+      this.setNodePresentationLayer("hover", {
+        nodes: new Map([[nodeId, { tint: 0xdddddd }]]),
+      });
     });
     display.container.on("pointerout", () => {
       useGraphStore.getState().setHoveredNode(null);
-      display.bg.tint = 0xffffff;
+      this.clearNodePresentationLayer("hover");
     });
 
     getNodeLayer(node, this.containerLayer, this.componentLayer).addChild(display.container);
@@ -500,6 +562,43 @@ export class PixiRenderer {
         redrawNodeBg(display, true);
       }
     }
+
+    this.applyNodePresentation();
+  }
+
+  setNodePresentationLayer(layerId: string, layer: NodePresentationLayer | null) {
+    if (layer) {
+      this.nodePresentationLayers.set(layerId, layer);
+    } else {
+      this.nodePresentationLayers.delete(layerId);
+    }
+    this.applyNodePresentation();
+  }
+
+  clearNodePresentationLayer(layerId: string) {
+    this.setNodePresentationLayer(layerId, null);
+  }
+
+  private applyNodePresentation() {
+    for (const [nodeId, display] of this.nodeDisplays) {
+      let alpha = 1;
+      let tint = 0xffffff;
+
+      for (const layer of this.nodePresentationLayers.values()) {
+        const presentation = layer.nodes?.get(nodeId) ?? layer.default;
+        if (!presentation) continue;
+
+        if (presentation.alpha !== undefined) {
+          alpha = Math.min(alpha, presentation.alpha);
+        }
+        if (presentation.tint !== undefined) {
+          tint = presentation.tint;
+        }
+      }
+
+      display.container.alpha = alpha;
+      display.bg.tint = tint;
+    }
   }
 
   /**
@@ -535,13 +634,20 @@ export class PixiRenderer {
    * Pass null to clear highlighting.
    */
   setDependencyHighlight(chainNodes: Set<string> | null): void {
-    for (const [nodeId, display] of this.nodeDisplays) {
-      if (chainNodes) {
-        display.container.alpha = chainNodes.has(nodeId) ? 1.0 : 0.15;
-      } else {
-        display.container.alpha = 1.0;
-      }
+    if (!chainNodes || chainNodes.size === 0) {
+      this.clearNodePresentationLayer("dependency");
+      return;
     }
+
+    const nodes = new Map<string, NodePresentation>();
+    for (const nodeId of chainNodes) {
+      nodes.set(nodeId, { alpha: 1 });
+    }
+
+    this.setNodePresentationLayer("dependency", {
+      default: { alpha: 0.15 },
+      nodes,
+    });
   }
 
   /**
@@ -550,18 +656,20 @@ export class PixiRenderer {
    * Pass null to clear hotspot coloring.
    */
   setHotspotColors(hotspotValues: Map<string, number> | null): void {
-    for (const [nodeId, display] of this.nodeDisplays) {
-      if (hotspotValues && hotspotValues.has(nodeId)) {
-        const value = hotspotValues.get(nodeId)!;
-        // Interpolate from base blue-ish (#1e293b) toward red (#ef4444)
-        const r = Math.floor(0x1e + value * (0xef - 0x1e));
-        const g = Math.floor(0x29 + value * (0x44 - 0x29));
-        const b = Math.floor(0x3b + value * (0x44 - 0x3b));
-        display.bg.tint = (r << 16) | (g << 8) | b;
-      } else {
-        display.bg.tint = 0xffffff;
-      }
+    if (!hotspotValues || hotspotValues.size === 0) {
+      this.clearNodePresentationLayer("hotspot");
+      return;
     }
+
+    const nodes = new Map<string, NodePresentation>();
+    for (const [nodeId, value] of hotspotValues) {
+      const r = Math.floor(0x1e + value * (0xef - 0x1e));
+      const g = Math.floor(0x29 + value * (0x44 - 0x29));
+      const b = Math.floor(0x3b + value * (0x44 - 0x3b));
+      nodes.set(nodeId, { tint: (r << 16) | (g << 8) | b });
+    }
+
+    this.setNodePresentationLayer("hotspot", { nodes });
   }
 
   /**
@@ -578,6 +686,12 @@ export class PixiRenderer {
         layoutHeight: d.layoutPos.height,
         layoutX: d.layoutPos.x,
         layoutY: d.layoutPos.y,
+        nodeType: d.nodeData.type,
+        labelX: d.label.x,
+        labelY: d.label.y,
+        labelWidth: d.label.width,
+        labelHeight: d.label.height,
+        labelVisible: d.label.visible,
       };
     };
 
@@ -596,6 +710,10 @@ export class PixiRenderer {
     if (this._viewportRafId !== null) {
       cancelAnimationFrame(this._viewportRafId);
       this._viewportRafId = null;
+    }
+    if (this._edgeHoverRafId !== null) {
+      cancelAnimationFrame(this._edgeHoverRafId);
+      this._edgeHoverRafId = null;
     }
     this.resizeObserver.disconnect();
     if (!this.initialized) return;
