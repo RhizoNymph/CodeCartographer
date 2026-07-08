@@ -36,13 +36,16 @@ export function Toolbar() {
   const isParsing = useGraphStore((s) => s.isParsing);
   const enabledEdgeKinds = useGraphStore((s) => s.enabledEdgeKinds);
   const activePreset = useGraphStore((s) => s.activePreset);
+  const hideUnconnectedNodes = useGraphStore((s) => s.hideUnconnectedNodes);
   const setRepoPath = useGraphStore((s) => s.setRepoPath);
   const setGraph = useGraphStore((s) => s.setGraph);
   const setIsParsing = useGraphStore((s) => s.setIsParsing);
   const handleParseEvent = useGraphStore((s) => s.handleParseEvent);
   const toggleEdgeKind = useGraphStore((s) => s.toggleEdgeKind);
+  const setHideUnconnectedNodes = useGraphStore((s) => s.setHideUnconnectedNodes);
   const applyPreset = useGraphStore((s) => s.applyPreset);
   const applySnapshot = useGraphStore((s) => s.applySnapshot);
+  const getGraphViewSnapshot = useGraphStore((s) => s.getGraphViewSnapshot);
 
   const edgeLODSettings = useViewportStore((s) => s.edgeLODSettings);
   const setEdgeLODSettings = useViewportStore((s) => s.setEdgeLODSettings);
@@ -148,18 +151,18 @@ export function Toolbar() {
   };
 
   const handleUndo = useCallback(() => {
-    const snapshot = undo();
+    const snapshot = undo(getGraphViewSnapshot());
     if (snapshot) {
       applySnapshot(snapshot);
     }
-  }, [undo, applySnapshot]);
+  }, [undo, applySnapshot, getGraphViewSnapshot]);
 
   const handleRedo = useCallback(() => {
-    const snapshot = redo();
+    const snapshot = redo(getGraphViewSnapshot());
     if (snapshot) {
       applySnapshot(snapshot);
     }
-  }, [redo, applySnapshot]);
+  }, [redo, applySnapshot, getGraphViewSnapshot]);
 
   const handleApplyPreset = useCallback(
     (preset: Preset) => {
@@ -340,6 +343,36 @@ export function Toolbar() {
             activePreset={activePreset}
             onApplyPreset={handleApplyPreset}
           />
+
+          {/* Separator */}
+          <div style={{ width: 1, height: 20, background: "#334155" }} />
+
+          <label
+            title="Hide nodes that are not connected by the currently enabled edge types"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 5,
+              fontSize: 11,
+              color: "#cbd5e1",
+              whiteSpace: "nowrap",
+              marginRight: 8,
+              cursor: "pointer",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={hideUnconnectedNodes}
+              onChange={(e) => setHideUnconnectedNodes(e.currentTarget.checked)}
+              style={{
+                cursor: "pointer",
+                width: 13,
+                height: 13,
+                margin: 0,
+              }}
+            />
+            Hide unconnected
+          </label>
 
           {/* Separator */}
           <div style={{ width: 1, height: 20, background: "#334155" }} />

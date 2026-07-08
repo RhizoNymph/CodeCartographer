@@ -2,6 +2,7 @@ import { Container, Graphics, Text, TextStyle } from "pixi.js";
 import type { CodeNode, BlockKind } from "../../api/types";
 import { BLOCK_COLORS } from "../../api/types";
 import type { LayoutNodePosition } from "../layout/elkLayout";
+import { drawNodeShape, DIRECTORY_TAB_HEIGHT } from "./shapes";
 
 export interface NodeDisplay {
   container: Container;
@@ -34,14 +35,18 @@ export function createNodeDisplay(
   const borderColor = selectedNodeId === nodeId ? 0x60a5fa : 0x334155;
   const borderWidth = selectedNodeId === nodeId ? 3 : 1;
 
-  bg.roundRect(0, 0, pos.width, pos.height, 8);
-  bg.fill({ color });
-  bg.stroke({ color: borderColor, width: borderWidth });
+  drawNodeShape(bg, node, pos.width, pos.height, color, borderColor, borderWidth);
 
   container.addChild(bg);
 
-  // Label
+  // Label — shift down for directory tab; CodeBlock pills need centred text
   const fontSize = node.type === "CodeBlock" ? 11 : 13;
+  const labelY =
+    node.type === "Directory"
+      ? DIRECTORY_TAB_HEIGHT + 4
+      : node.type === "CodeBlock"
+        ? (pos.height - fontSize) / 2
+        : 6;
   const label = new Text({
     text: getNodeLabel(node),
     style: new TextStyle({
@@ -52,8 +57,8 @@ export function createNodeDisplay(
       wordWrapWidth: Math.max(pos.width - 16, 40),
     }),
   });
-  label.x = 8;
-  label.y = 6;
+  label.x = node.type === "CodeBlock" ? 12 : 8;
+  label.y = labelY;
   container.addChild(label);
 
   return {

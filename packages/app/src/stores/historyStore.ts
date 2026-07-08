@@ -5,6 +5,7 @@ export interface Snapshot {
   visibleNodes: Set<string>;
   expandedNodes: Set<string>;
   enabledEdgeKinds: Set<EdgeKind>;
+  hideUnconnectedNodes: boolean;
 }
 
 const MAX_HISTORY = 50;
@@ -15,8 +16,8 @@ interface HistoryState {
   canUndo: boolean;
   canRedo: boolean;
   pushSnapshot: (snapshot: Snapshot) => void;
-  undo: () => Snapshot | null;
-  redo: () => Snapshot | null;
+  undo: (current: Snapshot) => Snapshot | null;
+  redo: (current: Snapshot) => Snapshot | null;
   clear: () => void;
 }
 
@@ -40,7 +41,7 @@ export const useHistoryStore = create<HistoryState>((set, get) => ({
     });
   },
 
-  undo: () => {
+  undo: (current) => {
     const { undoStack, redoStack } = get();
     if (undoStack.length === 0) return null;
 
@@ -48,21 +49,21 @@ export const useHistoryStore = create<HistoryState>((set, get) => ({
     const newUndoStack = undoStack.slice(0, -1);
     set({
       undoStack: newUndoStack,
-      redoStack: [...redoStack, snapshot],
+      redoStack: [...redoStack, current],
       canUndo: newUndoStack.length > 0,
       canRedo: true,
     });
     return snapshot;
   },
 
-  redo: () => {
+  redo: (current) => {
     const { undoStack, redoStack } = get();
     if (redoStack.length === 0) return null;
 
     const snapshot = redoStack[redoStack.length - 1];
     const newRedoStack = redoStack.slice(0, -1);
     set({
-      undoStack: [...undoStack, snapshot],
+      undoStack: [...undoStack, current],
       redoStack: newRedoStack,
       canUndo: true,
       canRedo: newRedoStack.length > 0,

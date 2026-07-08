@@ -2,7 +2,7 @@ import { create } from "zustand";
 import type { CodeGraph, CodeNode, EdgeKind, ParseEvent } from "../api/types";
 import { saveFolderState, loadFolderState } from "./persistenceStore";
 import { useDebugStore } from "./debugStore";
-import { useHistoryStore } from "./historyStore";
+import { useHistoryStore, type Snapshot } from "./historyStore";
 import type { Preset } from "../toolbar/PresetButtons";
 
 interface ParseProgress {
@@ -11,6 +11,29 @@ interface ParseProgress {
   totalBlocks: number;
   currentFile: string;
   errors: Array<{ path: string; message: string }>;
+}
+
+export interface HoveredEdgeInfo {
+  kind: EdgeKind;
+  sourceId: string;
+  targetId: string;
+  sourceName: string;
+  targetName: string;
+  count: number;
+}
+
+export type GraphViewRelayoutMode = "none" | "defer" | "now";
+
+export interface GraphViewPatch {
+  expandedNodes?: Set<string>;
+  visibleNodes?: Set<string>;
+  enabledEdgeKinds?: Set<EdgeKind>;
+  hideUnconnectedNodes?: boolean;
+  activePreset?: string | null;
+}
+
+export interface GraphViewPatchOptions {
+  relayout?: GraphViewRelayoutMode;
 }
 
 interface GraphState {
@@ -35,8 +58,12 @@ interface GraphState {
   selectedNodeId: string | null;
   hoveredNodeId: string | null;
 
+  /** Info about the edge currently being hovered (edge tooltip). */
+  hoveredEdgeInfo: HoveredEdgeInfo | null;
+
   // Edge filter state
   enabledEdgeKinds: Set<EdgeKind>;
+  hideUnconnectedNodes: boolean;
 
   // Preset state
   activePreset: string | null;
@@ -55,12 +82,19 @@ interface GraphState {
   toggleVisible: (nodeId: string) => void;
   setSelectedNode: (nodeId: string | null) => void;
   setHoveredNode: (nodeId: string | null) => void;
+  setHoveredEdge: (info: HoveredEdgeInfo | null) => void;
   toggleEdgeKind: (kind: EdgeKind) => void;
+  setHideUnconnectedNodes: (hide: boolean) => void;
+  applyGraphViewPatch: (
+    patch: GraphViewPatch,
+    options?: GraphViewPatchOptions
+  ) => void;
   getVisibleNodeIds: () => string[];
   requestRelayout: () => void;
   saveCurrentState: () => void;
   applyPreset: (preset: Preset) => void;
-  applySnapshot: (snapshot: { visibleNodes: Set<string>; expandedNodes: Set<string>; enabledEdgeKinds: Set<EdgeKind> }) => void;
+  applySnapshot: (snapshot: Snapshot) => void;
+  getGraphViewSnapshot: () => Snapshot;
 }
 
 const ALL_EDGE_KINDS: EdgeKind[] = [
@@ -73,6 +107,15 @@ const ALL_EDGE_KINDS: EdgeKind[] = [
   "VariableUsage",
 ];
 
+function snapshotFromState(state: GraphState): Snapshot {
+  return {
+    visibleNodes: new Set(state.visibleNodes),
+    expandedNodes: new Set(state.expandedNodes),
+    enabledEdgeKinds: new Set(state.enabledEdgeKinds),
+    hideUnconnectedNodes: state.hideUnconnectedNodes,
+  };
+}
+
 export const useGraphStore = create<GraphState>((set, get) => ({
   repoPath: null,
   graph: null,
@@ -82,7 +125,9 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   visibleNodes: new Set<string>(),
   selectedNodeId: null,
   hoveredNodeId: null,
+  hoveredEdgeInfo: null,
   enabledEdgeKinds: new Set<EdgeKind>(ALL_EDGE_KINDS),
+  hideUnconnectedNodes: false,
   activePreset: null,
   needsRelayout: false,
   layoutVersion: 0,
@@ -121,8 +166,9 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       if (!restored) {
         for (const [nodeId, node] of Object.entries(graph.nodes)) {
           visible.add(nodeId);
-          // Expand directories and files (so code blocks are visible)
-          if ((node.type === "Directory" || node.type === "File") && node.children.length > 0) {
+          // Only expand directories by default (progressive disclosure:
+          // files start collapsed so code blocks are hidden initially)
+          if (node.type === "Directory" && node.children.length > 0) {
             expanded.add(nodeId);
           }
         }
@@ -140,6 +186,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       graph,
       expandedNodes: expanded,
       visibleNodes: visible,
+      activePreset: null,
       needsRelayout: false,
       layoutVersion: get().layoutVersion + 1,
     });
@@ -202,6 +249,41 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     }
   },
 
+  applyGraphViewPatch: (patch, options = {}) => {
+    const state = get();
+    const next: Partial<GraphState> = {};
+
+    if (patch.expandedNodes !== undefined) {
+      next.expandedNodes = new Set(patch.expandedNodes);
+    }
+    if (patch.visibleNodes !== undefined) {
+      next.visibleNodes = new Set(patch.visibleNodes);
+    }
+    if (patch.enabledEdgeKinds !== undefined) {
+      next.enabledEdgeKinds = new Set(patch.enabledEdgeKinds);
+    }
+    if (patch.hideUnconnectedNodes !== undefined) {
+      next.hideUnconnectedNodes = patch.hideUnconnectedNodes;
+    }
+    if (patch.activePreset !== undefined) {
+      next.activePreset = patch.activePreset;
+    }
+
+    switch (options.relayout ?? "now") {
+      case "none":
+        break;
+      case "defer":
+        next.needsRelayout = true;
+        break;
+      case "now":
+        next.needsRelayout = false;
+        next.layoutVersion = state.layoutVersion + 1;
+        break;
+    }
+
+    set(next);
+  },
+
   toggleExpanded: (nodeId) => {
     const expanded = new Set(get().expandedNodes);
     if (expanded.has(nodeId)) {
@@ -209,7 +291,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     } else {
       expanded.add(nodeId);
     }
-    set({ expandedNodes: expanded, needsRelayout: true });
+    get().applyGraphViewPatch({ expandedNodes: expanded }, { relayout: "defer" });
   },
 
   setExpanded: (nodeId, isExpanded) => {
@@ -219,7 +301,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     } else {
       expanded.delete(nodeId);
     }
-    set({ expandedNodes: expanded, needsRelayout: true });
+    get().applyGraphViewPatch({ expandedNodes: expanded }, { relayout: "defer" });
   },
 
   toggleVisible: (nodeId) => {
@@ -229,11 +311,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     if (!graph) return;
 
     // Push history snapshot before mutating
-    useHistoryStore.getState().pushSnapshot({
-      visibleNodes: new Set(state.visibleNodes),
-      expandedNodes: new Set(state.expandedNodes),
-      enabledEdgeKinds: new Set(state.enabledEdgeKinds),
-    });
+    useHistoryStore.getState().pushSnapshot(snapshotFromState(state));
 
     const toggleRecursive = (id: string, show: boolean) => {
       if (show) {
@@ -251,21 +329,21 @@ export const useGraphStore = create<GraphState>((set, get) => ({
 
     const shouldShow = !visible.has(nodeId);
     toggleRecursive(nodeId, shouldShow);
-    set({ visibleNodes: visible, needsRelayout: true, activePreset: null });
+    get().applyGraphViewPatch(
+      { visibleNodes: visible, activePreset: null },
+      { relayout: "defer" }
+    );
   },
 
   setSelectedNode: (nodeId) => set({ selectedNodeId: nodeId }),
   setHoveredNode: (nodeId) => set({ hoveredNodeId: nodeId }),
+  setHoveredEdge: (info) => set({ hoveredEdgeInfo: info }),
 
   toggleEdgeKind: (kind) => {
     const state = get();
 
     // Push history snapshot before mutating
-    useHistoryStore.getState().pushSnapshot({
-      visibleNodes: new Set(state.visibleNodes),
-      expandedNodes: new Set(state.expandedNodes),
-      enabledEdgeKinds: new Set(state.enabledEdgeKinds),
-    });
+    useHistoryStore.getState().pushSnapshot(snapshotFromState(state));
 
     const kinds = new Set(state.enabledEdgeKinds);
     if (kinds.has(kind)) {
@@ -273,12 +351,21 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     } else {
       kinds.add(kind);
     }
-    // Trigger relayout since edge filtering affects layout
-    set({
-      enabledEdgeKinds: kinds,
-      activePreset: null,
-      layoutVersion: state.layoutVersion + 1,
-    });
+    get().applyGraphViewPatch(
+      { enabledEdgeKinds: kinds, activePreset: null },
+      { relayout: "now" }
+    );
+  },
+
+  setHideUnconnectedNodes: (hide) => {
+    const state = get();
+    if (state.hideUnconnectedNodes === hide) return;
+
+    useHistoryStore.getState().pushSnapshot(snapshotFromState(state));
+    get().applyGraphViewPatch(
+      { hideUnconnectedNodes: hide, activePreset: null },
+      { relayout: "now" }
+    );
   },
 
   getVisibleNodeIds: () => {
@@ -314,11 +401,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     if (!graph) return;
 
     // Push history snapshot before mutating
-    useHistoryStore.getState().pushSnapshot({
-      visibleNodes: new Set(state.visibleNodes),
-      expandedNodes: new Set(state.expandedNodes),
-      enabledEdgeKinds: new Set(state.enabledEdgeKinds),
-    });
+    useHistoryStore.getState().pushSnapshot(snapshotFromState(state));
 
     const newEdgeKinds = new Set<EdgeKind>(preset.edgeKinds);
 
@@ -377,25 +460,23 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       }
     }
 
-    set({
+    get().applyGraphViewPatch({
       enabledEdgeKinds: newEdgeKinds,
       expandedNodes: newExpanded,
       visibleNodes: newVisible,
       activePreset: preset.name,
-      needsRelayout: false,
-      layoutVersion: state.layoutVersion + 1,
-    });
+    }, { relayout: "now" });
   },
 
   applySnapshot: (snapshot) => {
-    const state = get();
-    set({
+    get().applyGraphViewPatch({
       visibleNodes: new Set(snapshot.visibleNodes),
       expandedNodes: new Set(snapshot.expandedNodes),
       enabledEdgeKinds: new Set(snapshot.enabledEdgeKinds),
+      hideUnconnectedNodes: snapshot.hideUnconnectedNodes,
       activePreset: null,
-      needsRelayout: false,
-      layoutVersion: state.layoutVersion + 1,
-    });
+    }, { relayout: "now" });
   },
+
+  getGraphViewSnapshot: () => snapshotFromState(get()),
 }));
