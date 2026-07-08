@@ -16,6 +16,16 @@ import {
   type NodeDisplay,
 } from "./nodeCreation";
 
+export interface NodePresentation {
+  alpha?: number;
+  tint?: number;
+}
+
+export interface NodePresentationLayer {
+  default?: NodePresentation;
+  nodes?: Map<string, NodePresentation>;
+}
+
 export class PixiRenderer {
   private app: Application;
   private viewport!: Viewport;
@@ -34,6 +44,7 @@ export class PixiRenderer {
   private lastLayout: LayoutResult | null = null;
   private currentGraph: CodeGraph | null = null;
   private currentVisibleNodes: Set<string> = new Set();
+  private nodePresentationLayers = new Map<string, NodePresentationLayer>();
   private _viewportDirty = false;
   private _viewportRafId: number | null = null;
   private _layoutRequestId = 0;
@@ -43,6 +54,7 @@ export class PixiRenderer {
     graph: CodeGraph;
     expanded: Set<string>;
     visible: Set<string>;
+    enabledEdgeKinds?: Set<EdgeKind>;
   } | null = null;
 
   private initPromise: Promise<void>;
@@ -194,9 +206,9 @@ export class PixiRenderer {
 
     // Process any pending update
     if (this.pendingUpdate) {
-      const { graph, expanded, visible } = this.pendingUpdate;
+      const { graph, expanded, visible, enabledEdgeKinds } = this.pendingUpdate;
       this.pendingUpdate = null;
-      this.updateGraph(graph, expanded, visible);
+      this.updateGraph(graph, expanded, visible, enabledEdgeKinds);
     }
   }
 
@@ -264,7 +276,12 @@ export class PixiRenderer {
     }
 
     if (!this.initialized) {
-      this.pendingUpdate = { graph, expanded: expandedNodes, visible: visibleNodes };
+      this.pendingUpdate = {
+        graph,
+        expanded: expandedNodes,
+        visible: visibleNodes,
+        enabledEdgeKinds,
+      };
       if (import.meta.env.DEV) {
         useDebugStore.getState().addLog("Pixi not initialized, queuing update");
       }
@@ -332,6 +349,7 @@ export class PixiRenderer {
 
     // Initial LOD update
     this.updateLODVisibility();
+    this.applyNodePresentation();
 
     // Fit viewport to content
     if (this.nodeDisplays.size > 0) {
@@ -455,11 +473,13 @@ export class PixiRenderer {
     // Hover
     display.container.on("pointerover", () => {
       useGraphStore.getState().setHoveredNode(nodeId);
-      display.bg.tint = 0xdddddd;
+      this.setNodePresentationLayer("hover", {
+        nodes: new Map([[nodeId, { tint: 0xdddddd }]]),
+      });
     });
     display.container.on("pointerout", () => {
       useGraphStore.getState().setHoveredNode(null);
-      display.bg.tint = 0xffffff;
+      this.clearNodePresentationLayer("hover");
     });
 
     getNodeLayer(node, this.containerLayer, this.componentLayer).addChild(display.container);
@@ -541,6 +561,43 @@ export class PixiRenderer {
       if (display) {
         redrawNodeBg(display, true);
       }
+    }
+
+    this.applyNodePresentation();
+  }
+
+  setNodePresentationLayer(layerId: string, layer: NodePresentationLayer | null) {
+    if (layer) {
+      this.nodePresentationLayers.set(layerId, layer);
+    } else {
+      this.nodePresentationLayers.delete(layerId);
+    }
+    this.applyNodePresentation();
+  }
+
+  clearNodePresentationLayer(layerId: string) {
+    this.setNodePresentationLayer(layerId, null);
+  }
+
+  private applyNodePresentation() {
+    for (const [nodeId, display] of this.nodeDisplays) {
+      let alpha = 1;
+      let tint = 0xffffff;
+
+      for (const layer of this.nodePresentationLayers.values()) {
+        const presentation = layer.nodes?.get(nodeId) ?? layer.default;
+        if (!presentation) continue;
+
+        if (presentation.alpha !== undefined) {
+          alpha = Math.min(alpha, presentation.alpha);
+        }
+        if (presentation.tint !== undefined) {
+          tint = presentation.tint;
+        }
+      }
+
+      display.container.alpha = alpha;
+      display.bg.tint = tint;
     }
   }
 

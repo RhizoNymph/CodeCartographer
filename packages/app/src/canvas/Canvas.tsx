@@ -4,7 +4,7 @@ import { PixiRenderer } from "./renderers/PixiRenderer";
 import { useGraphStore } from "../stores/graphStore";
 import { useViewportStore } from "../stores/viewportStore";
 import { useDebugStore } from "../stores/debugStore";
-import { computeDisplayVisibleNodes } from "../stores/visibilityFilter";
+import { createGraphViewModel } from "./view/graphViewModel";
 
 export function Canvas() {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -31,14 +31,15 @@ export function Canvas() {
     }))
   );
   const [error, setError] = useState<string | null>(null);
-  const displayVisibleNodes = useMemo(
-    () => computeDisplayVisibleNodes(
+  const graphView = useMemo(
+    () => createGraphViewModel({
       graph,
+      expandedNodes,
       visibleNodes,
       enabledEdgeKinds,
-      hideUnconnectedNodes
-    ),
-    [graph, visibleNodes, enabledEdgeKinds, hideUnconnectedNodes]
+      hideUnconnectedNodes,
+    }),
+    [graph, expandedNodes, visibleNodes, enabledEdgeKinds, hideUnconnectedNodes]
   );
 
   useEffect(() => {
@@ -64,26 +65,27 @@ export function Canvas() {
   // Only relayout when layoutVersion changes (triggered by setGraph or requestRelayout)
   useEffect(() => {
     const codeBlocks = graph ? Object.values(graph.nodes).filter(n => n.type === "CodeBlock").length : 0;
-    const addLog = useDebugStore.getState().addLog;
-    addLog(`Canvas: edges=${graph?.edges.length ?? 0}, codeBlocks=${codeBlocks}, hasRenderer=${!!rendererRef.current}, layoutVersion=${layoutVersion}`);
-    console.log("Canvas layout effect triggered:", {
-      hasRenderer: !!rendererRef.current,
-      hasGraph: !!graph,
-      edges: graph?.edges.length ?? 0,
-      codeBlocks,
-      layoutVersion,
-    });
-    if (rendererRef.current && graph) {
-      rendererRef.current.updateGraph(graph, expandedNodes, displayVisibleNodes, enabledEdgeKinds);
+    if (import.meta.env.DEV) {
+      useDebugStore.getState().addLog(
+        `Canvas: edges=${graph?.edges.length ?? 0}, codeBlocks=${codeBlocks}, hasRenderer=${!!rendererRef.current}, layoutVersion=${layoutVersion}`
+      );
+    }
+    if (rendererRef.current && graphView.graph) {
+      rendererRef.current.updateGraph(
+        graphView.graph,
+        graphView.expandedNodes,
+        graphView.layoutVisibleNodes,
+        graphView.enabledEdgeKinds
+      );
     }
   }, [graph, layoutVersion, enabledEdgeKinds]);
 
   // Update visibility immediately when nodes are checked/unchecked (without full relayout)
   useEffect(() => {
     if (rendererRef.current && graph) {
-      rendererRef.current.updateVisibility(displayVisibleNodes);
+      rendererRef.current.updateVisibility(graphView.layoutVisibleNodes);
     }
-  }, [graph, displayVisibleNodes]);
+  }, [graph, graphView.layoutVisibleNodes]);
 
   useEffect(() => {
     if (rendererRef.current) {
