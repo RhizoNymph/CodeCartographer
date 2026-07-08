@@ -22,6 +22,8 @@ const POINT_TOLERANCE = 0.5;
 const MIN_LEAD_DISTANCE = 18;
 const MAX_LEAD_DISTANCE = 72;
 const DETOUR_GUTTER = 28;
+const NODE_OBSTACLE_MARGIN = 14;
+const MAX_OBSTACLE_REROUTE_PASSES = 32;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
@@ -40,6 +42,26 @@ function nearlyEqual(a: number, b: number, tolerance = POINT_TOLERANCE): boolean
   return Math.abs(a - b) <= tolerance;
 }
 
+function samePoint(a: Point, b: Point): boolean {
+  return nearlyEqual(a.x, b.x) && nearlyEqual(a.y, b.y);
+}
+
+function withinRange(value: number, min: number, max: number): boolean {
+  return value >= min - BOUNDARY_TOLERANCE && value <= max + BOUNDARY_TOLERANCE;
+}
+
+function withinPointRange(value: number, min: number, max: number): boolean {
+  return value >= min - POINT_TOLERANCE && value <= max + POINT_TOLERANCE;
+}
+
+function withinSegmentInterior(value: number, min: number, max: number): boolean {
+  return value > min + POINT_TOLERANCE && value < max - POINT_TOLERANCE;
+}
+
+function rangesOverlap(aMin: number, aMax: number, bMin: number, bMax: number): boolean {
+  return Math.max(aMin, bMin) < Math.min(aMax, bMax) - POINT_TOLERANCE;
+}
+
 export function isHorizontalSide(side: EdgeAnchorSide): boolean {
   return side === "left" || side === "right";
 }
@@ -48,11 +70,53 @@ function isVerticalSide(side: EdgeAnchorSide): boolean {
   return side === "top" || side === "bottom";
 }
 
+function inferApproachSide(
+  nodeBox: NodeBox,
+  boundaryPoint: Point,
+  adjacentPoint: Point
+): EdgeAnchorSide | null {
+  const dx = adjacentPoint.x - boundaryPoint.x;
+  const dy = adjacentPoint.y - boundaryPoint.y;
+  const xWithinNode = withinRange(boundaryPoint.x, nodeBox.x, nodeBox.x + nodeBox.width);
+  const yWithinNode = withinRange(boundaryPoint.y, nodeBox.y, nodeBox.y + nodeBox.height);
+  const verticalApproach =
+    Math.abs(dy) > POINT_TOLERANCE &&
+    (Math.abs(dy) >= Math.abs(dx) || nearlyEqual(boundaryPoint.x, adjacentPoint.x, BOUNDARY_TOLERANCE));
+  const horizontalApproach =
+    Math.abs(dx) > POINT_TOLERANCE &&
+    (Math.abs(dx) > Math.abs(dy) || nearlyEqual(boundaryPoint.y, adjacentPoint.y, BOUNDARY_TOLERANCE));
+
+  if (verticalApproach && xWithinNode) {
+    if (dy < 0 && adjacentPoint.y <= nodeBox.y + BOUNDARY_TOLERANCE) {
+      return "top";
+    }
+    if (dy > 0 && adjacentPoint.y >= nodeBox.y + nodeBox.height - BOUNDARY_TOLERANCE) {
+      return "bottom";
+    }
+  }
+
+  if (horizontalApproach && yWithinNode) {
+    if (dx < 0 && adjacentPoint.x <= nodeBox.x + BOUNDARY_TOLERANCE) {
+      return "left";
+    }
+    if (dx > 0 && adjacentPoint.x >= nodeBox.x + nodeBox.width - BOUNDARY_TOLERANCE) {
+      return "right";
+    }
+  }
+
+  return null;
+}
+
 function inferAnchorSide(
   nodeBox: NodeBox,
   boundaryPoint: Point,
   adjacentPoint: Point
 ): EdgeAnchorSide {
+  const approachSide = inferApproachSide(nodeBox, boundaryPoint, adjacentPoint);
+  if (approachSide) {
+    return approachSide;
+  }
+
   if (Math.abs(boundaryPoint.x - nodeBox.x) <= BOUNDARY_TOLERANCE) {
     return "left";
   }
@@ -88,6 +152,34 @@ export function inferEdgeAnchor(
       side === "left" || side === "right"
         ? clamp(boundaryPoint.y - nodeBox.y, 0, nodeBox.height)
         : clamp(boundaryPoint.x - nodeBox.x, 0, nodeBox.width),
+  };
+}
+
+export function inferEdgeAnchorFromPoint(
+  nodeBox: NodeBox,
+  externalPoint: Point
+): EdgeAnchor {
+  const center = {
+    x: nodeBox.x + nodeBox.width / 2,
+    y: nodeBox.y + nodeBox.height / 2,
+  };
+  const dx = externalPoint.x - center.x;
+  const dy = externalPoint.y - center.y;
+  const halfWidth = Math.max(nodeBox.width / 2, 1);
+  const halfHeight = Math.max(nodeBox.height / 2, 1);
+  const scaledX = Math.abs(dx) / halfWidth;
+  const scaledY = Math.abs(dy) / halfHeight;
+
+  if (scaledY > scaledX) {
+    return {
+      side: dy >= 0 ? "bottom" : "top",
+      offset: clamp(externalPoint.x - nodeBox.x, 0, nodeBox.width),
+    };
+  }
+
+  return {
+    side: dx >= 0 ? "right" : "left",
+    offset: clamp(externalPoint.y - nodeBox.y, 0, nodeBox.height),
   };
 }
 
@@ -157,6 +249,364 @@ export function simplifyOrthogonalPolyline(points: Point[]): Point[] {
 
   simplified.push(deduped[deduped.length - 1]);
   return dedupePolylinePoints(simplified);
+}
+
+function isOrthogonalSegment(a: Point, b: Point): boolean {
+  return nearlyEqual(a.x, b.x) || nearlyEqual(a.y, b.y);
+}
+
+function orthogonalizePolyline(points: Point[]): Point[] {
+  const deduped = dedupePolylinePoints(points);
+  if (deduped.length <= 1) {
+    return deduped;
+  }
+
+  const result: Point[] = [deduped[0]];
+
+  for (let i = 1; i < deduped.length; i++) {
+    const prev = result[result.length - 1];
+    const current = deduped[i];
+
+    if (!isOrthogonalSegment(prev, current)) {
+      const prior = result.length >= 2 ? result[result.length - 2] : null;
+      const next = i + 1 < deduped.length ? deduped[i + 1] : null;
+      const preferVerticalFirst =
+        (prior ? nearlyEqual(prior.x, prev.x) : false) ||
+        (next ? nearlyEqual(next.y, current.y) : false);
+      const bend = preferVerticalFirst
+        ? { x: prev.x, y: current.y }
+        : { x: current.x, y: prev.y };
+
+      if (!samePoint(prev, bend) && !samePoint(bend, current)) {
+        result.push(bend);
+      }
+    }
+
+    result.push(current);
+  }
+
+  return simplifyOrthogonalPolyline(result);
+}
+
+function pointOnSegment(point: Point, a: Point, b: Point): boolean {
+  return (
+    withinPointRange(point.x, Math.min(a.x, b.x), Math.max(a.x, b.x)) &&
+    withinPointRange(point.y, Math.min(a.y, b.y), Math.max(a.y, b.y))
+  );
+}
+
+function segmentIntersection(a: Point, b: Point, c: Point, d: Point): Point | null {
+  const abVertical = nearlyEqual(a.x, b.x);
+  const abHorizontal = nearlyEqual(a.y, b.y);
+  const cdVertical = nearlyEqual(c.x, d.x);
+  const cdHorizontal = nearlyEqual(c.y, d.y);
+
+  if (abVertical && cdHorizontal) {
+    const point = { x: a.x, y: c.y };
+    return pointOnSegment(point, a, b) && pointOnSegment(point, c, d) ? point : null;
+  }
+
+  if (abHorizontal && cdVertical) {
+    const point = { x: c.x, y: a.y };
+    return pointOnSegment(point, a, b) && pointOnSegment(point, c, d) ? point : null;
+  }
+
+  if (abVertical && cdVertical && nearlyEqual(a.x, c.x)) {
+    if (pointOnSegment(c, a, b)) return c;
+    if (pointOnSegment(d, a, b)) return d;
+    if (pointOnSegment(a, c, d)) return a;
+    if (pointOnSegment(b, c, d)) return b;
+  }
+
+  if (abHorizontal && cdHorizontal && nearlyEqual(a.y, c.y)) {
+    if (pointOnSegment(c, a, b)) return c;
+    if (pointOnSegment(d, a, b)) return d;
+    if (pointOnSegment(a, c, d)) return a;
+    if (pointOnSegment(b, c, d)) return b;
+  }
+
+  return null;
+}
+
+function findLoopIntersection(
+  points: Point[],
+  nextPoint: Point
+): { segmentIndex: number; point: Point } | null {
+  if (points.length < 3) {
+    return null;
+  }
+
+  const current = points[points.length - 1];
+  for (let i = 0; i < points.length - 2; i++) {
+    const point = segmentIntersection(points[i], points[i + 1], current, nextPoint);
+    if (point && !samePoint(point, current)) {
+      return { segmentIndex: i, point };
+    }
+  }
+
+  return null;
+}
+
+function eraseOrthogonalLoops(points: Point[]): Point[] {
+  const simplified = simplifyOrthogonalPolyline(points);
+  if (simplified.length <= 3) {
+    return simplified;
+  }
+
+  let result: Point[] = [simplified[0]];
+
+  for (let i = 1; i < simplified.length; i++) {
+    const nextPoint = simplified[i];
+    let guard = 0;
+
+    while (!samePoint(result[result.length - 1], nextPoint) && guard < simplified.length) {
+      guard++;
+      const hit = findLoopIntersection(result, nextPoint);
+
+      if (!hit) {
+        result.push(nextPoint);
+        break;
+      }
+
+      result = result.slice(0, hit.segmentIndex + 1);
+      if (!samePoint(result[result.length - 1], hit.point)) {
+        result.push(hit.point);
+      }
+
+      if (samePoint(hit.point, nextPoint)) {
+        break;
+      }
+    }
+  }
+
+  return simplifyOrthogonalPolyline(result);
+}
+
+function normalizeRoutedPolyline(points: Point[]): Point[] {
+  return eraseOrthogonalLoops(orthogonalizePolyline(points));
+}
+
+function inflateBox(box: NodeBox, margin: number): NodeBox {
+  return {
+    x: box.x - margin,
+    y: box.y - margin,
+    width: box.width + margin * 2,
+    height: box.height + margin * 2,
+  };
+}
+
+function segmentCrossesBox(a: Point, b: Point, box: NodeBox): boolean {
+  const left = box.x;
+  const right = box.x + box.width;
+  const top = box.y;
+  const bottom = box.y + box.height;
+
+  if (nearlyEqual(a.y, b.y)) {
+    return (
+      withinSegmentInterior(a.y, top, bottom) &&
+      rangesOverlap(Math.min(a.x, b.x), Math.max(a.x, b.x), left, right)
+    );
+  }
+
+  if (nearlyEqual(a.x, b.x)) {
+    return (
+      withinSegmentInterior(a.x, left, right) &&
+      rangesOverlap(Math.min(a.y, b.y), Math.max(a.y, b.y), top, bottom)
+    );
+  }
+
+  return false;
+}
+
+function countObstacleCrossings(points: Point[], obstacles: NodeBox[]): number {
+  let crossings = 0;
+  for (let i = 0; i < points.length - 1; i++) {
+    for (const obstacle of obstacles) {
+      if (segmentCrossesBox(points[i], points[i + 1], obstacle)) {
+        crossings++;
+      }
+    }
+  }
+  return crossings;
+}
+
+function findFirstObstacleCrossing(
+  points: Point[],
+  obstacles: NodeBox[]
+): { segmentIndex: number; obstacle: NodeBox } | null {
+  for (let i = 0; i < points.length - 1; i++) {
+    for (const obstacle of obstacles) {
+      if (segmentCrossesBox(points[i], points[i + 1], obstacle)) {
+        return { segmentIndex: i, obstacle };
+      }
+    }
+  }
+  return null;
+}
+
+function boundingBox(boxes: NodeBox[]): NodeBox {
+  const left = Math.min(...boxes.map((box) => box.x));
+  const top = Math.min(...boxes.map((box) => box.y));
+  const right = Math.max(...boxes.map((box) => box.x + box.width));
+  const bottom = Math.max(...boxes.map((box) => box.y + box.height));
+
+  return {
+    x: left,
+    y: top,
+    width: right - left,
+    height: bottom - top,
+  };
+}
+
+function pointAtSegmentEndpoint(point: Point, a: Point, b: Point): boolean {
+  return samePoint(point, a) || samePoint(point, b);
+}
+
+function countPolylineCrossings(points: Point[], referencePolylines: Point[][]): number {
+  let crossings = 0;
+
+  for (let i = 0; i < points.length - 1; i++) {
+    const a = points[i];
+    const b = points[i + 1];
+
+    for (const reference of referencePolylines) {
+      for (let j = 0; j < reference.length - 1; j++) {
+        const c = reference[j];
+        const d = reference[j + 1];
+        const intersection = segmentIntersection(a, b, c, d);
+
+        if (!intersection) {
+          continue;
+        }
+
+        if (
+          pointAtSegmentEndpoint(intersection, a, b) &&
+          pointAtSegmentEndpoint(intersection, c, d)
+        ) {
+          continue;
+        }
+
+        crossings++;
+      }
+    }
+  }
+
+  return crossings;
+}
+
+function chooseObstacleDetour(
+  a: Point,
+  b: Point,
+  obstacle: NodeBox,
+  obstacles: NodeBox[],
+  referencePolylines: Point[][]
+): Point[] {
+  const candidates: Point[][] = [];
+  const crossedObstacles = obstacles.filter((box) => segmentCrossesBox(a, b, box));
+  const detourBox = boundingBox(crossedObstacles.length > 0 ? crossedObstacles : [obstacle]);
+
+  if (nearlyEqual(a.y, b.y)) {
+    const movingPositive = b.x >= a.x;
+    const entryX = movingPositive ? detourBox.x : detourBox.x + detourBox.width;
+    const exitX = movingPositive ? detourBox.x + detourBox.width : detourBox.x;
+
+    for (const y of [detourBox.y, detourBox.y + detourBox.height]) {
+      candidates.push(simplifyOrthogonalPolyline([
+        a,
+        { x: entryX, y: a.y },
+        { x: entryX, y },
+        { x: exitX, y },
+        { x: exitX, y: b.y },
+        b,
+      ]));
+    }
+  } else if (nearlyEqual(a.x, b.x)) {
+    const movingPositive = b.y >= a.y;
+    const entryY = movingPositive ? detourBox.y : detourBox.y + detourBox.height;
+    const exitY = movingPositive ? detourBox.y + detourBox.height : detourBox.y;
+
+    for (const x of [detourBox.x, detourBox.x + detourBox.width]) {
+      candidates.push(simplifyOrthogonalPolyline([
+        a,
+        { x: a.x, y: entryY },
+        { x, y: entryY },
+        { x, y: exitY },
+        { x: b.x, y: exitY },
+        b,
+      ]));
+    }
+  }
+
+  if (candidates.length === 0) {
+    return [a, b];
+  }
+
+  return candidates.sort((left, right) => {
+    const crossingDelta =
+      countObstacleCrossings(left, obstacles) - countObstacleCrossings(right, obstacles);
+    if (crossingDelta !== 0) {
+      return crossingDelta;
+    }
+
+    const edgeCrossingDelta =
+      countPolylineCrossings(left, referencePolylines) -
+      countPolylineCrossings(right, referencePolylines);
+    if (edgeCrossingDelta !== 0) {
+      return edgeCrossingDelta;
+    }
+
+    const leftLength = polylineManhattanLength(left);
+    const rightLength = polylineManhattanLength(right);
+    return leftLength - rightLength;
+  })[0];
+}
+
+function polylineManhattanLength(points: Point[]): number {
+  let length = 0;
+  for (let i = 0; i < points.length - 1; i++) {
+    length += manhattanLength(points[i], points[i + 1]);
+  }
+  return length;
+}
+
+function routeByLocalObstacleDetours(
+  points: Point[],
+  obstacles: NodeBox[],
+  referencePolylines: Point[][]
+): Point[] {
+  let routed = normalizeRoutedPolyline(points);
+
+  for (let pass = 0; pass < MAX_OBSTACLE_REROUTE_PASSES; pass++) {
+    const hit = findFirstObstacleCrossing(routed, obstacles);
+    if (!hit) {
+      return routed;
+    }
+
+    const a = routed[hit.segmentIndex];
+    const b = routed[hit.segmentIndex + 1];
+    const detour = chooseObstacleDetour(a, b, hit.obstacle, obstacles, referencePolylines);
+    routed = normalizeRoutedPolyline([
+      ...routed.slice(0, hit.segmentIndex),
+      ...detour,
+      ...routed.slice(hit.segmentIndex + 2),
+    ]);
+  }
+
+  return routed;
+}
+
+export function routePolylineAroundObstacles(
+  points: Point[],
+  obstacles: NodeBox[],
+  referencePolylines: Point[][] = []
+): Point[] {
+  if (points.length < 2 || obstacles.length === 0) {
+    return normalizeRoutedPolyline(points);
+  }
+
+  const inflatedObstacles = obstacles.map((box) => inflateBox(box, NODE_OBSTACLE_MARGIN));
+  const normalized = normalizeRoutedPolyline(points);
+  return routeByLocalObstacleDetours(normalized, inflatedObstacles, referencePolylines);
 }
 
 function segmentMatchesAnchorAxis(from: Point, to: Point, side: EdgeAnchorSide): boolean {
@@ -263,7 +713,7 @@ export function anchorEdgePolyline(
     targetAnchor.side
   );
 
-  const anchored = simplifyOrthogonalPolyline(withEnd);
+  const anchored = normalizeRoutedPolyline(withEnd);
   if (polylineRespectsAnchorDirections(anchored, sourceAnchor, targetAnchor)) {
     return anchored;
   }
@@ -560,6 +1010,31 @@ function routeVerticalSides(
   ];
 }
 
+/**
+ * Compute the minimum distance from a point to any segment in a polyline.
+ * Used for edge hover hit-testing.
+ */
+export function pointToPolylineDistance(point: Point, polyline: Point[]): number {
+  let minDist = Infinity;
+  for (let i = 0; i < polyline.length - 1; i++) {
+    const dist = pointToSegmentDistance(point, polyline[i], polyline[i + 1]);
+    if (dist < minDist) minDist = dist;
+  }
+  return minDist;
+}
+
+function pointToSegmentDistance(p: Point, a: Point, b: Point): number {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq === 0) return Math.hypot(p.x - a.x, p.y - a.y);
+  let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq;
+  t = Math.max(0, Math.min(1, t));
+  const projX = a.x + t * dx;
+  const projY = a.y + t * dy;
+  return Math.hypot(p.x - projX, p.y - projY);
+}
+
 export function rerouteOrthogonalEdge(
   originalPoints: Point[],
   sourceBox: NodeBox,
@@ -618,7 +1093,7 @@ export function rerouteOrthogonalEdge(
     ];
   }
 
-  return simplifyOrthogonalPolyline([
+  return normalizeRoutedPolyline([
     startPoint,
     ...middlePoints,
     endPoint,

@@ -23,7 +23,9 @@ export function Toolbar() {
   const graph = useGraphStore((s) => s.graph);
   const isParsing = useGraphStore((s) => s.isParsing);
   const enabledEdgeKinds = useGraphStore((s) => s.enabledEdgeKinds);
+  const hideUnconnectedNodes = useGraphStore((s) => s.hideUnconnectedNodes);
   const toggleEdgeKind = useGraphStore((s) => s.toggleEdgeKind);
+  const setHideUnconnectedNodes = useGraphStore((s) => s.setHideUnconnectedNodes);
 
   const edgeLODSettings = useViewportStore((s) => s.edgeLODSettings);
   const setEdgeLODSettings = useViewportStore((s) => s.setEdgeLODSettings);
@@ -223,6 +225,33 @@ export function Toolbar() {
             overflow: "hidden",
           }}
         >
+          <label
+            title="Hide nodes that are not connected by the currently enabled edge types"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 5,
+              fontSize: 11,
+              color: "#cbd5e1",
+              whiteSpace: "nowrap",
+              marginRight: 8,
+              cursor: "pointer",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={hideUnconnectedNodes}
+              onChange={(e) => setHideUnconnectedNodes(e.currentTarget.checked)}
+              style={{
+                cursor: "pointer",
+                width: 13,
+                height: 13,
+                margin: 0,
+              }}
+            />
+            Hide unconnected
+          </label>
+
           <span
             style={{ fontSize: 10, color: "#64748b", marginRight: 2 }}
           >

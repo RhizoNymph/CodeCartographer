@@ -2,8 +2,13 @@ import { Container, Graphics } from "pixi.js";
 import type { EdgeKind } from "../../api/types";
 import {
   anchorEdgePolyline,
+  inferEdgeAnchor,
+  inferEdgeAnchorFromPoint,
   rerouteOrthogonalEdge,
+  routePolylineAroundObstacles,
   translatePolyline,
+  type EdgeAnchor,
+  type NodeBox,
   type Point,
 } from "../layout/edgeGeometry";
 import type { LayoutResult } from "../layout/elkLayout";
@@ -18,14 +23,236 @@ import {
 // Re-export types for backwards compatibility with existing imports
 export type { EdgeDatum, NodeDisplayRef } from "./types";
 
+interface ResolvedEdgeDraw {
+  index: number;
+  edge: EdgeDatum;
+  points: Point[];
+  sourceBox: NodeBox;
+  targetBox: NodeBox;
+  obstacles: NodeBox[];
+}
+
+function getBoxCenter(box: NodeBox): Point {
+  return {
+    x: box.x + box.width / 2,
+    y: box.y + box.height / 2,
+  };
+}
+
+function nearlyEqual(a: number, b: number, tolerance = 1.5): boolean {
+  return Math.abs(a - b) <= tolerance;
+}
+
+function boxContainsPoint(box: NodeBox, point: Point): boolean {
+  return (
+    point.x >= box.x &&
+    point.x <= box.x + box.width &&
+    point.y >= box.y &&
+    point.y <= box.y + box.height
+  );
+}
+
+function nodeRefToBox(ref: NodeDisplayRef): NodeBox {
+  return {
+    x: ref.containerX,
+    y: ref.containerY,
+    width: ref.layoutWidth,
+    height: ref.layoutHeight,
+  };
+}
+
+function nodeRefToLabelObstacle(ref: NodeDisplayRef): NodeBox | null {
+  if (!ref.labelVisible || ref.nodeType === "CodeBlock" || ref.labelWidth <= 0 || ref.labelHeight <= 0) {
+    return null;
+  }
+
+  const paddingX = 8;
+  const paddingY = 6;
+  const localX = Math.max(0, ref.labelX - paddingX);
+  const localY = Math.max(0, ref.labelY - paddingY);
+  const maxWidth = Math.max(0, ref.layoutWidth - localX);
+  const maxHeight = Math.max(0, ref.layoutHeight - localY);
+  const width = Math.min(maxWidth, ref.labelWidth + paddingX * 2);
+  const height = Math.min(maxHeight, ref.labelHeight + paddingY * 2);
+
+  if (width <= 0 || height <= 0) {
+    return null;
+  }
+
+  return {
+    x: ref.containerX + localX,
+    y: ref.containerY + localY,
+    width,
+    height,
+  };
+}
+
+function inferPointSide(box: NodeBox, point: Point): EdgeAnchor["side"] | null {
+  if (nearlyEqual(point.x, box.x)) return "left";
+  if (nearlyEqual(point.x, box.x + box.width)) return "right";
+  if (nearlyEqual(point.y, box.y)) return "top";
+  if (nearlyEqual(point.y, box.y + box.height)) return "bottom";
+  return null;
+}
+
+function sideLength(box: NodeBox, side: EdgeAnchor["side"]): number {
+  return side === "left" || side === "right" ? box.height : box.width;
+}
+
+function pointOnSide(box: NodeBox, side: EdgeAnchor["side"], offset: number): Point {
+  const clampedOffset = Math.max(0, Math.min(sideLength(box, side), offset));
+
+  switch (side) {
+    case "left":
+      return { x: box.x, y: box.y + clampedOffset };
+    case "right":
+      return { x: box.x + box.width, y: box.y + clampedOffset };
+    case "top":
+      return { x: box.x + clampedOffset, y: box.y };
+    case "bottom":
+      return { x: box.x + clampedOffset, y: box.y + box.height };
+  }
+}
+
+function laneOffset(box: NodeBox, side: EdgeAnchor["side"], index: number, count: number): number {
+  const length = sideLength(box, side);
+  if (count <= 1) {
+    return length / 2;
+  }
+
+  const padding = Math.min(12, Math.max(4, length / 4));
+  const usable = Math.max(1, length - padding * 2);
+  return padding + (usable * (index + 1)) / (count + 1);
+}
+
+function orderValueForSide(box: NodeBox, side: EdgeAnchor["side"]): number {
+  const center = getBoxCenter(box);
+  return side === "left" || side === "right" ? center.y : center.x;
+}
+
+function moveEndpointToLane(
+  points: Point[],
+  box: NodeBox,
+  side: EdgeAnchor["side"],
+  offset: number,
+  atEnd: boolean
+): Point[] {
+  if (points.length < 2) {
+    return points;
+  }
+
+  const nextPoints = points.map((point) => ({ ...point }));
+  const endpoint = pointOnSide(box, side, offset);
+
+  if (atEnd) {
+    const prevIndex = nextPoints.length - 2;
+    nextPoints[nextPoints.length - 1] = endpoint;
+
+    if (side === "left" || side === "right") {
+      nextPoints[prevIndex] = { ...nextPoints[prevIndex], y: endpoint.y };
+    } else {
+      nextPoints[prevIndex] = { ...nextPoints[prevIndex], x: endpoint.x };
+    }
+  } else {
+    nextPoints[0] = endpoint;
+
+    if (side === "left" || side === "right") {
+      nextPoints[1] = { ...nextPoints[1], y: endpoint.y };
+    } else {
+      nextPoints[1] = { ...nextPoints[1], x: endpoint.x };
+    }
+  }
+
+  return routePolylineAroundObstacles(nextPoints, []);
+}
+
+function spreadEndpointLanes(draws: ResolvedEdgeDraw[], atEnd: boolean): void {
+  const groups = new Map<string, ResolvedEdgeDraw[]>();
+
+  for (const draw of draws) {
+    const box = atEnd ? draw.targetBox : draw.sourceBox;
+    const point = atEnd ? draw.points[draw.points.length - 1] : draw.points[0];
+    const side = inferPointSide(box, point);
+
+    if (!side) {
+      continue;
+    }
+
+    const nodeId = atEnd ? draw.edge.target : draw.edge.source;
+    const key = `${nodeId}:${side}`;
+    const group = groups.get(key);
+
+    if (group) {
+      group.push(draw);
+    } else {
+      groups.set(key, [draw]);
+    }
+  }
+
+  for (const group of groups.values()) {
+    if (group.length <= 1) {
+      continue;
+    }
+
+    const side = inferPointSide(
+      atEnd ? group[0].targetBox : group[0].sourceBox,
+      atEnd ? group[0].points[group[0].points.length - 1] : group[0].points[0]
+    );
+    if (!side) {
+      continue;
+    }
+
+    group.sort((a, b) => {
+      const aBox = atEnd ? a.sourceBox : a.targetBox;
+      const bBox = atEnd ? b.sourceBox : b.targetBox;
+      return orderValueForSide(aBox, side) - orderValueForSide(bBox, side);
+    });
+
+    for (let i = 0; i < group.length; i++) {
+      const draw = group[i];
+      const box = atEnd ? draw.targetBox : draw.sourceBox;
+      draw.points = moveEndpointToLane(
+        draw.points,
+        box,
+        side,
+        laneOffset(box, side, i, group.length),
+        atEnd
+      );
+    }
+  }
+}
+
+function inferAnchorsFromPolyline(
+  points: Point[],
+  sourceBox: NodeBox,
+  targetBox: NodeBox
+): { sourceAnchor: EdgeAnchor; targetAnchor: EdgeAnchor } {
+  const sourceAnchor =
+    points.length >= 2
+      ? inferEdgeAnchor(sourceBox, points[0], points[1])
+      : inferEdgeAnchorFromPoint(sourceBox, getBoxCenter(targetBox));
+  const targetAnchor =
+    points.length >= 2
+      ? inferEdgeAnchor(
+          targetBox,
+          points[points.length - 1],
+          points[points.length - 2]
+        )
+      : inferEdgeAnchorFromPoint(targetBox, getBoxCenter(sourceBox));
+
+  return { sourceAnchor, targetAnchor };
+}
+
 /**
  * Resolves edge routing points for a single edge given current node positions.
  * Extracted so both base and highlight layers can share this logic.
  */
-function resolveEdgePoints(
+function resolveEdgeDraw(
+  index: number,
   edge: EdgeDatum,
+  visibleNodes: Set<string>,
   getNodeDisplayRef: (nodeId: string) => NodeDisplayRef | null
-): Point[] | null {
+): ResolvedEdgeDraw | null {
   const sourceRef = getNodeDisplayRef(edge.source);
   const targetRef = getNodeDisplayRef(edge.target);
 
@@ -49,42 +276,77 @@ function resolveEdgePoints(
   const targetDy = targetRef.containerY - targetRef.layoutY;
   const sourceMoved = Math.abs(sourceDx) > 1 || Math.abs(sourceDy) > 1;
   const targetMoved = Math.abs(targetDx) > 1 || Math.abs(targetDy) > 1;
+  const sourceCenter = getBoxCenter(sourceBox);
+  const targetCenter = getBoxCenter(targetBox);
+  const obstacles: NodeBox[] = [];
+
+  for (const nodeId of visibleNodes) {
+    if (nodeId === edge.source || nodeId === edge.target) {
+      continue;
+    }
+
+    const ref = getNodeDisplayRef(nodeId);
+    if (!ref) {
+      continue;
+    }
+
+    const labelObstacle = nodeRefToLabelObstacle(ref);
+    if (
+      labelObstacle &&
+      !boxContainsPoint(labelObstacle, sourceCenter) &&
+      !boxContainsPoint(labelObstacle, targetCenter)
+    ) {
+      obstacles.push(labelObstacle);
+    }
+
+    const box = nodeRefToBox(ref);
+    if (!boxContainsPoint(box, sourceCenter) && !boxContainsPoint(box, targetCenter)) {
+      obstacles.push(box);
+    }
+  }
 
   let points: Point[];
   if (!sourceMoved && !targetMoved) {
+    const anchors = inferAnchorsFromPolyline(edge.originalPoints, sourceBox, targetBox);
     points = anchorEdgePolyline(
       edge.originalPoints,
       sourceBox,
       targetBox,
-      edge.sourceAnchor,
-      edge.targetAnchor
+      anchors.sourceAnchor,
+      anchors.targetAnchor
     );
   } else if (
     Math.abs(sourceDx - targetDx) <= 1 &&
     Math.abs(sourceDy - targetDy) <= 1
   ) {
+    const translatedPoints = translatePolyline(
+      edge.originalPoints,
+      (sourceDx + targetDx) / 2,
+      (sourceDy + targetDy) / 2
+    );
+    const anchors = inferAnchorsFromPolyline(translatedPoints, sourceBox, targetBox);
     points = anchorEdgePolyline(
-      translatePolyline(
-        edge.originalPoints,
-        (sourceDx + targetDx) / 2,
-        (sourceDy + targetDy) / 2
-      ),
+      translatedPoints,
       sourceBox,
       targetBox,
-      edge.sourceAnchor,
-      edge.targetAnchor
+      anchors.sourceAnchor,
+      anchors.targetAnchor
     );
   } else {
+    const sourceAnchor = inferEdgeAnchorFromPoint(sourceBox, getBoxCenter(targetBox));
+    const targetAnchor = inferEdgeAnchorFromPoint(targetBox, getBoxCenter(sourceBox));
     points = rerouteOrthogonalEdge(
       edge.originalPoints,
       sourceBox,
       targetBox,
-      edge.sourceAnchor,
-      edge.targetAnchor
+      sourceAnchor,
+      targetAnchor
     );
   }
 
-  return points.length >= 2 ? points : null;
+  return points.length >= 2
+    ? { index, edge, points, sourceBox, targetBox, obstacles }
+    : null;
 }
 
 /**
@@ -156,6 +418,7 @@ export class EdgeDrawingManager {
   private _lastVisibleNodes: Set<string> = new Set();
   private _lastGetRef: ((nodeId: string) => NodeDisplayRef | null) | null = null;
   private _hoveredNodeId: string | null = null;
+  private resolvedPointsByEdgeIndex = new Map<number, Point[]>();
 
   /**
    * Build edge data from a layout result and populate the node-to-edge index.
@@ -181,6 +444,7 @@ export class EdgeDrawingManager {
         originalPoints: e.points.map((p) => ({ x: p.x, y: p.y })),
         sourceAnchor: e.sourceAnchor,
         targetAnchor: e.targetAnchor,
+        count: 1,
       };
     });
   }
@@ -203,14 +467,14 @@ export class EdgeDrawingManager {
     this._lastGetRef = getNodeDisplayRef;
     this._hoveredNodeId = hoveredNodeId;
 
-    if (this.edgeData.length === 0) return;
-
     // Destroy old layers
     this.destroyBaseLayer();
     this.destroyHighlightLayer();
+    this.resolvedPointsByEdgeIndex.clear();
 
-    const gfx = new Graphics();
-    const lodOpacityMultiplier = getLODEdgeOpacity(currentLOD);
+    if (this.edgeData.length === 0) return;
+
+    const resolvedDraws: ResolvedEdgeDraw[] = [];
 
     for (const [idx, edge] of this.edgeData.entries()) {
       // Skip edges where either endpoint is not visible
@@ -223,13 +487,40 @@ export class EdgeDrawingManager {
         continue;
       }
 
-      const points = resolveEdgePoints(edge, getNodeDisplayRef);
-      if (!points) continue;
+      const draw = resolveEdgeDraw(idx, edge, currentVisibleNodes, getNodeDisplayRef);
+      if (!draw) continue;
+
+      resolvedDraws.push(draw);
+    }
+
+    spreadEndpointLanes(resolvedDraws, true);
+    spreadEndpointLanes(resolvedDraws, false);
+    const routedPolylines: Point[][] = [];
+    for (const draw of resolvedDraws) {
+      draw.points = routePolylineAroundObstacles(
+        draw.points,
+        draw.obstacles,
+        routedPolylines
+      );
+      routedPolylines.push(draw.points);
+    }
+
+    const gfx = new Graphics();
+    const lodOpacityMultiplier = getLODEdgeOpacity(currentLOD);
+
+    for (const draw of resolvedDraws) {
+      const { edge, points } = draw;
+      this.resolvedPointsByEdgeIndex.set(
+        draw.index,
+        points.map((point) => ({ ...point }))
+      );
 
       const style = edge.kind ? EDGE_STYLES[edge.kind] : DEFAULT_EDGE_STYLE;
       const color = parseInt(edge.color.replace("#", ""), 16);
       const alpha = style.baseAlpha * lodOpacityMultiplier;
-      const width = style.width * getLODEdgeWidthMultiplier(currentLOD);
+      // Scale width by edge count (log scale so bundled edges are visually thicker)
+      const countScale = edge.count > 1 ? 1 + Math.log2(edge.count) * 0.4 : 1;
+      const width = style.width * getLODEdgeWidthMultiplier(currentLOD) * countScale;
 
       // Skip edges that are too faint
       if (alpha < 0.05) continue;
@@ -302,7 +593,8 @@ export class EdgeDrawingManager {
         continue;
       }
 
-      const points = resolveEdgePoints(edge, getRef);
+      const points = this.resolvedPointsByEdgeIndex.get(idx) ??
+        resolveEdgeDraw(idx, edge, visibleNodes, getRef)?.points;
       if (!points) continue;
 
       const style = edge.kind ? EDGE_STYLES[edge.kind] : DEFAULT_EDGE_STYLE;

@@ -14,6 +14,23 @@ export function buildParentMap(graph: CodeGraph): Map<string, string> {
   return parentMap;
 }
 
+export function isAncestorOf(
+  maybeAncestor: string,
+  nodeId: string,
+  parentMap: Map<string, string>
+): boolean {
+  let current = parentMap.get(nodeId);
+
+  while (current) {
+    if (current === maybeAncestor) {
+      return true;
+    }
+    current = parentMap.get(current);
+  }
+
+  return false;
+}
+
 /**
  * Get the minimum size for a node based on its type.
  * Shared by elkLayout and PixiRenderer.
@@ -21,11 +38,11 @@ export function buildParentMap(graph: CodeGraph): Map<string, string> {
 export function getNodeSize(node: CodeNode): { width: number; height: number } {
   switch (node.type) {
     case "Directory":
-      return { width: 200, height: 60 };
+      return { width: 220, height: 70 };
     case "File":
-      return { width: 180, height: 40 };
+      return { width: 180, height: 44 };
     case "CodeBlock":
-      return { width: 160, height: 32 };
+      return { width: 150, height: 28 };
   }
 }
 
