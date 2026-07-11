@@ -34,103 +34,90 @@ impl LanguageSupport for PythonSupport {
         }
     }
 
-    fn collect_references(
+    fn collect_node_references(
         &self,
         source: &str,
-        root: &Node,
+        node: &Node,
         from_id: &NodeId,
         refs: &mut Vec<RawReference>,
     ) {
-        let mut stack = vec![*root];
-
-        while let Some(current) = stack.pop() {
-            let kind = current.kind();
-
-            match kind {
-                "import_statement" | "import_from_statement" => {
-                    if let Some(module) = current
-                        .child_by_field_name("module_name")
-                        .or_else(|| current.child_by_field_name("name"))
-                    {
-                        if let Ok(text) = module.utf8_text(source.as_bytes()) {
+        let current = *node;
+        match current.kind() {
+            "import_statement" | "import_from_statement" => {
+                if let Some(module) = current
+                    .child_by_field_name("module_name")
+                    .or_else(|| current.child_by_field_name("name"))
+                {
+                    if let Ok(text) = module.utf8_text(source.as_bytes()) {
+                        refs.push(RawReference {
+                            from_node: from_id.clone(),
+                            kind: RawRefKind::Import {
+                                module_path: text.to_string(),
+                            },
+                            name: text.to_string(),
+                            span: Extractor::node_span(&current),
+                        });
+                    }
+                }
+            }
+            "call" => {
+                if let Some(func) = current.child_by_field_name("function") {
+                    if func.kind() == "attribute" {
+                        let name = Extractor::extract_function_name(&func, source);
+                        if !name.is_empty() {
                             refs.push(RawReference {
                                 from_node: from_id.clone(),
-                                kind: RawRefKind::Import {
-                                    module_path: text.to_string(),
-                                },
-                                name: text.to_string(),
+                                kind: RawRefKind::MethodCall,
+                                name,
                                 span: Extractor::node_span(&current),
                             });
                         }
-                    }
-                }
-                "call" => {
-                    if let Some(func) = current.child_by_field_name("function") {
-                        if func.kind() == "attribute" {
-                            let name = Extractor::extract_function_name(&func, source);
-                            if !name.is_empty() {
-                                refs.push(RawReference {
-                                    from_node: from_id.clone(),
-                                    kind: RawRefKind::MethodCall,
-                                    name,
-                                    span: Extractor::node_span(&current),
-                                });
-                            }
-                        } else {
-                            let name = Extractor::extract_function_name(&func, source);
-                            if !name.is_empty() {
-                                refs.push(RawReference {
-                                    from_node: from_id.clone(),
-                                    kind: RawRefKind::FunctionCall,
-                                    name,
-                                    span: Extractor::node_span(&current),
-                                });
-                            }
-                        }
-                    }
-                }
-                "type" => {
-                    if let Ok(text) = current.utf8_text(source.as_bytes()) {
-                        let name = text.trim().to_string();
-                        if !name.is_empty() && !is_python_builtin_type(&name) {
+                    } else {
+                        let name = Extractor::extract_function_name(&func, source);
+                        if !name.is_empty() {
                             refs.push(RawReference {
                                 from_node: from_id.clone(),
-                                kind: RawRefKind::TypeReference,
+                                kind: RawRefKind::FunctionCall,
                                 name,
                                 span: Extractor::node_span(&current),
                             });
                         }
                     }
                 }
-                "argument_list" => {
-                    if let Some(parent) = current.parent() {
-                        if parent.kind() == "class_definition" {
-                            let mut cursor = current.walk();
-                            for child in current.children(&mut cursor) {
-                                if child.kind() == "identifier" {
-                                    if let Ok(text) = child.utf8_text(source.as_bytes()) {
-                                        refs.push(RawReference {
-                                            from_node: from_id.clone(),
-                                            kind: RawRefKind::Inheritance,
-                                            name: text.to_string(),
-                                            span: Extractor::node_span(&child),
-                                        });
-                                    }
+            }
+            "type" => {
+                if let Ok(text) = current.utf8_text(source.as_bytes()) {
+                    let name = text.trim().to_string();
+                    if !name.is_empty() && !is_python_builtin_type(&name) {
+                        refs.push(RawReference {
+                            from_node: from_id.clone(),
+                            kind: RawRefKind::TypeReference,
+                            name,
+                            span: Extractor::node_span(&current),
+                        });
+                    }
+                }
+            }
+            "argument_list" => {
+                if let Some(parent) = current.parent() {
+                    if parent.kind() == "class_definition" {
+                        let mut cursor = current.walk();
+                        for child in current.children(&mut cursor) {
+                            if child.kind() == "identifier" {
+                                if let Ok(text) = child.utf8_text(source.as_bytes()) {
+                                    refs.push(RawReference {
+                                        from_node: from_id.clone(),
+                                        kind: RawRefKind::Inheritance,
+                                        name: text.to_string(),
+                                        span: Extractor::node_span(&child),
+                                    });
                                 }
                             }
                         }
                     }
                 }
-                _ => {}
             }
-
-            // Push children onto stack
-            let child_count = current.child_count();
-            for i in 0..child_count {
-                if let Some(child) = current.child(i) {
-                    stack.push(child);
-                }
-            }
+            _ => {}
         }
     }
 

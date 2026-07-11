@@ -91,6 +91,49 @@ impl CodeGraph {
     }
 }
 
+/// A filtered subgraph for frontend rendering.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SubGraph {
+    pub nodes: Vec<CodeNode>,
+    pub edges: Vec<CodeEdge>,
+    pub aggregated_edges: Vec<AggregatedEdge>,
+}
+
+impl SubGraph {
+    /// Extract a subgraph with only the visible nodes and relevant edges.
+    pub fn from_graph(
+        graph: &CodeGraph,
+        visible_ids: &[NodeId],
+        enabled_edge_kinds: &HashSet<EdgeKind>,
+    ) -> Self {
+        let visible_set: HashSet<&NodeId> = visible_ids.iter().collect();
+
+        let nodes: Vec<CodeNode> = visible_ids
+            .iter()
+            .filter_map(|id| graph.nodes.get(id).cloned())
+            .collect();
+
+        let edges: Vec<CodeEdge> = graph
+            .edges
+            .iter()
+            .filter(|e| {
+                visible_set.contains(&e.source)
+                    && visible_set.contains(&e.target)
+                    && enabled_edge_kinds.contains(&e.kind)
+            })
+            .cloned()
+            .collect();
+
+        // TODO: compute aggregated edges for collapsed containers
+
+        SubGraph {
+            nodes,
+            edges,
+            aggregated_edges: Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -324,48 +367,5 @@ mod tests {
 
         // The final edge count must equal the number of unique (source, target, kind) combos
         assert_eq!(graph.edge_count(), unique_keys.len());
-    }
-}
-
-/// A filtered subgraph for frontend rendering.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SubGraph {
-    pub nodes: Vec<CodeNode>,
-    pub edges: Vec<CodeEdge>,
-    pub aggregated_edges: Vec<AggregatedEdge>,
-}
-
-impl SubGraph {
-    /// Extract a subgraph with only the visible nodes and relevant edges.
-    pub fn from_graph(
-        graph: &CodeGraph,
-        visible_ids: &[NodeId],
-        enabled_edge_kinds: &HashSet<EdgeKind>,
-    ) -> Self {
-        let visible_set: HashSet<&NodeId> = visible_ids.iter().collect();
-
-        let nodes: Vec<CodeNode> = visible_ids
-            .iter()
-            .filter_map(|id| graph.nodes.get(id).cloned())
-            .collect();
-
-        let edges: Vec<CodeEdge> = graph
-            .edges
-            .iter()
-            .filter(|e| {
-                visible_set.contains(&e.source)
-                    && visible_set.contains(&e.target)
-                    && enabled_edge_kinds.contains(&e.kind)
-            })
-            .cloned()
-            .collect();
-
-        // TODO: compute aggregated edges for collapsed containers
-
-        SubGraph {
-            nodes,
-            edges,
-            aggregated_edges: Vec::new(),
-        }
     }
 }

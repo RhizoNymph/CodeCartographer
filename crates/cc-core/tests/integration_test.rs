@@ -75,10 +75,18 @@ fn test_end_to_end_scan_parse_resolve() {
             Extractor::extract_file(path, &source, lang).expect("extraction should succeed");
 
         for code_node in nodes {
+            // Only top-level blocks (parented directly to the file) become file
+            // children; nested blocks are linked into their parent block by the
+            // extractor.
+            let is_top_level = matches!(
+                &code_node,
+                CodeNode::CodeBlock { parent, .. } if parent == file_id
+            );
             let child_id = code_node.id().clone();
-            // Add child reference to parent
-            if let Some(parent) = graph.nodes.get_mut(file_id) {
-                parent.children_mut().push(child_id);
+            if is_top_level {
+                if let Some(parent) = graph.nodes.get_mut(file_id) {
+                    parent.children_mut().push(child_id);
+                }
             }
             graph.add_node(code_node);
         }
