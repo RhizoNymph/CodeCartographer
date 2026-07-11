@@ -1,4 +1,5 @@
-import ELK, { type ElkNode, type ElkExtendedEdge } from "elkjs/lib/elk.bundled.js";
+import ELK, { type ElkNode, type ElkExtendedEdge } from "elkjs/lib/elk-api";
+import ElkWorker from "elkjs/lib/elk-worker.min.js?worker";
 import type { CodeGraph, CodeNode, CodeEdge, EdgeKind } from "../../api/types";
 import { EDGE_COLORS } from "../../api/types";
 import { useDebugStore } from "../../stores/debugStore";
@@ -11,7 +12,7 @@ import {
 } from "./edgeGeometry";
 import { buildParentMap, getNodeSize, isAncestorOf } from "../utils/graphUtils";
 
-const elk = new ELK();
+const elk = new ELK({ workerFactory: () => new ElkWorker() });
 
 /**
  * Find the visible ancestor of a node. If the node is in elkNodeIds, return itself.

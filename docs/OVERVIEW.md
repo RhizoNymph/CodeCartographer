@@ -31,7 +31,7 @@ Features Index:
         doc: docs/features/canvas-rendering.md
 
     graph-layout:
-        description: ELK-based hierarchical graph layout with edge routing, aggregated edges for collapsed containers, and fallback layout.
+        description: ELK-based hierarchical graph layout with edge routing, aggregated edges for collapsed containers, and fallback layout. ELK runs in a web worker (elk-api + elk-worker.min.js?worker) so layout does not block the UI thread.
         entry_points: [packages/app/src/canvas/layout/elkLayout.ts]
         depends_on: []
         doc: docs/features/graph-layout.md
