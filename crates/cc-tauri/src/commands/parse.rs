@@ -1,7 +1,9 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-use cc_core::model::{CodeGraph, CodeNode, EdgeKind, Language, NodeId, SubGraph};
+use cc_core::model::{
+    CodeGraph, CodeNode, EdgeKind, Language, NodeId, ParseResult, SubGraph,
+};
 use cc_core::parser::{Extractor, ParseEvent};
 use cc_core::resolver::{ImportResolver, SymbolTable};
 use rayon::prelude::*;
@@ -15,7 +17,7 @@ pub async fn parse_repo(
     path: String,
     on_event: Channel<ParseEvent>,
     state: tauri::State<'_, GraphState>,
-) -> Result<CodeGraph, String> {
+) -> Result<ParseResult, String> {
     let root = PathBuf::from(&path);
 
     // Take the graph from server-side state
@@ -142,7 +144,8 @@ pub async fn parse_repo(
     }
     tracing::info!("Graph now has {} edges after adding", graph.edges.len());
 
-    // Resolve references into edges via the precision ladder (uses import_map).
+    // Resolve references into edges via the precision ladder (uses import_map),
+    // so each edge carries a Resolution confidence.
     let edges = symbol_table.resolve_references(&all_refs, &import_map);
     tracing::info!(
         "Resolved {} refs into {} edges (symbols: {})",
@@ -163,16 +166,18 @@ pub async fn parse_repo(
         tracing::warn!(error = %e, "Failed to send parse event");
     }
 
-    // Store updated graph back in server-side state
+    // Build the edge-less response from the graph, then hand ownership of the
+    // graph to server-side state (no extra clone of the full graph).
+    let result = ParseResult::from_graph(&graph);
     {
         let mut guard = state
             .0
             .lock()
             .map_err(|e| format!("Lock poisoned: {}", e))?;
-        *guard = Some(graph.clone());
+        *guard = Some(graph);
     }
 
-    Ok(graph)
+    Ok(result)
 }
 
 /// Remove all parse-derived state from the graph so that re-parsing is
@@ -206,12 +211,13 @@ fn strip_parsed_state(graph: &mut CodeGraph) {
     graph.rebuild_adjacency();
 }
 
-// TODO: get_subgraph is registered as a Tauri command but not yet called from the
-// frontend. It will become useful once server-side graph state is implemented so the
-// frontend can request filtered subgraphs without sending the full graph over IPC.
+/// Compute the direct + aggregated edges for a render view from server-side
+/// graph state. `render_ids` are the node ids present in the frontend's ELK
+/// layout tree (visible nodes whose ancestors are all expanded); `edge_kinds`
+/// is the set of enabled edge-kind names.
 #[command]
 pub async fn get_subgraph(
-    visible_ids: Vec<String>,
+    render_ids: Vec<String>,
     edge_kinds: Vec<String>,
     state: tauri::State<'_, GraphState>,
 ) -> Result<SubGraph, String> {
@@ -223,7 +229,7 @@ pub async fn get_subgraph(
         .as_ref()
         .ok_or_else(|| "No graph in state. Run scan_repo first.".to_string())?;
 
-    let visible: Vec<NodeId> = visible_ids.into_iter().map(NodeId).collect();
+    let render: Vec<NodeId> = render_ids.into_iter().map(NodeId).collect();
     let kinds: HashSet<EdgeKind> = edge_kinds
         .into_iter()
         .map(|s| match s.as_str() {
@@ -238,7 +244,7 @@ pub async fn get_subgraph(
         })
         .collect::<Result<_, _>>()?;
 
-    Ok(SubGraph::from_graph(graph, &visible, &kinds))
+    Ok(SubGraph::from_graph(graph, &render, &kinds))
 }
 
 #[cfg(test)]

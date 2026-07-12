@@ -453,7 +453,7 @@ export class EdgeDrawingManager {
         originalPoints: e.points.map((p) => ({ x: p.x, y: p.y })),
         sourceAnchor: e.sourceAnchor,
         targetAnchor: e.targetAnchor,
-        count: 1,
+        count: e.count,
       };
     });
   }
