@@ -1,7 +1,20 @@
 import { create } from "zustand";
-import type { CodeGraph, CodeNode, EdgeKind, ParseEvent } from "../api/types";
+import type { CodeGraph, EdgeKind, ParseEvent, ParseResult } from "../api/types";
 import { saveFolderState, loadFolderState } from "./persistenceStore";
 import { useDebugStore } from "./debugStore";
+
+/**
+ * Convert the edge-less `ParseResult` IPC payload into the frontend `CodeGraph`,
+ * turning the plain connectivity record into a Map for fast lookup.
+ */
+function parseResultToGraph(result: ParseResult): CodeGraph {
+  return {
+    nodes: result.nodes,
+    root: result.root,
+    edgeCount: result.edge_count,
+    nodeEdgeKinds: new Map(Object.entries(result.node_edge_kinds)),
+  };
+}
 
 interface ParseProgress {
   totalFiles: number;
@@ -55,7 +68,7 @@ interface GraphState {
 
   // Actions
   setRepoPath: (path: string) => void;
-  setGraph: (graph: CodeGraph, restoreState?: boolean) => void;
+  setGraph: (result: ParseResult, restoreState?: boolean) => void;
   setIsParsing: (v: boolean) => void;
   handleParseEvent: (event: ParseEvent) => void;
   toggleExpanded: (nodeId: string) => void;
@@ -98,7 +111,8 @@ export const useGraphStore = create<GraphState>((set, get) => ({
 
   setRepoPath: (path) => set({ repoPath: path }),
 
-  setGraph: (graph, restoreState = true) => {
+  setGraph: (result, restoreState = true) => {
+    const graph = parseResultToGraph(result);
     const repoPath = get().repoPath;
     let expanded = new Set<string>();
     let visible = new Set<string>();
@@ -140,7 +154,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
 
       if (import.meta.env.DEV) {
         useDebugStore.getState().addLog(
-          `setGraph: nodes=${Object.keys(graph.nodes).length}, edges=${graph.edges.length}, expanded=${expanded.size}, visible=${visible.size}, restored=${restored}`
+          `setGraph: nodes=${Object.keys(graph.nodes).length}, edges=${graph.edgeCount}, expanded=${expanded.size}, visible=${visible.size}, restored=${restored}`
         );
       }
     }

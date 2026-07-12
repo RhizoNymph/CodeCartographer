@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 
-use cc_core::model::CodeGraph;
+use cc_core::model::ParseResult;
 use cc_core::repo::RepoScanner;
 use tauri::command;
 
@@ -10,7 +10,7 @@ use crate::GraphState;
 pub async fn scan_repo(
     path: String,
     state: tauri::State<'_, GraphState>,
-) -> Result<CodeGraph, String> {
+) -> Result<ParseResult, String> {
     let path = PathBuf::from(&path);
 
     if !path.exists() {
@@ -23,14 +23,16 @@ pub async fn scan_repo(
 
     let graph = RepoScanner::scan(&path).map_err(|e| e.to_string())?;
 
-    // Store graph in server-side state
+    // Build the edge-less response (scan produces no edges), then hand the graph
+    // to server-side state without an extra clone of the full graph.
+    let result = ParseResult::from_graph(&graph);
     {
         let mut guard = state
             .0
             .lock()
             .map_err(|e| format!("Lock poisoned: {}", e))?;
-        *guard = Some(graph.clone());
+        *guard = Some(graph);
     }
 
-    Ok(graph)
+    Ok(result)
 }

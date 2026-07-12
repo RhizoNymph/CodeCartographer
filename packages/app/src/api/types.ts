@@ -77,14 +77,37 @@ export interface AggregatedEdge {
   count: number;
 }
 
+/**
+ * The node graph held by the frontend. Edges live only in server-side state;
+ * per-view edges are fetched on demand via `get_subgraph`. `nodeEdgeKinds`
+ * records, for each node touched by an edge, the distinct edge kinds touching
+ * it, so connectivity filtering can run synchronously without edges.
+ */
 export interface CodeGraph {
   nodes: Record<string, CodeNode>;
-  edges: CodeEdge[];
   root: string;
+  /** Total edge count in the backing graph (for UI counts). */
+  edgeCount: number;
+  /** node id -> distinct edge kinds touching that node. */
+  nodeEdgeKinds: Map<string, EdgeKind[]>;
 }
 
+/**
+ * Raw edge-less parse response from the `parse_repo` command. Converted into a
+ * `CodeGraph` (with Map-based connectivity) by graphStore.
+ */
+export interface ParseResult {
+  nodes: Record<string, CodeNode>;
+  root: string;
+  edge_count: number;
+  node_edge_kinds: Record<string, EdgeKind[]>;
+}
+
+/**
+ * Per-view edges computed server-side by `get_subgraph`. The frontend already
+ * holds the node tree, so only edges are returned.
+ */
 export interface SubGraph {
-  nodes: CodeNode[];
   edges: CodeEdge[];
   aggregated_edges: AggregatedEdge[];
 }

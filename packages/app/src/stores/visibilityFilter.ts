@@ -44,6 +44,31 @@ function findNearestVisibleAncestor(
   return null;
 }
 
+/**
+ * Whether a node is an endpoint of at least one edge whose kind is enabled,
+ * using the connectivity map returned by the backend (`nodeEdgeKinds`).
+ */
+function nodeHasEnabledEdge(
+  graph: CodeGraph,
+  nodeId: string,
+  enabledEdgeKinds: Set<EdgeKind>
+): boolean {
+  const kinds = graph.nodeEdgeKinds.get(nodeId);
+  if (!kinds) return false;
+  for (const kind of kinds) {
+    if (enabledEdgeKinds.has(kind)) return true;
+  }
+  return false;
+}
+
+/**
+ * Compute the set of visible nodes that are connected through an enabled edge,
+ * plus their ancestors. Edges live server-side; connectivity is derived
+ * synchronously from the per-node `nodeEdgeKinds` map. A node is treated as
+ * connected if it -- or any descendant that collapses up into it -- is an
+ * endpoint of an enabled-kind edge. Its nearest visible ancestor and that
+ * ancestor's ancestors are retained.
+ */
 export function computeConnectedVisibleNodes(
   graph: CodeGraph,
   visibleNodes: Set<string>,
@@ -52,34 +77,19 @@ export function computeConnectedVisibleNodes(
   const parentByNodeId = buildParentMap(graph);
   const connected = new Set<string>();
 
-  for (const edge of graph.edges) {
-    if (
-      !enabledEdgeKinds.has(edge.kind) ||
-      !graph.nodes[edge.source] ||
-      !graph.nodes[edge.target]
-    ) {
-      continue;
-    }
+  for (const nodeId of graph.nodeEdgeKinds.keys()) {
+    if (!graph.nodes[nodeId]) continue;
+    if (!nodeHasEnabledEdge(graph, nodeId, enabledEdgeKinds)) continue;
 
-    const visibleSource = findNearestVisibleAncestor(
-      edge.source,
+    const visibleAncestor = findNearestVisibleAncestor(
+      nodeId,
       graph,
       visibleNodes,
       parentByNodeId
     );
-    const visibleTarget = findNearestVisibleAncestor(
-      edge.target,
-      graph,
-      visibleNodes,
-      parentByNodeId
-    );
+    if (!visibleAncestor) continue;
 
-    if (!visibleSource || !visibleTarget || visibleSource === visibleTarget) {
-      continue;
-    }
-
-    addNodeAndAncestors(visibleSource, graph, parentByNodeId, connected);
-    addNodeAndAncestors(visibleTarget, graph, parentByNodeId, connected);
+    addNodeAndAncestors(visibleAncestor, graph, parentByNodeId, connected);
   }
 
   return connected;

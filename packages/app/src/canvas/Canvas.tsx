@@ -65,11 +65,11 @@ export function Canvas() {
   useEffect(() => {
     const codeBlocks = graph ? Object.values(graph.nodes).filter(n => n.type === "CodeBlock").length : 0;
     const addLog = useDebugStore.getState().addLog;
-    addLog(`Canvas: edges=${graph?.edges.length ?? 0}, codeBlocks=${codeBlocks}, hasRenderer=${!!rendererRef.current}, layoutVersion=${layoutVersion}`);
+    addLog(`Canvas: edges=${graph?.edgeCount ?? 0}, codeBlocks=${codeBlocks}, hasRenderer=${!!rendererRef.current}, layoutVersion=${layoutVersion}`);
     console.log("Canvas layout effect triggered:", {
       hasRenderer: !!rendererRef.current,
       hasGraph: !!graph,
-      edges: graph?.edges.length ?? 0,
+      edges: graph?.edgeCount ?? 0,
       codeBlocks,
       layoutVersion,
     });

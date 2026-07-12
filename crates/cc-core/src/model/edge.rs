@@ -15,6 +15,19 @@ pub enum EdgeKind {
 }
 
 impl EdgeKind {
+    /// A stable numeric discriminant for deterministic ordering.
+    pub fn discriminant(&self) -> u8 {
+        match self {
+            EdgeKind::Import => 0,
+            EdgeKind::FunctionCall => 1,
+            EdgeKind::MethodCall => 2,
+            EdgeKind::TypeReference => 3,
+            EdgeKind::Inheritance => 4,
+            EdgeKind::TraitImpl => 5,
+            EdgeKind::VariableUsage => 6,
+        }
+    }
+
     pub fn color(&self) -> &str {
         match self {
             EdgeKind::Import => "#6366f1",        // indigo

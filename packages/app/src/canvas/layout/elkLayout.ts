@@ -1,6 +1,7 @@
 import ELK, { type ElkNode, type ElkExtendedEdge } from "elkjs/lib/elk.bundled.js";
-import type { CodeGraph, CodeNode, CodeEdge, EdgeKind } from "../../api/types";
+import type { CodeGraph, CodeNode, EdgeKind } from "../../api/types";
 import { EDGE_COLORS } from "../../api/types";
+import { getSubgraph } from "../../api/commands";
 import { useDebugStore } from "../../stores/debugStore";
 import {
   anchorEdgePolyline,
@@ -9,102 +10,34 @@ import {
   type EdgeAnchor,
   type Point,
 } from "./edgeGeometry";
-import { buildParentMap, getNodeSize, isAncestorOf } from "../utils/graphUtils";
+import { getNodeSize } from "../utils/graphUtils";
 
 const elk = new ELK();
 
-/**
- * Find the visible ancestor of a node. If the node is in elkNodeIds, return itself.
- * Otherwise, walk up the parent chain until we find a node in elkNodeIds.
- * Returns null if no visible ancestor found (shouldn't happen for valid graphs).
- */
-function findVisibleAncestor(
-  nodeId: string,
-  elkNodeIds: Set<string>,
-  parentMap: Map<string, string>
-): string | null {
-  let current = nodeId;
-  while (current) {
-    if (elkNodeIds.has(current)) {
-      return current;
-    }
-    const parent = parentMap.get(current);
-    if (!parent) {
-      return null;
-    }
-    current = parent;
-  }
-  return null;
-}
+/** Above this many rendered nodes, ELK edge routing is skipped for performance. */
+const EDGE_ROUTING_NODE_LIMIT = 1500;
+
+const ALL_EDGE_KINDS: EdgeKind[] = [
+  "Import",
+  "FunctionCall",
+  "MethodCall",
+  "TypeReference",
+  "Inheritance",
+  "TraitImpl",
+  "VariableUsage",
+];
 
 /**
- * Compute aggregated edges for collapsed containers.
- * When a container is collapsed, edges to/from its children should be
- * shown as a single edge to/from the container itself.
+ * A view edge with resolved display info, ready to feed to ELK and extractLayout.
+ * `kind` is null-safe: aggregated edges carry the kind of the first underlying
+ * edge; `weight`/`count` drive tooltip counts and edge-width scaling.
  */
-function computeAggregatedEdges(
-  graph: CodeGraph,
-  elkNodeIds: Set<string>,
-  parentMap: Map<string, string>,
-  enabledEdgeKinds?: Set<EdgeKind>
-): Array<{ source: string; target: string; color: string; kind: EdgeKind | null }> {
-  // Use a Map to deduplicate edges by source-target pair
-  // Key: "source->target", Value: { color, kind } (we pick one, could aggregate later)
-  const aggregatedMap = new Map<string, { color: string; kind: EdgeKind }>();
-
-  // Filter edges by enabled kinds
-  const filteredEdges = enabledEdgeKinds
-    ? graph.edges.filter((e) => enabledEdgeKinds.has(e.kind))
-    : graph.edges;
-
-  for (const edge of filteredEdges) {
-    const sourceInTree = elkNodeIds.has(edge.source);
-    const targetInTree = elkNodeIds.has(edge.target);
-
-    // Skip edges that are already fully in the tree - they're handled normally
-    if (sourceInTree && targetInTree) {
-      continue;
-    }
-
-    // Find visible ancestors for both endpoints
-    const visibleSource = findVisibleAncestor(edge.source, elkNodeIds, parentMap);
-    const visibleTarget = findVisibleAncestor(edge.target, elkNodeIds, parentMap);
-
-    // Skip if we can't find visible ancestors (both hidden or disconnected)
-    if (!visibleSource || !visibleTarget) {
-      continue;
-    }
-
-    // Skip self-loops (both endpoints resolve to same collapsed container)
-    if (visibleSource === visibleTarget) {
-      continue;
-    }
-
-    // If collapsing one endpoint resolves it to a visible container that already
-    // contains the other endpoint, drawing child -> parent creates misleading
-    // arrows into the node's own container. Hide those collapsed internal edges.
-    if (
-      isAncestorOf(visibleSource, visibleTarget, parentMap) ||
-      isAncestorOf(visibleTarget, visibleSource, parentMap)
-    ) {
-      continue;
-    }
-
-    // Create aggregated edge key and store
-    const key = `${visibleSource}->${visibleTarget}`;
-    if (!aggregatedMap.has(key)) {
-      aggregatedMap.set(key, { color: EDGE_COLORS[edge.kind] || "#64748b", kind: edge.kind });
-    }
-  }
-
-  // Convert to array
-  const result: Array<{ source: string; target: string; color: string; kind: EdgeKind | null }> = [];
-  for (const [key, { color, kind }] of aggregatedMap) {
-    const [source, target] = key.split("->");
-    result.push({ source, target, color, kind });
-  }
-
-  return result;
+interface ViewEdge {
+  source: string;
+  target: string;
+  color: string;
+  kind: EdgeKind | null;
+  count: number;
 }
 
 export interface LayoutNodePosition {
@@ -118,7 +51,9 @@ export interface LayoutEdge {
   source: string;
   target: string;
   color: string;
-  kind: EdgeKind | null; // null for aggregated edges
+  kind: EdgeKind | null; // null when the underlying kind is unknown
+  /** Number of underlying edges (1 for direct, N for aggregated). Drives tooltip count + width. */
+  count: number;
   points: Point[];
   sourceAnchor: EdgeAnchor;
   targetAnchor: EdgeAnchor;
@@ -211,7 +146,8 @@ export async function layoutGraph(
     }
   }
 
-  // Collect all node IDs that are actually in the ELK tree
+  // Collect all node IDs that are actually in the ELK tree (visible nodes whose
+  // ancestors are all expanded). This is the render set sent to the backend.
   const elkNodeIds = new Set<string>();
   function collectElkNodeIds(nodes: ElkNode[]) {
     for (const n of nodes) {
@@ -221,47 +157,66 @@ export async function layoutGraph(
   }
   collectElkNodeIds(children);
 
-  // Build parent map for finding visible ancestors
-  const parentMap = buildParentMap(graph);
+  // Fetch per-view edges (direct + aggregated) from server-side graph state.
+  const renderIds = Array.from(elkNodeIds);
+  const enabledKinds = enabledEdgeKinds
+    ? Array.from(enabledEdgeKinds)
+    : ALL_EDGE_KINDS;
 
-  // Filter edges by enabled edge kinds first
-  const kindFilteredEdges = enabledEdgeKinds
-    ? graph.edges.filter((e) => enabledEdgeKinds.has(e.kind))
-    : graph.edges;
+  let viewEdges: ViewEdge[] = [];
+  try {
+    const sub = await getSubgraph(renderIds, enabledKinds);
+    for (const e of sub.edges) {
+      viewEdges.push({
+        source: e.source,
+        target: e.target,
+        color: EDGE_COLORS[e.kind] || "#64748b",
+        kind: e.kind,
+        count: e.weight,
+      });
+    }
+    for (const ae of sub.aggregated_edges) {
+      viewEdges.push({
+        source: ae.source,
+        target: ae.target,
+        color: EDGE_COLORS[ae.kind] || "#64748b",
+        kind: ae.kind,
+        count: ae.count,
+      });
+    }
+  } catch (err) {
+    console.error("getSubgraph failed:", err);
+    if (import.meta.env.DEV) {
+      useDebugStore.getState().addLog(`getSubgraph FAILED: ${err}`);
+    }
+    viewEdges = [];
+  }
 
-  // Build edges - only include edges where both endpoints are in the ELK tree
-  const edgesInTree = kindFilteredEdges.filter(
-    (e) => elkNodeIds.has(e.source) && elkNodeIds.has(e.target)
-  );
-  const edgesNotInTree = kindFilteredEdges.filter(
-    (e) => !elkNodeIds.has(e.source) || !elkNodeIds.has(e.target)
-  );
-
-  // Compute aggregated edges for collapsed containers
-  const aggregatedEdges = computeAggregatedEdges(graph, elkNodeIds, parentMap, enabledEdgeKinds);
-
-  if (import.meta.env.DEV) {
+  // Layout guard: for very large views, skip ELK orthogonal edge routing and let
+  // extractLayout produce straight-line fallback edges. Routing thousands of
+  // edges is prohibitively slow.
+  const skipEdgeRouting = elkNodeIds.size > EDGE_ROUTING_NODE_LIMIT;
+  if (skipEdgeRouting && import.meta.env.DEV) {
     useDebugStore.getState().addLog(
-      `Edge filtering: total=${graph.edges.length}, inTree=${edgesInTree.length}, missing=${edgesNotInTree.length}, aggregated=${aggregatedEdges.length}`
+      `Large view (${elkNodeIds.size} nodes > ${EDGE_ROUTING_NODE_LIMIT}): skipping edge routing. ` +
+        `Consider Module view or collapsing containers for cleaner routing.`
     );
   }
 
-  // Create ELK edges from direct edges
-  const elkEdges: ElkExtendedEdge[] = edgesInTree.map((e, i) => ({
-    id: `edge-${i}`,
-    sources: [e.source],
-    targets: [e.target],
-  }));
-
-  // Add aggregated edges for collapsed containers
-  for (let i = 0; i < aggregatedEdges.length; i++) {
-    const ae = aggregatedEdges[i];
-    elkEdges.push({
-      id: `agg-edge-${i}`,
-      sources: [ae.source],
-      targets: [ae.target],
-    });
+  if (import.meta.env.DEV) {
+    useDebugStore.getState().addLog(
+      `View edges: total=${viewEdges.length}, elkNodes=${elkNodeIds.size}, routing=${!skipEdgeRouting}`
+    );
   }
+
+  // Build ELK edge inputs (omitted entirely when skipping routing).
+  const elkEdges: ElkExtendedEdge[] = skipEdgeRouting
+    ? []
+    : viewEdges.map((e, i) => ({
+        id: `edge-${i}`,
+        sources: [e.source],
+        targets: [e.target],
+      }));
 
   const elkGraph: ElkNode = {
     id: "root",
@@ -280,17 +235,11 @@ export async function layoutGraph(
     },
   };
 
-  if (import.meta.env.DEV) {
-    const codeBlocksInGraph = Object.values(graph.nodes).filter(n => n.type === "CodeBlock").length;
-    useDebugStore.getState().addLog(
-      `ELK: codeBlocks=${codeBlocksInGraph}, edges=${graph.edges.length}, aggregated=${aggregatedEdges.length}, elkNodes=${elkNodeIds.size}`
-    );
-  }
-
-  // Build aggregated edge info map for extractLayout
-  const aggregatedEdgeInfo = new Map<string, { color: string; kind: EdgeKind | null }>();
-  for (const ae of aggregatedEdges) {
-    aggregatedEdgeInfo.set(`${ae.source}->${ae.target}`, { color: ae.color, kind: ae.kind });
+  // Index view edges by source->target for lookup during extraction.
+  const viewEdgeInfo = new Map<string, ViewEdge>();
+  for (const ve of viewEdges) {
+    const key = `${ve.source}->${ve.target}`;
+    if (!viewEdgeInfo.has(key)) viewEdgeInfo.set(key, ve);
   }
 
   try {
@@ -301,7 +250,7 @@ export async function layoutGraph(
     if (import.meta.env.DEV) {
       useDebugStore.getState().addLog(`ELK layout done, extracting...`);
     }
-    const result = extractLayout(laidOut, graph, aggregatedEdgeInfo);
+    const result = extractLayout(laidOut, viewEdges, viewEdgeInfo);
     if (import.meta.env.DEV) {
       useDebugStore.getState().addLog(`ELK extracted ${result.edges.length} edges`);
 
@@ -311,14 +260,14 @@ export async function layoutGraph(
       const expandedFiles = Array.from(expandedNodes).filter(id => graph.nodes[id]?.type === "File").length;
       useDebugStore.getState().setLayoutInfo({
         elkNodeIds: elkNodeIds.size,
-        edgesInTree: edgesInTree.length,
-        edgesNotInTree: edgesNotInTree.length,
-        aggregatedEdges: aggregatedEdges.length,
+        edgesInTree: viewEdges.length,
+        edgesNotInTree: 0,
+        aggregatedEdges: viewEdges.filter((e) => e.count > 1).length,
         elkEdgesInput: elkEdges.length,
         elkEdgesOutput: result.edges.length,
         edgesWithSections: result.edges.length, // approximate
         edgesWithoutSections: elkEdges.length - result.edges.length,
-        sampleGraphEdge: JSON.stringify(graph.edges[0]),
+        sampleGraphEdge: JSON.stringify(viewEdges[0]),
         sampleElkNodeId: Array.from(elkNodeIds)[0] ?? "none",
         codeBlocksInGraph,
         filesWithChildren,
@@ -338,16 +287,10 @@ export async function layoutGraph(
 
 function extractLayout(
   elkNode: ElkNode,
-  graph: CodeGraph,
-  aggregatedEdgeInfo: Map<string, { color: string; kind: EdgeKind | null }>
+  viewEdges: ViewEdge[],
+  viewEdgeInfo: Map<string, ViewEdge>
 ): LayoutResult {
   const result: LayoutResult = { nodes: {}, edges: [] };
-
-  const edgeLookup = new Map<string, CodeEdge>();
-  for (const e of graph.edges) {
-    const key = `${e.source}->${e.target}`;
-    if (!edgeLookup.has(key)) edgeLookup.set(key, e);
-  }
 
   let edgesWithSections = 0;
   let edgesWithoutSections = 0;
@@ -378,22 +321,10 @@ function extractLayout(
         const sourceId = edge.sources[0];
         const targetId = edge.targets[0];
 
-        // Check if this is an aggregated edge first, then fall back to graph edges
-        const aggKey = `${sourceId}->${targetId}`;
-        const aggInfo = aggregatedEdgeInfo.get(aggKey);
-
-        let color: string;
-        let kind: EdgeKind | null;
-        if (aggInfo) {
-          color = aggInfo.color;
-          kind = aggInfo.kind;
-        } else {
-          const graphEdge = edgeLookup.get(`${sourceId}->${targetId}`);
-          color = graphEdge
-            ? EDGE_COLORS[graphEdge.kind]
-            : "#64748b";
-          kind = graphEdge?.kind ?? null;
-        }
+        const info = viewEdgeInfo.get(`${sourceId}->${targetId}`);
+        const color = info?.color ?? "#64748b";
+        const kind = info?.kind ?? null;
+        const count = info?.count ?? 1;
 
         const points: Point[] = [];
         if (edge.sections) {
@@ -458,6 +389,7 @@ function extractLayout(
             target: targetId,
             color,
             kind,
+            count,
             points: anchorEdgePolyline(
               normalizedPoints,
               sourcePos,
@@ -481,10 +413,11 @@ function extractLayout(
     );
   }
 
-  // If ELK didn't provide edges, generate straight-line fallback edges from graph data
-  if (result.edges.length === 0 && graph.edges.length > 0) {
+  // If ELK didn't route edges (either it produced none, or routing was skipped
+  // for a large view), generate straight-line fallback edges from the view edges.
+  if (result.edges.length === 0 && viewEdges.length > 0) {
     if (import.meta.env.DEV) {
-      useDebugStore.getState().addLog("ELK provided no routed edges, generating fallback edges from graph");
+      useDebugStore.getState().addLog("ELK provided no routed edges, generating straight-line fallback edges");
     }
 
     // Helper to create fallback edge
@@ -492,7 +425,8 @@ function extractLayout(
       source: string,
       target: string,
       color: string,
-      kind: EdgeKind | null
+      kind: EdgeKind | null,
+      count: number
     ): LayoutEdge | null => {
       const sourcePos = result.nodes[source];
       const targetPos = result.nodes[target];
@@ -537,6 +471,7 @@ function extractLayout(
         target,
         color,
         kind,
+        count,
         points: anchorEdgePolyline(
           [startPoint, endPoint],
           sourcePos,
@@ -549,23 +484,16 @@ function extractLayout(
       };
     };
 
-    // Generate fallback for direct edges (where both endpoints are visible)
-    for (const edge of graph.edges) {
+    // Generate straight-line fallback for every view edge whose endpoints are
+    // present in the layout.
+    for (const ve of viewEdges) {
       const fallbackEdge = createFallbackEdge(
-        edge.source,
-        edge.target,
-        EDGE_COLORS[edge.kind] || "#64748b",
-        edge.kind
+        ve.source,
+        ve.target,
+        ve.color,
+        ve.kind,
+        ve.count
       );
-      if (fallbackEdge) {
-        result.edges.push(fallbackEdge);
-      }
-    }
-
-    // Generate fallback for aggregated edges
-    for (const [key, info] of aggregatedEdgeInfo) {
-      const [source, target] = key.split("->");
-      const fallbackEdge = createFallbackEdge(source, target, info.color, info.kind);
       if (fallbackEdge) {
         result.edges.push(fallbackEdge);
       }

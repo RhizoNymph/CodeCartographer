@@ -14,22 +14,17 @@ const allEdgeKinds = new Set<EdgeKind>([
   "VariableUsage",
 ]);
 
+// Connectivity derived from the (server-side) edges:
+//   fn1 -> fn2  (FunctionCall)
+//   orphanFn -> fn1  (Import)
 const graph: CodeGraph = {
   root: "root",
-  edges: [
-    {
-      source: "fn1",
-      target: "fn2",
-      kind: "FunctionCall",
-      weight: 1,
-    },
-    {
-      source: "orphanFn",
-      target: "fn1",
-      kind: "Import",
-      weight: 1,
-    },
-  ],
+  edgeCount: 2,
+  nodeEdgeKinds: new Map<string, EdgeKind[]>([
+    ["fn1", ["FunctionCall", "Import"]],
+    ["fn2", ["FunctionCall"]],
+    ["orphanFn", ["Import"]],
+  ]),
   nodes: {
     root: {
       type: "Directory",
