@@ -232,25 +232,6 @@ impl Extractor {
         text.to_string()
     }
 
-    /// Extract imported name from a use declaration.
-    pub(crate) fn extract_use_name(node: &tree_sitter::Node, source: &str) -> Option<String> {
-        fn find_last_ident(n: &tree_sitter::Node, src: &str) -> Option<String> {
-            if n.kind() == "identifier" {
-                return n.utf8_text(src.as_bytes()).ok().map(|s| s.to_string());
-            }
-            let mut last = None;
-            let child_count = n.child_count();
-            for i in 0..child_count {
-                if let Some(child) = n.child(i) {
-                    if let Some(name) = find_last_ident(&child, src) {
-                        last = Some(name);
-                    }
-                }
-            }
-            last
-        }
-        find_last_ident(node, source)
-    }
 }
 
 #[cfg(test)]
@@ -838,6 +819,56 @@ mod tests {
         } else {
             panic!("expected CodeBlock");
         }
+    }
+
+    #[test]
+    fn test_rust_use_full_paths_and_lists() {
+        // Full module paths are preserved so the import resolver can map them
+        // to files; the ref name is the last path segment.
+        let source = "use crate::model::CodeGraph;";
+        let (_, refs) = extract(source, &Language::Rust);
+        let imports: Vec<_> = refs
+            .iter()
+            .filter_map(|r| match &r.kind {
+                RawRefKind::Import { module_path } => Some((module_path.as_str(), r.name.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(imports, vec![("crate::model::CodeGraph", "CodeGraph")]);
+
+        // Use lists expand into one ref per leaf, aliases resolve to the
+        // original path, and `self` maps to the module itself.
+        let source_list = "use crate::model::{graph, edge as E};\nuse super::util::{self, helpers};";
+        let (_, refs_list) = extract(source_list, &Language::Rust);
+        let mut paths: Vec<String> = refs_list
+            .iter()
+            .filter_map(|r| match &r.kind {
+                RawRefKind::Import { module_path } => Some(module_path.clone()),
+                _ => None,
+            })
+            .collect();
+        paths.sort();
+        assert_eq!(
+            paths,
+            vec![
+                "crate::model::edge",
+                "crate::model::graph",
+                "super::util",
+                "super::util::helpers",
+            ]
+        );
+
+        // Wildcards import the module itself.
+        let source_glob = "use crate::model::*;";
+        let (_, refs_glob) = extract(source_glob, &Language::Rust);
+        let glob_paths: Vec<_> = refs_glob
+            .iter()
+            .filter_map(|r| match &r.kind {
+                RawRefKind::Import { module_path } => Some(module_path.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(glob_paths, vec!["crate::model"]);
     }
 
     #[test]

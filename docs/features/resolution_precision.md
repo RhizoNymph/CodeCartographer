@@ -8,6 +8,7 @@
 - Capping ambiguous fan-out: 2..=5 candidate names produce one flagged edge each; more than 5 are dropped entirely.
 - Producing an import map (source file -> imported files) from the import resolver and feeding it to the symbol resolver as the "imported" tier.
 - Python leading-dot relative import resolution (`.foo`, `..pkg.mod`, `from . import x` / `.`), including package `__init__.py` targets.
+- Rust use-path resolution (`crate::`, `super::`, `self::`): paths name modules and items rather than files, so the resolver probes progressively shorter prefixes against the source file's crate `src` root (workspace-aware) until a file (`.rs` / `mod.rs`, falling back to `lib.rs`/`main.rs`) matches. External-crate paths (`std::`, dependencies) do not resolve.
 - Merging duplicate edges keeps the highest-confidence resolution.
 - Frontend: dashed/dimmed rendering of ambiguous edges and a toolbar toggle to hide them.
 

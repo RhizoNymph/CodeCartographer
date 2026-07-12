@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::model::{CodeEdge, CodeGraph, CodeNode, EdgeKind, Language, NodeId, Resolution};
 use crate::parser::{RawRefKind, RawReference};
@@ -151,15 +151,9 @@ impl ImportResolver {
             return probe_path(&as_path, Language::Python, path_map);
         }
 
-        // Handle Rust crate-level imports (crate::foo::bar)
-        if module_path.starts_with("crate::") {
-            let parts: Vec<&str> = module_path
-                .strip_prefix("crate::")
-                .unwrap()
-                .split("::")
-                .collect();
-            let as_path = format!("src/{}", parts.join("/"));
-            return probe_path(&as_path, Language::Rust, path_map);
+        // Handle Rust use paths (crate::foo::Bar, super::sibling, self::sub).
+        if module_path.contains("::") {
+            return Self::resolve_rust_use_path(module_path, from_file, path_map);
         }
 
         // Bare module name lookup
@@ -168,6 +162,103 @@ impl ImportResolver {
         }
 
         None
+    }
+
+    /// Resolve a Rust use path (`crate::a::b::Item`, `super::sibling::Item`,
+    /// `self::sub::Item`) to a file in the repo.
+    ///
+    /// Rust paths name modules and items, not files, so resolution probes
+    /// progressively shorter prefixes: `crate::model::graph::CodeGraph` first
+    /// tries `<src>/model/graph/CodeGraph` (`.rs`, `/mod.rs`), then
+    /// `<src>/model/graph.rs` (the file defining `CodeGraph`), then
+    /// `<src>/model.rs` / `<src>/model/mod.rs`. Paths rooted in external crates
+    /// (`std::...`, dependency crates) do not resolve to repo files.
+    fn resolve_rust_use_path(
+        module_path: &str,
+        from_file: &str,
+        path_map: &HashMap<String, NodeId>,
+    ) -> Option<NodeId> {
+        let mut segments: Vec<&str> = module_path.split("::").collect();
+        if segments.is_empty() {
+            return None;
+        }
+
+        // Determine the base directory the remaining segments resolve against.
+        let base: PathBuf = match segments[0] {
+            "crate" => {
+                segments.remove(0);
+                Self::crate_src_root(from_file)
+            }
+            "self" => {
+                segments.remove(0);
+                Self::module_dir(from_file)
+            }
+            "super" => {
+                let mut dir = Self::module_dir(from_file);
+                while segments.first() == Some(&"super") {
+                    segments.remove(0);
+                    dir = dir.parent().map(Path::to_path_buf).unwrap_or_default();
+                }
+                dir
+            }
+            // External crate (std, serde, workspace sibling) -- not resolvable
+            // to a file within this repo scan.
+            _ => return None,
+        };
+
+        let base_str = base.to_string_lossy().to_string();
+        let join_base = |suffix: &str| {
+            if base_str.is_empty() {
+                suffix.to_string()
+            } else {
+                format!("{}/{}", base_str, suffix)
+            }
+        };
+
+        // Probe progressively shorter prefixes: the path may name an item
+        // (function/type) inside a module file rather than the file itself.
+        for take in (1..=segments.len()).rev() {
+            let candidate = join_base(&segments[..take].join("/"));
+            if let Some(id) = probe_path(&candidate, Language::Rust, path_map) {
+                return Some(id);
+            }
+        }
+
+        // All segments consumed (e.g. `use crate::Item;` or bare `super::Item`
+        // fully probed): the target is the crate root file or the base module.
+        for root in ["lib", "main"] {
+            if let Some(id) = probe_path(&join_base(root), Language::Rust, path_map) {
+                return Some(id);
+            }
+        }
+        probe_path(&base_str, Language::Rust, path_map)
+    }
+
+    /// The directory a Rust file's module owns: `src/model/mod.rs` (and
+    /// `lib.rs`/`main.rs`) own their containing directory, while a file module
+    /// like `src/model/graph.rs` owns the virtual directory `src/model/graph`
+    /// (so `super::` from it means `src/model`).
+    fn module_dir(from_file: &str) -> PathBuf {
+        let path = Path::new(from_file);
+        let parent = path.parent().unwrap_or(Path::new("")).to_path_buf();
+        match path.file_stem().and_then(|s| s.to_str()) {
+            Some("mod") | Some("lib") | Some("main") => parent,
+            Some(stem) => parent.join(stem),
+            None => parent,
+        }
+    }
+
+    /// The crate `src` root for a file: everything up to and including the last
+    /// `src` path component (`crates/cc-core/src/model/graph.rs` ->
+    /// `crates/cc-core/src`), supporting multi-crate workspaces. Falls back to
+    /// `src` when the file is not under a `src` directory.
+    fn crate_src_root(from_file: &str) -> PathBuf {
+        let path = Path::new(from_file);
+        let components: Vec<&std::ffi::OsStr> = path.iter().collect();
+        match components.iter().rposition(|c| *c == "src") {
+            Some(idx) => components[..=idx].iter().collect(),
+            None => PathBuf::from("src"),
+        }
     }
 
     /// Resolve a Python leading-dot relative import.
@@ -353,5 +444,92 @@ mod tests {
 
         assert_eq!(edges.len(), 1);
         assert_eq!(edges[0].target, NodeId::file("pkg/subpkg/__init__.py"));
+    }
+
+    fn rs_file(graph: &mut CodeGraph, path: &str) {
+        graph.add_node(CodeNode::File {
+            id: NodeId::file(path),
+            name: path.to_string(),
+            path: path.to_string(),
+            language: Some(Language::Rust),
+            children: Vec::new(),
+        });
+    }
+
+    #[test]
+    fn rust_crate_import_resolves_in_workspace_crate() {
+        // crates/core/src/lib.rs uses crate::model::graph::CodeGraph; the path
+        // names an item, so resolution must drop the trailing segment and land
+        // on the defining file. The crate root is derived from the source file
+        // (workspace layout), not assumed to be `src/`.
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        rs_file(&mut graph, "crates/core/src/lib.rs");
+        rs_file(&mut graph, "crates/core/src/model/graph.rs");
+
+        let refs = vec![import_ref(
+            "crates/core/src/lib.rs",
+            "crate::model::graph::CodeGraph",
+        )];
+        let (edges, map) = ImportResolver::resolve(&graph, &refs);
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, NodeId::file("crates/core/src/model/graph.rs"));
+        assert!(map["crates/core/src/lib.rs"].contains("crates/core/src/model/graph.rs"));
+    }
+
+    #[test]
+    fn rust_crate_import_resolves_to_mod_rs() {
+        // crate::model with model as a mod.rs directory module.
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        rs_file(&mut graph, "src/main.rs");
+        rs_file(&mut graph, "src/model/mod.rs");
+
+        let refs = vec![import_ref("src/main.rs", "crate::model::CodeGraph")];
+        let (edges, _map) = ImportResolver::resolve(&graph, &refs);
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, NodeId::file("src/model/mod.rs"));
+    }
+
+    #[test]
+    fn rust_super_import_from_file_module_resolves_to_sibling() {
+        // src/model/graph.rs (module model::graph) uses super::edge::CodeEdge
+        // -> src/model/edge.rs.
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        rs_file(&mut graph, "src/model/graph.rs");
+        rs_file(&mut graph, "src/model/edge.rs");
+
+        let refs = vec![import_ref("src/model/graph.rs", "super::edge::CodeEdge")];
+        let (edges, _map) = ImportResolver::resolve(&graph, &refs);
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, NodeId::file("src/model/edge.rs"));
+    }
+
+    #[test]
+    fn rust_crate_root_item_import_resolves_to_lib_rs() {
+        // `use crate::Item;` where Item lives in lib.rs.
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        rs_file(&mut graph, "src/lib.rs");
+        rs_file(&mut graph, "src/util.rs");
+
+        let refs = vec![import_ref("src/util.rs", "crate::Item")];
+        let (edges, _map) = ImportResolver::resolve(&graph, &refs);
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, NodeId::file("src/lib.rs"));
+    }
+
+    #[test]
+    fn rust_external_crate_import_does_not_resolve() {
+        // std / dependency crates cannot map to repo files.
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        rs_file(&mut graph, "src/lib.rs");
+
+        let refs = vec![import_ref("src/lib.rs", "std::collections::HashMap")];
+        let (edges, map) = ImportResolver::resolve(&graph, &refs);
+
+        assert!(edges.is_empty());
+        assert!(map.is_empty());
     }
 }

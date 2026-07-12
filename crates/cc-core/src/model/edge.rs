@@ -47,25 +47,20 @@ impl EdgeKind {
 /// confidence comparison: `Ambiguous < GlobalUnique < Imported < SameFile`.
 /// When two duplicate edges are merged (see `CodeGraph::add_edge`) the higher
 /// (more confident) resolution is kept.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Default, Serialize, Deserialize)]
 pub enum Resolution {
     /// The name matched several candidates and we could not disambiguate; the
     /// edge is one of up to 5 flagged guesses (rendered dashed/dimmed).
     Ambiguous,
-    /// Exactly one symbol with this name exists in the whole repo.
+    /// Exactly one symbol with this name exists in the whole repo. Also the
+    /// neutral default for edges constructed without an explicit resolution
+    /// (e.g. in tests/benches).
+    #[default]
     GlobalUnique,
     /// The target lives in a file the source file imports.
     Imported,
     /// The target is defined in the same file as the source.
     SameFile,
-}
-
-impl Default for Resolution {
-    fn default() -> Self {
-        // Neutral, non-ambiguous default for edges constructed without an
-        // explicit resolution (e.g. in tests/benches).
-        Resolution::GlobalUnique
-    }
 }
 
 /// An edge in the code graph.

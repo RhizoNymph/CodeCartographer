@@ -168,8 +168,9 @@ impl SubGraph {
     /// - Direct edges: both endpoints in `render_ids`, kind enabled.
     /// - Aggregated edges: for edges with at least one endpoint NOT in
     ///   `render_ids`, lift each endpoint to its nearest ancestor in the set;
-    ///   skip when unresolvable, when both lift to the same node (self-loop), or
-    ///   when one lifted endpoint is an ancestor of the other. Deduped by
+    ///   skip when unresolvable, when both lift to the same node (self-loop),
+    ///   when one lifted endpoint is an ancestor of the other, or when the
+    ///   lifted pair is already connected by a direct edge. Deduped by
     ///   (source, target) keeping the first kind seen; `count` accumulates the
     ///   number of underlying edges collapsed into each aggregated edge.
     pub fn from_graph(
@@ -184,6 +185,21 @@ impl SubGraph {
         // Preserve insertion order of aggregated edges for stable output.
         let mut agg_order: Vec<(NodeId, NodeId)> = Vec::new();
         let mut agg_map: HashMap<(NodeId, NodeId), AggregatedEdge> = HashMap::new();
+
+        // Pairs already connected by a direct edge. Aggregation must not
+        // duplicate them: e.g. a file->file Import edge plus a file->block
+        // Import edge whose block endpoint is hidden would otherwise render as
+        // two parallel edges between the same pair of nodes.
+        let direct_pairs: HashSet<(&NodeId, &NodeId)> = graph
+            .edges
+            .iter()
+            .filter(|e| {
+                enabled_edge_kinds.contains(&e.kind)
+                    && render_set.contains(&e.source)
+                    && render_set.contains(&e.target)
+            })
+            .map(|e| (&e.source, &e.target))
+            .collect();
 
         for edge in graph.edges.iter() {
             if !enabled_edge_kinds.contains(&edge.kind) {
@@ -221,6 +237,11 @@ impl SubGraph {
             if is_ancestor_of(lifted_source, lifted_target, &parent_map)
                 || is_ancestor_of(lifted_target, lifted_source, &parent_map)
             {
+                continue;
+            }
+
+            // Skip pairs already connected by a direct edge.
+            if direct_pairs.contains(&(lifted_source, lifted_target)) {
                 continue;
             }
 
@@ -804,6 +825,29 @@ mod tests {
         assert_eq!(sub.aggregated_edges.len(), 0);
         assert_eq!(sub.edges[0].source, NodeId("fnA1".into()));
         assert_eq!(sub.edges[0].target, NodeId("fnB1".into()));
+    }
+
+    #[test]
+    fn subgraph_aggregation_skips_pairs_with_direct_edge() {
+        // fileA imports fileB directly (file->file) AND has an Import edge to a
+        // block inside fileB (file->block). With fileB collapsed, the lifted
+        // file->block edge must NOT duplicate the direct file->file edge.
+        let mut g = sample_graph();
+        g.add_edge(edge("fileA", "fileB", EdgeKind::Import));
+        g.add_edge(edge("fileA", "fnB1", EdgeKind::Import));
+
+        let render: Vec<NodeId> = ["fileA", "fileB"]
+            .iter()
+            .map(|s| NodeId(s.to_string()))
+            .collect();
+        let sub = SubGraph::from_graph(&g, &render, &all_kinds());
+
+        assert_eq!(sub.edges.len(), 1, "one direct file->file edge");
+        assert_eq!(
+            sub.aggregated_edges.len(),
+            0,
+            "lifted file->block edge must not duplicate the direct pair"
+        );
     }
 
     #[test]

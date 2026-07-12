@@ -43,11 +43,11 @@ Defines the interface every language must implement:
 ### Language Implementations
 - `PythonSupport` (`parser/python.rs`) - Python functions, classes, imports, calls, type annotations, inheritance
 - `TypeScriptSupport` / `JavaScriptSupport` (`parser/typescript.rs`) - TS/JS functions, classes, interfaces, type aliases, enums, arrow functions, imports, calls, type refs, inheritance
-- `RustSupport` (`parser/rust_lang.rs`) - Rust functions, structs, enums, traits, impls, modules, constants, type aliases, use declarations, calls, type refs, trait impls. Includes improved visibility detection for `pub`, `pub(crate)`, and `pub(super)`.
+- `RustSupport` (`parser/rust_lang.rs`) - Rust functions, structs, enums, traits, impls, modules, constants, type aliases, use declarations, calls, type refs, trait impls. Includes improved visibility detection for `pub`, `pub(crate)`, and `pub(super)`. Use declarations expand to full module paths (`expand_use_paths`): use lists yield one Import ref per leaf, aliases resolve to the original path, `self` maps to the module, wildcards import the module itself.
 
 ### Shared Framework (`parser/extract.rs`)
 - `Extractor` struct with `extract_file()` public API (unchanged from original)
-- Helper functions: `child_text()`, `extract_signature()`, `node_span()`, `extract_function_name()`, `extract_use_name()` (all `pub(crate)`)
+- Helper functions: `child_text()`, `extract_signature()`, `node_span()`, `extract_function_name()` (all `pub(crate)`)
 - Data types: `RawReference`, `RawRefKind`, `ParseEvent`
 
 ### Extension Probing (`resolver/extension_probe.rs`)
