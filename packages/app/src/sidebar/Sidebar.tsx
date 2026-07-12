@@ -373,7 +373,7 @@ export function Sidebar() {
         }}
       >
         <span>{Object.keys(graph.nodes).length} nodes</span>
-        <span>{graph.edges.length} edges</span>
+        <span>{graph.edgeCount} edges</span>
       </div>
     </div>
   );

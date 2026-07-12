@@ -259,7 +259,7 @@ export class PixiRenderer {
     if (import.meta.env.DEV) {
       const codeBlocks = Object.values(graph.nodes).filter(n => n.type === "CodeBlock").length;
       useDebugStore.getState().addLog(
-        `updateGraph: nodes=${Object.keys(graph.nodes).length}, edges=${graph.edges.length}, codeBlocks=${codeBlocks}, expanded=${expandedNodes.size}, visible=${visibleNodes.size}`
+        `updateGraph: nodes=${Object.keys(graph.nodes).length}, edges=${graph.edgeCount}, codeBlocks=${codeBlocks}, expanded=${expandedNodes.size}, visible=${visibleNodes.size}`
       );
     }
 
@@ -306,7 +306,7 @@ export class PixiRenderer {
   ) {
     if (import.meta.env.DEV) {
       useDebugStore.getState().addLog(
-        `renderFromLayout: graphEdges=${graph.edges.length}, layoutEdges=${layout.edges.length}, layoutNodes=${Object.keys(layout.nodes).length}`
+        `renderFromLayout: graphEdges=${graph.edgeCount}, layoutEdges=${layout.edges.length}, layoutNodes=${Object.keys(layout.nodes).length}`
       );
     }
 

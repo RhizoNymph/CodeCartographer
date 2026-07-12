@@ -46,7 +46,7 @@ export function Toolbar() {
       saveLastFolder(path);
       try {
         const scannedGraph = await scanRepo(path);
-        console.log("Scanned graph edges:", scannedGraph.edges.length);
+        console.log("Scanned graph edges:", scannedGraph.edge_count);
         setGraph(scannedGraph);
 
         setIsParsing(true);
@@ -265,7 +265,7 @@ export function Toolbar() {
       <div style={{ flex: 1 }} />
 
       {/* Edge type toggles */}
-      {graph && graph.edges.length > 0 && (
+      {graph && graph.edgeCount > 0 && (
         <div
           style={{
             display: "flex",
