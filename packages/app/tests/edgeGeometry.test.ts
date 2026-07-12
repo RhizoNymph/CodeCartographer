@@ -383,3 +383,27 @@ test("rerouteOrthogonalEdge uses dynamically inferred vertical anchors for moved
   assertLeavesFromSide(points, "bottom");
   assertApproachesFromSide(points, "top");
 });
+
+test("routePolylineAroundObstacles never collapses below two points", () => {
+  // Coincident endpoints (a node dragged on top of its edge partner):
+  // normalization would erase the polyline entirely without the fallback.
+  const degenerate = routePolylineAroundObstacles(
+    [
+      { x: 150, y: 150 },
+      { x: 150, y: 150 },
+    ],
+    []
+  );
+  assert.ok(degenerate.length >= 2, "degenerate polyline must stay drawable");
+
+  // Same input routed against an obstacle it nominally overlaps.
+  const obstacle: NodeBox = { x: 140, y: 140, width: 40, height: 40 };
+  const routed = routePolylineAroundObstacles(
+    [
+      { x: 150, y: 150 },
+      { x: 150.0001, y: 150 },
+    ],
+    [obstacle]
+  );
+  assert.ok(routed.length >= 2, "near-degenerate polyline must stay drawable");
+});
