@@ -69,91 +69,78 @@ impl LanguageSupport for RustSupport {
         }
     }
 
-    fn collect_references(
+    fn collect_node_references(
         &self,
         source: &str,
-        root: &Node,
+        node: &Node,
         from_id: &NodeId,
         refs: &mut Vec<RawReference>,
     ) {
-        let mut stack = vec![*root];
-
-        while let Some(current) = stack.pop() {
-            let kind = current.kind();
-
-            match kind {
-                "use_declaration" => {
-                    if let Some(name) = Extractor::extract_use_name(&current, source) {
-                        refs.push(RawReference {
-                            from_node: from_id.clone(),
-                            kind: RawRefKind::Import {
-                                module_path: name.clone(),
-                            },
-                            name,
-                            span: Extractor::node_span(&current),
-                        });
-                    }
+        let current = *node;
+        match current.kind() {
+            "use_declaration" => {
+                if let Some(name) = Extractor::extract_use_name(&current, source) {
+                    refs.push(RawReference {
+                        from_node: from_id.clone(),
+                        kind: RawRefKind::Import {
+                            module_path: name.clone(),
+                        },
+                        name,
+                        span: Extractor::node_span(&current),
+                    });
                 }
-                "call_expression" => {
-                    if let Some(func) = current.child_by_field_name("function") {
-                        if func.kind() == "field_expression" {
-                            let name = Extractor::extract_function_name(&func, source);
-                            if !name.is_empty() && name != "Self" && name != "self" {
-                                refs.push(RawReference {
-                                    from_node: from_id.clone(),
-                                    kind: RawRefKind::MethodCall,
-                                    name,
-                                    span: Extractor::node_span(&current),
-                                });
-                            }
-                        } else {
-                            let name = Extractor::extract_function_name(&func, source);
-                            if !name.is_empty() && name != "Self" && name != "self" {
-                                refs.push(RawReference {
-                                    from_node: from_id.clone(),
-                                    kind: RawRefKind::FunctionCall,
-                                    name,
-                                    span: Extractor::node_span(&current),
-                                });
-                            }
-                        }
-                    }
-                }
-                "type_identifier" => {
-                    if let Ok(text) = current.utf8_text(source.as_bytes()) {
-                        let name = text.trim().to_string();
-                        if !name.is_empty() && !is_rust_builtin_type(&name) {
+            }
+            "call_expression" => {
+                if let Some(func) = current.child_by_field_name("function") {
+                    if func.kind() == "field_expression" {
+                        let name = Extractor::extract_function_name(&func, source);
+                        if !name.is_empty() && name != "Self" && name != "self" {
                             refs.push(RawReference {
                                 from_node: from_id.clone(),
-                                kind: RawRefKind::TypeReference,
+                                kind: RawRefKind::MethodCall,
+                                name,
+                                span: Extractor::node_span(&current),
+                            });
+                        }
+                    } else {
+                        let name = Extractor::extract_function_name(&func, source);
+                        if !name.is_empty() && name != "Self" && name != "self" {
+                            refs.push(RawReference {
+                                from_node: from_id.clone(),
+                                kind: RawRefKind::FunctionCall,
                                 name,
                                 span: Extractor::node_span(&current),
                             });
                         }
                     }
                 }
-                "impl_item" => {
-                    if let Some(trait_node) = current.child_by_field_name("trait") {
-                        if let Ok(text) = trait_node.utf8_text(source.as_bytes()) {
-                            refs.push(RawReference {
-                                from_node: from_id.clone(),
-                                kind: RawRefKind::TraitImpl,
-                                name: text.to_string(),
-                                span: Extractor::node_span(&trait_node),
-                            });
-                        }
+            }
+            "type_identifier" => {
+                if let Ok(text) = current.utf8_text(source.as_bytes()) {
+                    let name = text.trim().to_string();
+                    if !name.is_empty() && !is_rust_builtin_type(&name) {
+                        refs.push(RawReference {
+                            from_node: from_id.clone(),
+                            kind: RawRefKind::TypeReference,
+                            name,
+                            span: Extractor::node_span(&current),
+                        });
                     }
                 }
-                _ => {}
             }
-
-            // Push children onto stack
-            let child_count = current.child_count();
-            for i in 0..child_count {
-                if let Some(child) = current.child(i) {
-                    stack.push(child);
+            "impl_item" => {
+                if let Some(trait_node) = current.child_by_field_name("trait") {
+                    if let Ok(text) = trait_node.utf8_text(source.as_bytes()) {
+                        refs.push(RawReference {
+                            from_node: from_id.clone(),
+                            kind: RawRefKind::TraitImpl,
+                            name: text.to_string(),
+                            span: Extractor::node_span(&trait_node),
+                        });
+                    }
                 }
             }
+            _ => {}
         }
     }
 

@@ -29,6 +29,11 @@ pub async fn parse_repo(
             .ok_or_else(|| "No graph in state. Run scan_repo first.".to_string())?
     };
 
+    // Re-parse guard: strip any state left by a previous parse so that parsing
+    // the same repo twice is idempotent. Remove all CodeBlock nodes, drop block
+    // ids from File children arrays, clear edges, and rebuild adjacency.
+    strip_parsed_state(&mut graph);
+
     let mut all_refs = Vec::new();
     let mut total_blocks = 0usize;
     let mut total_files = 0usize;
@@ -77,10 +82,19 @@ pub async fn parse_repo(
                 let block_count = nodes.len();
                 total_blocks += block_count;
                 for node in nodes {
+                    // Only top-level blocks (parented directly to the file) are
+                    // added to the File node's children. Nested blocks are already
+                    // linked into their parent block's children by the extractor.
+                    let is_top_level = matches!(
+                        &node,
+                        CodeNode::CodeBlock { parent, .. } if *parent == file_id
+                    );
                     let block_id = node.id().clone();
                     graph.add_node(node);
-                    if let Some(file_node) = graph.nodes.get_mut(&file_id) {
-                        file_node.children_mut().push(block_id);
+                    if is_top_level {
+                        if let Some(file_node) = graph.nodes.get_mut(&file_id) {
+                            file_node.children_mut().push(block_id);
+                        }
                     }
                 }
                 all_refs.extend(refs);
@@ -158,6 +172,37 @@ pub async fn parse_repo(
     Ok(graph)
 }
 
+/// Remove all parse-derived state from the graph so that re-parsing is
+/// idempotent: drop every CodeBlock node, remove block ids from File children
+/// arrays, clear all edges, and rebuild adjacency indexes. Directory and File
+/// nodes (produced by the scan phase) are preserved.
+fn strip_parsed_state(graph: &mut CodeGraph) {
+    // Collect ids of all code-block nodes.
+    let block_ids: HashSet<NodeId> = graph
+        .nodes
+        .iter()
+        .filter(|(_, node)| node.is_code_block())
+        .map(|(id, _)| id.clone())
+        .collect();
+
+    if block_ids.is_empty() && graph.edges.is_empty() {
+        return;
+    }
+
+    // Remove the code-block nodes.
+    graph.nodes.retain(|_, node| !node.is_code_block());
+
+    // Remove block ids from every remaining node's children (File nodes only
+    // ever reference blocks, but this is safe for all node kinds).
+    for node in graph.nodes.values_mut() {
+        node.children_mut().retain(|child| !block_ids.contains(child));
+    }
+
+    // Clear edges and rebuild the (now empty) adjacency indexes.
+    graph.edges.clear();
+    graph.rebuild_adjacency();
+}
+
 // TODO: get_subgraph is registered as a Tauri command but not yet called from the
 // frontend. It will become useful once server-side graph state is implemented so the
 // frontend can request filtered subgraphs without sending the full graph over IPC.
@@ -191,4 +236,102 @@ pub async fn get_subgraph(
         .collect::<Result<_, _>>()?;
 
     Ok(SubGraph::from_graph(graph, &visible, &kinds))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cc_core::model::{
+        BlockKind, CodeEdge, CodeNode, EdgeKind, NodeId, Span, Visibility,
+    };
+
+    fn file_node(id: &str) -> CodeNode {
+        CodeNode::File {
+            id: NodeId::file(id),
+            name: id.to_string(),
+            path: id.to_string(),
+            language: Some(Language::Python),
+            children: Vec::new(),
+        }
+    }
+
+    fn block_node(id: &str, parent: NodeId) -> CodeNode {
+        CodeNode::CodeBlock {
+            id: NodeId(id.to_string()),
+            name: id.to_string(),
+            kind: BlockKind::Function,
+            span: Span {
+                start_line: 1,
+                start_col: 0,
+                end_line: 1,
+                end_col: 0,
+            },
+            signature: None,
+            visibility: Some(Visibility::Public),
+            parent,
+            children: Vec::new(),
+        }
+    }
+
+    /// Build a "parsed" graph: one file with a block child and one edge, then
+    /// assert strip_parsed_state returns it to the pre-parse (scan-only) state.
+    #[test]
+    fn strip_parsed_state_removes_blocks_edges_and_children() {
+        let file_id = NodeId::file("a.py");
+        let block_id = NodeId("a.py::foo@1".into());
+
+        let mut graph = CodeGraph::new(file_id.clone());
+        let mut file = file_node("a.py");
+        file.children_mut().push(block_id.clone());
+        graph.add_node(file);
+        graph.add_node(block_node("a.py::foo@1", file_id.clone()));
+        graph.add_edge(CodeEdge {
+            source: file_id.clone(),
+            target: block_id.clone(),
+            kind: EdgeKind::FunctionCall,
+            weight: 1,
+        });
+
+        strip_parsed_state(&mut graph);
+
+        assert_eq!(graph.nodes.len(), 1, "only the file node should remain");
+        assert!(graph.nodes.contains_key(&file_id));
+        assert!(graph.edges.is_empty(), "edges should be cleared");
+        assert!(
+            graph.forward_adj.is_empty() && graph.reverse_adj.is_empty(),
+            "adjacency should be rebuilt empty"
+        );
+        let file = graph.nodes.get(&file_id).unwrap();
+        assert!(
+            file.children().is_empty(),
+            "block ids should be removed from file children"
+        );
+    }
+
+    /// Strip twice: second call is a no-op and leaves an identical graph.
+    #[test]
+    fn strip_parsed_state_is_idempotent() {
+        let file_id = NodeId::file("a.py");
+        let block_id = NodeId("a.py::foo@1".into());
+
+        let mut graph = CodeGraph::new(file_id.clone());
+        let mut file = file_node("a.py");
+        file.children_mut().push(block_id.clone());
+        graph.add_node(file);
+        graph.add_node(block_node("a.py::foo@1", file_id.clone()));
+        graph.add_edge(CodeEdge {
+            source: file_id.clone(),
+            target: block_id,
+            kind: EdgeKind::FunctionCall,
+            weight: 1,
+        });
+
+        strip_parsed_state(&mut graph);
+        let node_count = graph.node_count();
+        let edge_count = graph.edge_count();
+        strip_parsed_state(&mut graph);
+
+        assert_eq!(graph.node_count(), node_count);
+        assert_eq!(graph.edge_count(), edge_count);
+    }
 }

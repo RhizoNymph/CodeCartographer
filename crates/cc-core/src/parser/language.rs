@@ -15,11 +15,15 @@ pub trait LanguageSupport {
         source: &str,
     ) -> Option<(BlockKind, String, Option<Visibility>)>;
 
-    /// Collect raw references (imports, calls, type refs) from a tree-sitter subtree.
-    fn collect_references(
+    /// Collect raw references (imports, calls, type refs) from a single
+    /// tree-sitter node. The extractor drives the walk and calls this once per
+    /// node, so implementations must inspect only the given node (they may still
+    /// look at the node's own parent/children, but must not recurse the subtree).
+    /// References are attributed to `from_id`, the innermost enclosing block.
+    fn collect_node_references(
         &self,
         source: &str,
-        root: &Node,
+        node: &Node,
         from_id: &NodeId,
         refs: &mut Vec<RawReference>,
     );

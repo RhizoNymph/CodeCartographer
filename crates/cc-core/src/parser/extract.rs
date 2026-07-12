@@ -73,29 +73,47 @@ impl Extractor {
         let mut nodes = Vec::new();
         let mut refs = Vec::new();
 
+        let file_id = NodeId::file(file_path);
+
+        // Single pass over the whole tree. Attribution starts at the file node so
+        // top-level imports/refs are captured, then switches to the innermost
+        // enclosing block as the walk descends into classified blocks.
         Self::walk_tree(
             file_path,
             source,
             lang_support.as_ref(),
             &tree.root_node(),
-            &NodeId::file(file_path),
+            &file_id,
             &mut nodes,
             &mut refs,
         );
 
+        // Post-pass: populate each block's `children` from the `parent` links.
+        Self::link_block_children(&mut nodes);
+
         Ok((nodes, refs))
     }
 
+    /// Walk the entire file tree exactly once. `attribution_id` is the innermost
+    /// enclosing block (or the file) that references at this node should be
+    /// attributed to. When a node classifies as a block, we create the block node
+    /// and switch attribution to it for that node and its subtree; the block node
+    /// itself then has references collected under its own id (e.g. a Rust
+    /// `impl_item` both classifies and emits a `TraitImpl` ref).
     fn walk_tree(
         file_path: &str,
         source: &str,
         lang: &dyn LanguageSupport,
         node: &tree_sitter::Node,
-        parent_id: &NodeId,
+        attribution_id: &NodeId,
         out_nodes: &mut Vec<CodeNode>,
         out_refs: &mut Vec<RawReference>,
     ) {
         let kind = node.kind();
+
+        // Determine the attribution id for this node and its subtree. If the node
+        // is a code block, create it and switch attribution to the new block id.
+        let mut current_id = attribution_id.clone();
 
         if let Some((block_kind, name, visibility)) = lang.classify_node(kind, node, source) {
             let span = Span {
@@ -116,26 +134,51 @@ impl Extractor {
                 span,
                 signature,
                 visibility,
-                parent: parent_id.clone(),
+                parent: attribution_id.clone(),
                 children: Vec::new(),
             });
 
-            // Recurse with this block as parent
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                Self::walk_tree(file_path, source, lang, &child, &block_id, out_nodes, out_refs);
-            }
+            current_id = block_id;
+        }
 
-            // Collect references
-            lang.collect_references(source, node, &block_id, out_refs);
-        } else {
-            // Not a code block, recurse normally
-            let mut cursor = node.walk();
-            for child in node.children(&mut cursor) {
-                Self::walk_tree(
-                    file_path, source, lang, &child, parent_id, out_nodes, out_refs,
-                );
-            }
+        // Collect references for this exact node under the current attribution id.
+        lang.collect_node_references(source, node, &current_id, out_refs);
+
+        // Recurse into children with the (possibly updated) attribution id.
+        let mut cursor = node.walk();
+        for child in node.children(&mut cursor) {
+            Self::walk_tree(
+                file_path, source, lang, &child, &current_id, out_nodes, out_refs,
+            );
+        }
+    }
+
+    /// Populate each block's `children` vec from the `parent` links produced
+    /// during the walk. Only blocks whose parent is another block in this file
+    /// are linked; blocks parented directly to the file are left for the caller
+    /// (they become the File node's children).
+    fn link_block_children(nodes: &mut [CodeNode]) {
+        // Map block id -> index for O(1) parent lookup.
+        let index_of: std::collections::HashMap<NodeId, usize> = nodes
+            .iter()
+            .enumerate()
+            .map(|(i, n)| (n.id().clone(), i))
+            .collect();
+
+        // Collect (parent_index, child_id) pairs where the parent is a block.
+        let links: Vec<(usize, NodeId)> = nodes
+            .iter()
+            .filter_map(|n| {
+                if let CodeNode::CodeBlock { id, parent, .. } = n {
+                    index_of.get(parent).map(|&pi| (pi, id.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        for (parent_index, child_id) in links {
+            nodes[parent_index].children_mut().push(child_id);
         }
     }
 
@@ -322,8 +365,8 @@ mod tests {
 
     #[test]
     fn test_extract_python_imports() {
-        // Import statements inside a function body are collected as references
-        // (collect_references only runs on subtrees of classified code blocks)
+        // Import statements inside a function body are collected as references,
+        // attributed to the enclosing function block.
         let source = "def setup():\n    import os\n    from os import path";
         let (_, refs) = extract(source, &Language::Python);
         let import_refs: Vec<_> = refs
@@ -335,7 +378,7 @@ mod tests {
             "expected at least one import reference inside function"
         );
 
-        // Top-level imports are not inside any code block, so they are NOT collected
+        // Top-level imports are attributed to the file NodeId.
         let source_top = "import os\nfrom os import path";
         let (_, refs_top) = extract(source_top, &Language::Python);
         let top_imports: Vec<_> = refs_top
@@ -343,8 +386,17 @@ mod tests {
             .filter(|r| matches!(&r.kind, RawRefKind::Import { .. }))
             .collect();
         assert!(
-            top_imports.is_empty(),
-            "top-level imports produce no refs (no enclosing code block)"
+            !top_imports.is_empty(),
+            "top-level imports should produce Import refs"
+        );
+        let file_id = NodeId::file("test.file");
+        assert!(
+            top_imports.iter().all(|r| r.from_node == file_id),
+            "top-level imports should be attributed to the file NodeId"
+        );
+        assert!(
+            top_imports.iter().any(|r| r.name == "os"),
+            "expected top-level import ref for 'os'"
         );
     }
 
@@ -618,19 +670,25 @@ mod tests {
 
     #[test]
     fn test_extract_ts_imports() {
-        // Top-level import statements are not inside any code block, so the
-        // extractor does not collect them as references (collect_references only
-        // runs for subtrees of classified blocks). Verify this expected behavior:
+        // Top-level import statements are attributed to the file NodeId.
         let source_top = "import { foo } from './bar'";
         let (_, refs_top) = extract(source_top, &Language::TypeScript);
         let top_imports: Vec<_> = refs_top
             .iter()
             .filter(|r| matches!(&r.kind, RawRefKind::Import { .. }))
             .collect();
-        // Top-level imports produce no refs in current implementation
         assert!(
-            top_imports.is_empty(),
-            "top-level imports are not collected as refs (no enclosing code block)"
+            !top_imports.is_empty(),
+            "top-level imports should produce Import refs"
+        );
+        let file_id = NodeId::file("test.file");
+        assert!(
+            top_imports.iter().all(|r| r.from_node == file_id),
+            "top-level imports should be attributed to the file NodeId"
+        );
+        assert!(
+            top_imports.iter().any(|r| r.name == "./bar"),
+            "expected top-level import ref for './bar'"
         );
 
         // However, require() inside a function IS a call_expression
@@ -801,7 +859,7 @@ mod tests {
             "expected import ref with name 'HashMap'"
         );
 
-        // Top-level use declarations produce no refs (no enclosing code block)
+        // Top-level use declarations are attributed to the file NodeId.
         let source_top = "use std::collections::HashMap;";
         let (_, refs_top) = extract(source_top, &Language::Rust);
         let top_imports: Vec<_> = refs_top
@@ -809,8 +867,17 @@ mod tests {
             .filter(|r| matches!(&r.kind, RawRefKind::Import { .. }))
             .collect();
         assert!(
-            top_imports.is_empty(),
-            "top-level use produces no refs (no enclosing code block)"
+            !top_imports.is_empty(),
+            "top-level use should produce Import refs"
+        );
+        let file_id = NodeId::file("test.file");
+        assert!(
+            top_imports.iter().all(|r| r.from_node == file_id),
+            "top-level use should be attributed to the file NodeId"
+        );
+        assert!(
+            top_imports.iter().any(|r| r.name == "HashMap"),
+            "expected top-level import ref with name 'HashMap'"
         );
     }
 
@@ -878,6 +945,99 @@ mod tests {
                 lang
             );
         }
+    }
+
+    // -- Innermost attribution / children hierarchy --
+
+    fn block_id_of(nodes: &[CodeNode], name: &str) -> NodeId {
+        if let CodeNode::CodeBlock { id, .. } = find_block(nodes, name) {
+            id.clone()
+        } else {
+            panic!("expected CodeBlock for '{}'", name);
+        }
+    }
+
+    #[test]
+    fn test_method_body_call_attributed_to_method_not_class() {
+        // A class with a method whose body calls bar(): the FunctionCall ref must
+        // be attributed to the method block exactly once, never the class or file.
+        let source = "class Foo:\n    def m(self):\n        bar()";
+        let (nodes, refs) = extract(source, &Language::Python);
+
+        let method_id = block_id_of(&nodes, "m");
+        let class_id = block_id_of(&nodes, "Foo");
+        let file_id = NodeId::file("test.file");
+
+        let bar_calls: Vec<_> = refs
+            .iter()
+            .filter(|r| matches!(r.kind, RawRefKind::FunctionCall) && r.name == "bar")
+            .collect();
+        assert_eq!(
+            bar_calls.len(),
+            1,
+            "expected exactly one FunctionCall ref for 'bar', got {}",
+            bar_calls.len()
+        );
+        assert_eq!(
+            bar_calls[0].from_node, method_id,
+            "bar() should be attributed to the method block"
+        );
+        assert_ne!(bar_calls[0].from_node, class_id, "not the class");
+        assert_ne!(bar_calls[0].from_node, file_id, "not the file");
+    }
+
+    #[test]
+    fn test_class_children_contains_method() {
+        let source = "class Foo:\n    def bar(self):\n        pass";
+        let (nodes, _) = extract(source, &Language::Python);
+
+        let method_id = block_id_of(&nodes, "bar");
+        if let CodeNode::CodeBlock { children, .. } = find_block(&nodes, "Foo") {
+            assert!(
+                children.contains(&method_id),
+                "class children should contain the method id, got {:?}",
+                children
+            );
+        } else {
+            panic!("expected CodeBlock");
+        }
+    }
+
+    #[test]
+    fn test_only_top_level_blocks_parented_to_file() {
+        // The class is top-level (parent == file); the method is nested
+        // (parent == class). Extract-level check of the parent links that
+        // parse_repo uses to build the File node's children.
+        let source = "class Foo:\n    def bar(self):\n        pass";
+        let (nodes, _) = extract(source, &Language::Python);
+        let file_id = NodeId::file("test.file");
+
+        let class = find_block(&nodes, "Foo");
+        let method = find_block(&nodes, "bar");
+        let class_id = block_id_of(&nodes, "Foo");
+
+        if let CodeNode::CodeBlock { parent, .. } = class {
+            assert_eq!(*parent, file_id, "class parent should be the file");
+        }
+        if let CodeNode::CodeBlock { parent, .. } = method {
+            assert_eq!(*parent, class_id, "method parent should be the class");
+        }
+
+        // Blocks whose parent is the file (these become File node children).
+        let file_children: Vec<&str> = nodes
+            .iter()
+            .filter_map(|n| match n {
+                CodeNode::CodeBlock { name, parent, .. } if *parent == file_id => {
+                    Some(name.as_str())
+                }
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            file_children,
+            vec!["Foo"],
+            "only the top-level class should be parented to the file"
+        );
     }
 
     #[test]

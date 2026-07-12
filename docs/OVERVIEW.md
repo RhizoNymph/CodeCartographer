@@ -17,7 +17,7 @@ Overview:
     data_flow:
         1. User selects a repository path via the toolbar.
         2. Frontend calls scan_repo (Tauri IPC) -> cc-tauri scans directory tree -> returns CodeGraph with Directory/File nodes.
-        3. Frontend calls parse_repo (Tauri IPC) -> cc-tauri parses each file with tree-sitter (parallel via rayon) -> extracts CodeBlock nodes and raw references -> resolves references into edges via SymbolTable -> returns enriched CodeGraph.
+        3. Frontend calls parse_repo (Tauri IPC) -> cc-tauri first strips any prior parse state so re-parsing is idempotent -> parses each file with tree-sitter (parallel via rayon) in a single tree walk that attributes each raw reference to its innermost enclosing block (top-level imports/refs attributed to the File) and populates each block's children hierarchy -> only top-level blocks are appended to File children -> resolves references into edges via SymbolTable -> returns enriched CodeGraph.
         4. Frontend graphStore receives the CodeGraph, computes visibility/expansion state.
         5. Canvas component passes graph + state to PixiRenderer.
         6. PixiRenderer delegates to elkLayout for node positioning, then renders nodes and edges on the Pixi.js canvas.
