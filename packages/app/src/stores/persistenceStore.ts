@@ -5,10 +5,14 @@ const LAST_FOLDER_KEY = `${STORAGE_KEY_PREFIX}lastFolder`;
 const FOLDER_STATE_PREFIX = `${STORAGE_KEY_PREFIX}folder_`;
 const FOLDER_STATE_VERSION = 2;
 
+export type ViewMode = "module" | "symbol";
+
 interface FolderState {
   version: number;
   expandedNodes: string[];
   visibleNodes: string[];
+  /** Persisted zoom-level view mode. Absent in states saved before v3. */
+  viewMode?: ViewMode;
 }
 
 function hashPath(path: string): string {
@@ -50,7 +54,8 @@ export function clearLastFolder(): void {
 export function saveFolderState(
   folderPath: string,
   expandedNodes: Set<string>,
-  visibleNodes: Set<string>
+  visibleNodes: Set<string>,
+  viewMode: ViewMode = "module"
 ): void {
   try {
     const key = FOLDER_STATE_PREFIX + hashPath(folderPath);
@@ -58,6 +63,7 @@ export function saveFolderState(
       version: FOLDER_STATE_VERSION,
       expandedNodes: Array.from(expandedNodes),
       visibleNodes: Array.from(visibleNodes),
+      viewMode,
     };
     localStorage.setItem(key, JSON.stringify(state));
   } catch (e) {
@@ -79,7 +85,11 @@ export function loadFolderState(folderPath: string): FolderState | null {
       localStorage.removeItem(key);
       return null;
     }
-    return state as FolderState;
+    // Backward compat: states from before viewMode existed (or with an invalid
+    // value) default to the trustworthy module view.
+    const viewMode: ViewMode =
+      state.viewMode === "symbol" ? "symbol" : "module";
+    return { ...state, viewMode } as FolderState;
   } catch (e) {
     console.warn("Failed to load folder state:", e);
     return null;

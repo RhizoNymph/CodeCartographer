@@ -37,6 +37,7 @@ export function Tooltip() {
   const graph = useGraphStore((s) => s.graph);
   const hoveredNodeId = useGraphStore((s) => s.hoveredNodeId);
   const hoveredEdgeInfo = useGraphStore((s) => s.hoveredEdgeInfo);
+  const enterFocus = useGraphStore((s) => s.enterFocus);
 
   // Edge tooltip (shown when hovering an edge and NOT hovering a node)
   if (!hoveredNodeId && hoveredEdgeInfo) {
@@ -102,6 +103,24 @@ export function Tooltip() {
           {node.children.length} items
         </span>
       )}
+      <button
+        onClick={() => enterFocus(node.id)}
+        title="Focus on this node's neighborhood"
+        style={{
+          pointerEvents: "auto",
+          marginLeft: 4,
+          padding: "1px 8px",
+          fontSize: 10,
+          fontWeight: 600,
+          border: "1px solid #3b82f6",
+          borderRadius: 4,
+          cursor: "pointer",
+          background: "#1e3a5f",
+          color: "#93c5fd",
+        }}
+      >
+        Focus
+      </button>
     </div>
   );
 }

@@ -443,12 +443,21 @@ export class PixiRenderer {
       }
     });
 
-    // Double-click to expand/collapse
+    // Double-click behavior depends on the zoom-level view mode:
+    //  - Module view: double-clicking a File drills into Symbol view focused on
+    //    that file (instead of expanding code blocks in place). Other node types
+    //    fall back to expand/collapse.
+    //  - Symbol view: double-click expands/collapses as before.
     let lastClickTime = 0;
     display.container.on("pointertap", () => {
       const now = Date.now();
       if (now - lastClickTime < 350) {
-        useGraphStore.getState().toggleExpanded(nodeId);
+        const store = useGraphStore.getState();
+        if (store.viewMode === "module" && node.type === "File") {
+          store.enterFocus(nodeId);
+        } else {
+          store.toggleExpanded(nodeId);
+        }
       }
       lastClickTime = now;
     });

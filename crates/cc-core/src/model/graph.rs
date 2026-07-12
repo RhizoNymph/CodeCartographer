@@ -256,6 +256,119 @@ impl SubGraph {
     }
 }
 
+/// A local neighborhood extracted around a focus node for drill-down rendering.
+///
+/// `node_ids` is the closure of every node reachable within `depth` hops of the
+/// focus (following edges in BOTH directions), plus the container chain
+/// (parents up to the root) of each such node so the frontend can build the ELK
+/// containment tree. `edges` are the direct edges (with resolution) among the
+/// neighborhood nodes only (excludes container-chain-only nodes that have no
+/// edge among the set).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Neighborhood {
+    pub focus: NodeId,
+    pub depth: u8,
+    pub node_ids: Vec<NodeId>,
+    pub edges: Vec<CodeEdge>,
+}
+
+impl CodeGraph {
+    /// Compute the neighborhood around `focus` by breadth-first search over both
+    /// `forward_adj` and `reverse_adj`, bounded by `depth` hops and filtered to
+    /// `enabled_edge_kinds`. Returns `None` if `focus` is not a node in the graph.
+    ///
+    /// The returned `node_ids` include, in addition to the BFS frontier, the
+    /// container chain (parents up to the root, via the `children` hierarchy) of
+    /// every discovered node, so callers can render context containers. `edges`
+    /// are the direct edges among the discovered (BFS) nodes, carrying their
+    /// resolution; container-only nodes contribute no edges.
+    ///
+    /// `depth` is clamped to `1..=2`.
+    pub fn neighborhood(
+        &self,
+        focus: &NodeId,
+        depth: u8,
+        enabled_edge_kinds: &HashSet<EdgeKind>,
+    ) -> Option<Neighborhood> {
+        if !self.nodes.contains_key(focus) {
+            return None;
+        }
+        let depth = depth.clamp(1, 2);
+
+        // BFS over both directions, tracking discovered nodes. `frontier`
+        // carries the nodes to expand at the current level.
+        let mut discovered: HashSet<NodeId> = HashSet::new();
+        discovered.insert(focus.clone());
+        let mut frontier: Vec<NodeId> = vec![focus.clone()];
+
+        for _ in 0..depth {
+            let mut next: Vec<NodeId> = Vec::new();
+            for node in frontier.drain(..) {
+                // Forward: node -> target
+                if let Some(adj) = self.forward_adj.get(&node) {
+                    for (target, edge_idx) in adj {
+                        if !enabled_edge_kinds.contains(&self.edges[*edge_idx].kind) {
+                            continue;
+                        }
+                        if discovered.insert(target.clone()) {
+                            next.push(target.clone());
+                        }
+                    }
+                }
+                // Reverse: source -> node (callers)
+                if let Some(adj) = self.reverse_adj.get(&node) {
+                    for (source, edge_idx) in adj {
+                        if !enabled_edge_kinds.contains(&self.edges[*edge_idx].kind) {
+                            continue;
+                        }
+                        if discovered.insert(source.clone()) {
+                            next.push(source.clone());
+                        }
+                    }
+                }
+            }
+            frontier = next;
+        }
+
+        // Direct edges among discovered nodes only (before adding container
+        // chains, so container-only nodes never introduce spurious edges).
+        let edges: Vec<CodeEdge> = self
+            .edges
+            .iter()
+            .filter(|e| {
+                enabled_edge_kinds.contains(&e.kind)
+                    && discovered.contains(&e.source)
+                    && discovered.contains(&e.target)
+            })
+            .cloned()
+            .collect();
+
+        // Include the container chain (parents up to root) of every discovered
+        // node so the frontend can build the containment tree.
+        let parent_map = build_parent_map(self);
+        let mut node_set: HashSet<NodeId> = discovered.clone();
+        for node in discovered.iter() {
+            let mut current = node.clone();
+            while let Some(parent) = parent_map.get(&current) {
+                if !node_set.insert(parent.clone()) {
+                    break;
+                }
+                current = parent.clone();
+            }
+        }
+
+        let mut node_ids: Vec<NodeId> = node_set.into_iter().collect();
+        node_ids.sort_by(|a, b| a.0.cmp(&b.0));
+
+        Some(Neighborhood {
+            focus: focus.clone(),
+            depth,
+            node_ids,
+            edges,
+        })
+    }
+}
+
 /// The edge-less parse response sent over IPC.
 ///
 /// The full graph (nodes + edges) stays in server-side state; the frontend
@@ -818,5 +931,122 @@ mod tests {
         assert_eq!(result.nodes.len(), g.nodes.len());
         assert!(result.node_edge_kinds.contains_key(&NodeId("fnA1".into())));
         assert!(result.node_edge_kinds.contains_key(&NodeId("fnB1".into())));
+    }
+
+    // --- Neighborhood (focus / drill-down) tests ---
+
+    fn only_import() -> HashSet<EdgeKind> {
+        [EdgeKind::Import].into_iter().collect()
+    }
+
+    #[test]
+    fn neighborhood_unknown_node_returns_none() {
+        let g = sample_graph();
+        assert!(g
+            .neighborhood(&NodeId("does_not_exist".into()), 1, &all_kinds())
+            .is_none());
+    }
+
+    #[test]
+    fn neighborhood_includes_callers_and_callees_at_depth_1() {
+        // fnA1 -> fnB1 (callee) and fnA2 -> fnA1 (caller of fnA1).
+        let mut g = sample_graph();
+        g.add_edge(edge("fnA1", "fnB1", EdgeKind::FunctionCall));
+        g.add_edge(edge("fnA2", "fnA1", EdgeKind::FunctionCall));
+
+        let n = g
+            .neighborhood(&NodeId("fnA1".into()), 1, &all_kinds())
+            .expect("known node");
+        let ids: HashSet<&str> = n.node_ids.iter().map(|id| id.0.as_str()).collect();
+
+        // BOTH the callee (fnB1) and the caller (fnA2) are within one hop.
+        assert!(ids.contains("fnA1"), "focus itself");
+        assert!(ids.contains("fnB1"), "callee reached via forward_adj");
+        assert!(ids.contains("fnA2"), "caller reached via reverse_adj");
+        // Edges among the neighborhood carry resolution.
+        assert_eq!(n.edges.len(), 2);
+        assert!(n.edges.iter().all(|e| e.resolution == Resolution::GlobalUnique));
+    }
+
+    #[test]
+    fn neighborhood_respects_depth_bounds() {
+        // Chain: fnA1 -> fnA2 -> fnB1. From fnA1 at depth 1, fnB1 is NOT reached;
+        // at depth 2 it is.
+        let mut g = sample_graph();
+        g.add_edge(edge("fnA1", "fnA2", EdgeKind::FunctionCall));
+        g.add_edge(edge("fnA2", "fnB1", EdgeKind::FunctionCall));
+
+        let d1 = g
+            .neighborhood(&NodeId("fnA1".into()), 1, &all_kinds())
+            .unwrap();
+        let ids1: HashSet<&str> = d1.node_ids.iter().map(|id| id.0.as_str()).collect();
+        assert!(ids1.contains("fnA2"), "one hop reaches fnA2");
+        assert!(!ids1.contains("fnB1"), "two hops away, excluded at depth 1");
+
+        let d2 = g
+            .neighborhood(&NodeId("fnA1".into()), 2, &all_kinds())
+            .unwrap();
+        let ids2: HashSet<&str> = d2.node_ids.iter().map(|id| id.0.as_str()).collect();
+        assert!(ids2.contains("fnB1"), "two hops away, included at depth 2");
+    }
+
+    #[test]
+    fn neighborhood_depth_is_clamped_to_1_2() {
+        let mut g = sample_graph();
+        g.add_edge(edge("fnA1", "fnA2", EdgeKind::FunctionCall));
+        // depth 0 clamps up to 1; depth 5 clamps down to 2.
+        assert_eq!(
+            g.neighborhood(&NodeId("fnA1".into()), 0, &all_kinds())
+                .unwrap()
+                .depth,
+            1
+        );
+        assert_eq!(
+            g.neighborhood(&NodeId("fnA1".into()), 5, &all_kinds())
+                .unwrap()
+                .depth,
+            2
+        );
+    }
+
+    #[test]
+    fn neighborhood_filters_by_edge_kind() {
+        // fnA1 -Import-> fnB1 and fnA1 -FunctionCall-> fnA2.
+        let mut g = sample_graph();
+        g.add_edge(edge("fnA1", "fnB1", EdgeKind::Import));
+        g.add_edge(edge("fnA1", "fnA2", EdgeKind::FunctionCall));
+
+        let n = g
+            .neighborhood(&NodeId("fnA1".into()), 1, &only_import())
+            .unwrap();
+        let ids: HashSet<&str> = n.node_ids.iter().map(|id| id.0.as_str()).collect();
+        assert!(ids.contains("fnB1"), "import neighbor kept");
+        assert!(
+            !ids.contains("fnA2"),
+            "function-call neighbor filtered out by kind"
+        );
+        // Only the import edge survives.
+        assert_eq!(n.edges.len(), 1);
+        assert_eq!(n.edges[0].kind, EdgeKind::Import);
+    }
+
+    #[test]
+    fn neighborhood_includes_container_chain() {
+        // fnA1 -> fnB1: neighborhood nodes are {fnA1, fnB1}; container chain adds
+        // their files (fileA, fileB) and the root.
+        let mut g = sample_graph();
+        g.add_edge(edge("fnA1", "fnB1", EdgeKind::FunctionCall));
+
+        let n = g
+            .neighborhood(&NodeId("fnA1".into()), 1, &all_kinds())
+            .unwrap();
+        let ids: HashSet<&str> = n.node_ids.iter().map(|id| id.0.as_str()).collect();
+        assert!(ids.contains("fileA"), "container of fnA1");
+        assert!(ids.contains("fileB"), "container of fnB1");
+        assert!(ids.contains("root"), "root of the container chain");
+        // Container-only nodes contribute no edges: still exactly the 1 direct edge.
+        assert_eq!(n.edges.len(), 1);
+        assert_eq!(n.edges[0].source, NodeId("fnA1".into()));
+        assert_eq!(n.edges[0].target, NodeId("fnB1".into()));
     }
 }

@@ -5,6 +5,13 @@ import { useGraphStore } from "../stores/graphStore";
 import { useViewportStore } from "../stores/viewportStore";
 import { useDebugStore } from "../stores/debugStore";
 import { computeDisplayVisibleNodes } from "../stores/visibilityFilter";
+import {
+  effectiveExpandedNodes,
+  effectiveEdgeKinds,
+  effectiveHideAmbiguous,
+  focusVisibleNodes,
+  focusExpandedNodes,
+} from "../stores/graphViewModel";
 
 export function Canvas() {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -18,6 +25,9 @@ export function Canvas() {
     enabledEdgeKinds,
     hideUnconnectedNodes,
     hideAmbiguousEdges,
+    viewMode,
+    focusNodeId,
+    focusNeighborhood,
     layoutVersion,
   } = useGraphStore(
     useShallow((s) => ({
@@ -29,19 +39,49 @@ export function Canvas() {
       enabledEdgeKinds: s.enabledEdgeKinds,
       hideUnconnectedNodes: s.hideUnconnectedNodes,
       hideAmbiguousEdges: s.hideAmbiguousEdges,
+      viewMode: s.viewMode,
+      focusNodeId: s.focusNodeId,
+      focusNeighborhood: s.focusNeighborhood,
       layoutVersion: s.layoutVersion,
     }))
   );
   const [error, setError] = useState<string | null>(null);
-  const displayVisibleNodes = useMemo(
-    () => computeDisplayVisibleNodes(
+
+  const isFocused = focusNodeId !== null && focusNeighborhood !== null;
+
+  // Effective edge kinds fed to layout: module view forces {Import}; focus uses
+  // the enabled kinds (already applied server-side to the neighborhood).
+  const layoutEdgeKinds = useMemo(
+    () => effectiveEdgeKinds(enabledEdgeKinds, viewMode),
+    [enabledEdgeKinds, viewMode]
+  );
+  const layoutHideAmbiguous = useMemo(
+    () => effectiveHideAmbiguous(hideAmbiguousEdges, viewMode),
+    [hideAmbiguousEdges, viewMode]
+  );
+
+  // Effective expanded set. Focus expands the neighborhood's containers; module
+  // view drops file expansion; symbol view uses the raw set.
+  const layoutExpandedNodes = useMemo(() => {
+    if (isFocused) {
+      return focusExpandedNodes(graph, focusNeighborhood!.node_ids);
+    }
+    return effectiveExpandedNodes(graph, expandedNodes, viewMode);
+  }, [isFocused, graph, focusNeighborhood, expandedNodes, viewMode]);
+
+  // Visible set: focus restricts to the neighborhood ids; otherwise the normal
+  // connectivity-filtered display set (using the effective edge kinds).
+  const displayVisibleNodes = useMemo(() => {
+    if (isFocused) {
+      return focusVisibleNodes(graph, focusNeighborhood!.node_ids);
+    }
+    return computeDisplayVisibleNodes(
       graph,
       visibleNodes,
-      enabledEdgeKinds,
+      layoutEdgeKinds,
       hideUnconnectedNodes
-    ),
-    [graph, visibleNodes, enabledEdgeKinds, hideUnconnectedNodes]
-  );
+    );
+  }, [isFocused, graph, focusNeighborhood, visibleNodes, layoutEdgeKinds, hideUnconnectedNodes]);
 
   useEffect(() => {
     if (!containerRef.current) return;
@@ -78,13 +118,13 @@ export function Canvas() {
     if (rendererRef.current && graph) {
       rendererRef.current.updateGraph(
         graph,
-        expandedNodes,
+        layoutExpandedNodes,
         displayVisibleNodes,
-        enabledEdgeKinds,
-        hideAmbiguousEdges
+        layoutEdgeKinds,
+        layoutHideAmbiguous
       );
     }
-  }, [graph, layoutVersion, enabledEdgeKinds, hideAmbiguousEdges]);
+  }, [graph, layoutVersion, layoutEdgeKinds, layoutHideAmbiguous, layoutExpandedNodes, displayVisibleNodes]);
 
   // Update visibility immediately when nodes are checked/unchecked (without full relayout)
   useEffect(() => {
