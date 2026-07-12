@@ -18,6 +18,7 @@ const TreeItem = memo(function TreeItem({ nodeId, depth, searchQuery, matchingNo
   const toggleExpanded = useGraphStore((s) => s.toggleExpanded);
   const toggleVisible = useGraphStore((s) => s.toggleVisible);
   const setSelectedNode = useGraphStore((s) => s.setSelectedNode);
+  const enterFocus = useGraphStore((s) => s.enterFocus);
 
   if (!graph) return null;
   const node = graph.nodes[nodeId];
@@ -112,6 +113,29 @@ const TreeItem = memo(function TreeItem({ nodeId, depth, searchQuery, matchingNo
           >
             {node.kind.toLowerCase()}
           </span>
+        )}
+        {isSelected && (
+          <button
+            onClick={(e) => {
+              e.stopPropagation();
+              enterFocus(nodeId);
+            }}
+            title="Focus on this node's neighborhood"
+            style={{
+              marginLeft: node.type === "CodeBlock" ? 6 : "auto",
+              flexShrink: 0,
+              padding: "1px 7px",
+              fontSize: 10,
+              fontWeight: 600,
+              border: "1px solid #3b82f6",
+              borderRadius: 4,
+              cursor: "pointer",
+              background: "#1e3a5f",
+              color: "#93c5fd",
+            }}
+          >
+            Focus
+          </button>
         )}
       </div>
 

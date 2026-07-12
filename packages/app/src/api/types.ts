@@ -32,6 +32,17 @@ export type EdgeKind =
   | "TraitImpl"
   | "VariableUsage";
 
+/**
+ * How confidently a reference was resolved to its target. Matches the Rust
+ * `Resolution` enum's serde output (externally-tagged unit variants serialize
+ * to their plain variant name). Ordered worst -> best.
+ */
+export type Resolution =
+  | "Ambiguous"
+  | "GlobalUnique"
+  | "Imported"
+  | "SameFile";
+
 export interface DirectoryNode {
   type: "Directory";
   id: string;
@@ -68,6 +79,7 @@ export interface CodeEdge {
   target: string;
   kind: EdgeKind;
   weight: number;
+  resolution: Resolution;
 }
 
 export interface AggregatedEdge {
@@ -110,6 +122,20 @@ export interface ParseResult {
 export interface SubGraph {
   edges: CodeEdge[];
   aggregated_edges: AggregatedEdge[];
+}
+
+/**
+ * A local neighborhood around a focus node, returned by `get_neighborhood` for
+ * focus / drill-down. `node_ids` includes the BFS frontier plus the container
+ * chain (parents up to root) of every discovered node so the frontend can build
+ * the ELK containment tree; `edges` are the direct edges (with resolution) among
+ * the discovered nodes.
+ */
+export interface Neighborhood {
+  focus: string;
+  depth: number;
+  node_ids: string[];
+  edges: CodeEdge[];
 }
 
 export type ParseEvent =

@@ -41,6 +41,10 @@ impl CodeGraph {
     pub fn add_edge(&mut self, edge: CodeEdge) {
         if let Some(idx) = self.edge_index.get(&edge.source, &edge.target, &edge.kind) {
             self.edges[idx].weight = self.edges[idx].weight.saturating_add(edge.weight);
+            // Keep the highest-confidence resolution among the merged duplicates.
+            if edge.resolution > self.edges[idx].resolution {
+                self.edges[idx].resolution = edge.resolution;
+            }
             return;
         }
         let idx = self.edges.len();
@@ -164,8 +168,9 @@ impl SubGraph {
     /// - Direct edges: both endpoints in `render_ids`, kind enabled.
     /// - Aggregated edges: for edges with at least one endpoint NOT in
     ///   `render_ids`, lift each endpoint to its nearest ancestor in the set;
-    ///   skip when unresolvable, when both lift to the same node (self-loop), or
-    ///   when one lifted endpoint is an ancestor of the other. Deduped by
+    ///   skip when unresolvable, when both lift to the same node (self-loop),
+    ///   when one lifted endpoint is an ancestor of the other, or when the
+    ///   lifted pair is already connected by a direct edge. Deduped by
     ///   (source, target) keeping the first kind seen; `count` accumulates the
     ///   number of underlying edges collapsed into each aggregated edge.
     pub fn from_graph(
@@ -180,6 +185,21 @@ impl SubGraph {
         // Preserve insertion order of aggregated edges for stable output.
         let mut agg_order: Vec<(NodeId, NodeId)> = Vec::new();
         let mut agg_map: HashMap<(NodeId, NodeId), AggregatedEdge> = HashMap::new();
+
+        // Pairs already connected by a direct edge. Aggregation must not
+        // duplicate them: e.g. a file->file Import edge plus a file->block
+        // Import edge whose block endpoint is hidden would otherwise render as
+        // two parallel edges between the same pair of nodes.
+        let direct_pairs: HashSet<(&NodeId, &NodeId)> = graph
+            .edges
+            .iter()
+            .filter(|e| {
+                enabled_edge_kinds.contains(&e.kind)
+                    && render_set.contains(&e.source)
+                    && render_set.contains(&e.target)
+            })
+            .map(|e| (&e.source, &e.target))
+            .collect();
 
         for edge in graph.edges.iter() {
             if !enabled_edge_kinds.contains(&edge.kind) {
@@ -220,6 +240,11 @@ impl SubGraph {
                 continue;
             }
 
+            // Skip pairs already connected by a direct edge.
+            if direct_pairs.contains(&(lifted_source, lifted_target)) {
+                continue;
+            }
+
             let key = (lifted_source.clone(), lifted_target.clone());
             match agg_map.get_mut(&key) {
                 Some(agg) => {
@@ -249,6 +274,119 @@ impl SubGraph {
             edges,
             aggregated_edges,
         }
+    }
+}
+
+/// A local neighborhood extracted around a focus node for drill-down rendering.
+///
+/// `node_ids` is the closure of every node reachable within `depth` hops of the
+/// focus (following edges in BOTH directions), plus the container chain
+/// (parents up to the root) of each such node so the frontend can build the ELK
+/// containment tree. `edges` are the direct edges (with resolution) among the
+/// neighborhood nodes only (excludes container-chain-only nodes that have no
+/// edge among the set).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Neighborhood {
+    pub focus: NodeId,
+    pub depth: u8,
+    pub node_ids: Vec<NodeId>,
+    pub edges: Vec<CodeEdge>,
+}
+
+impl CodeGraph {
+    /// Compute the neighborhood around `focus` by breadth-first search over both
+    /// `forward_adj` and `reverse_adj`, bounded by `depth` hops and filtered to
+    /// `enabled_edge_kinds`. Returns `None` if `focus` is not a node in the graph.
+    ///
+    /// The returned `node_ids` include, in addition to the BFS frontier, the
+    /// container chain (parents up to the root, via the `children` hierarchy) of
+    /// every discovered node, so callers can render context containers. `edges`
+    /// are the direct edges among the discovered (BFS) nodes, carrying their
+    /// resolution; container-only nodes contribute no edges.
+    ///
+    /// `depth` is clamped to `1..=2`.
+    pub fn neighborhood(
+        &self,
+        focus: &NodeId,
+        depth: u8,
+        enabled_edge_kinds: &HashSet<EdgeKind>,
+    ) -> Option<Neighborhood> {
+        if !self.nodes.contains_key(focus) {
+            return None;
+        }
+        let depth = depth.clamp(1, 2);
+
+        // BFS over both directions, tracking discovered nodes. `frontier`
+        // carries the nodes to expand at the current level.
+        let mut discovered: HashSet<NodeId> = HashSet::new();
+        discovered.insert(focus.clone());
+        let mut frontier: Vec<NodeId> = vec![focus.clone()];
+
+        for _ in 0..depth {
+            let mut next: Vec<NodeId> = Vec::new();
+            for node in frontier.drain(..) {
+                // Forward: node -> target
+                if let Some(adj) = self.forward_adj.get(&node) {
+                    for (target, edge_idx) in adj {
+                        if !enabled_edge_kinds.contains(&self.edges[*edge_idx].kind) {
+                            continue;
+                        }
+                        if discovered.insert(target.clone()) {
+                            next.push(target.clone());
+                        }
+                    }
+                }
+                // Reverse: source -> node (callers)
+                if let Some(adj) = self.reverse_adj.get(&node) {
+                    for (source, edge_idx) in adj {
+                        if !enabled_edge_kinds.contains(&self.edges[*edge_idx].kind) {
+                            continue;
+                        }
+                        if discovered.insert(source.clone()) {
+                            next.push(source.clone());
+                        }
+                    }
+                }
+            }
+            frontier = next;
+        }
+
+        // Direct edges among discovered nodes only (before adding container
+        // chains, so container-only nodes never introduce spurious edges).
+        let edges: Vec<CodeEdge> = self
+            .edges
+            .iter()
+            .filter(|e| {
+                enabled_edge_kinds.contains(&e.kind)
+                    && discovered.contains(&e.source)
+                    && discovered.contains(&e.target)
+            })
+            .cloned()
+            .collect();
+
+        // Include the container chain (parents up to root) of every discovered
+        // node so the frontend can build the containment tree.
+        let parent_map = build_parent_map(self);
+        let mut node_set: HashSet<NodeId> = discovered.clone();
+        for node in discovered.iter() {
+            let mut current = node.clone();
+            while let Some(parent) = parent_map.get(&current) {
+                if !node_set.insert(parent.clone()) {
+                    break;
+                }
+                current = parent.clone();
+            }
+        }
+
+        let mut node_ids: Vec<NodeId> = node_set.into_iter().collect();
+        node_ids.sort_by(|a, b| a.0.cmp(&b.0));
+
+        Some(Neighborhood {
+            focus: focus.clone(),
+            depth,
+            node_ids,
+            edges,
+        })
     }
 }
 
@@ -309,6 +447,7 @@ pub fn build_node_edge_kinds(graph: &CodeGraph) -> HashMap<NodeId, Vec<EdgeKind>
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Resolution;
 
     #[test]
     fn add_edge_merges_duplicates_by_kind_and_endpoint_pair() {
@@ -319,18 +458,21 @@ mod tests {
             target: NodeId("b".into()),
             kind: EdgeKind::FunctionCall,
             weight: 1,
+            resolution: Resolution::GlobalUnique,
         });
         graph.add_edge(CodeEdge {
             source: NodeId("a".into()),
             target: NodeId("b".into()),
             kind: EdgeKind::FunctionCall,
             weight: 1,
+            resolution: Resolution::GlobalUnique,
         });
         graph.add_edge(CodeEdge {
             source: NodeId("a".into()),
             target: NodeId("b".into()),
             kind: EdgeKind::MethodCall,
             weight: 1,
+            resolution: Resolution::GlobalUnique,
         });
 
         assert_eq!(graph.edges.len(), 2);
@@ -354,6 +496,7 @@ mod tests {
                 target: NodeId(format!("tgt_{}", i)),
                 kind: EdgeKind::FunctionCall,
                 weight: 1,
+                resolution: Resolution::GlobalUnique,
             });
         }
         assert_eq!(graph.edge_count(), 1000);
@@ -371,6 +514,7 @@ mod tests {
                 target: NodeId(format!("b_{}", i)),
                 kind: EdgeKind::Import,
                 weight: 1,
+                resolution: Resolution::GlobalUnique,
             });
         }
 
@@ -381,6 +525,7 @@ mod tests {
                 target: NodeId(format!("b_{}", i)),
                 kind: EdgeKind::Import,
                 weight: 1,
+                resolution: Resolution::GlobalUnique,
             });
         }
 
@@ -391,6 +536,7 @@ mod tests {
                 target: NodeId(format!("b_{}", i)),
                 kind: EdgeKind::MethodCall,
                 weight: 1,
+                resolution: Resolution::GlobalUnique,
             });
         }
 
@@ -425,6 +571,7 @@ mod tests {
                 target: NodeId("y".into()),
                 kind: EdgeKind::FunctionCall,
                 weight: 1,
+                resolution: Resolution::GlobalUnique,
             });
         }
 
@@ -449,6 +596,7 @@ mod tests {
                     EdgeKind::MethodCall
                 },
                 weight: 1,
+                resolution: Resolution::GlobalUnique,
             })
             .collect();
 
@@ -488,6 +636,7 @@ mod tests {
             target: NodeId("b".into()),
             kind: EdgeKind::Import,
             weight: 3,
+            resolution: Resolution::GlobalUnique,
         });
         // Add the same edge again
         graph.add_edge(CodeEdge {
@@ -495,12 +644,51 @@ mod tests {
             target: NodeId("b".into()),
             kind: EdgeKind::Import,
             weight: 7,
+            resolution: Resolution::GlobalUnique,
         });
 
         // Edge count should still be 1
         assert_eq!(graph.edge_count(), 1);
         // Weight should be summed
         assert_eq!(graph.edges[0].weight, 10);
+    }
+
+    #[test]
+    fn add_edge_merge_keeps_highest_confidence_resolution() {
+        let mut graph = CodeGraph::new(NodeId("root".into()));
+
+        // First add a low-confidence (Ambiguous) edge...
+        graph.add_edge(CodeEdge {
+            source: NodeId("a".into()),
+            target: NodeId("b".into()),
+            kind: EdgeKind::FunctionCall,
+            weight: 1,
+            resolution: Resolution::Ambiguous,
+        });
+        // ...then a higher-confidence (SameFile) duplicate.
+        graph.add_edge(CodeEdge {
+            source: NodeId("a".into()),
+            target: NodeId("b".into()),
+            kind: EdgeKind::FunctionCall,
+            weight: 1,
+            resolution: Resolution::SameFile,
+        });
+        // ...and a middling one that must NOT downgrade the kept resolution.
+        graph.add_edge(CodeEdge {
+            source: NodeId("a".into()),
+            target: NodeId("b".into()),
+            kind: EdgeKind::FunctionCall,
+            weight: 1,
+            resolution: Resolution::Imported,
+        });
+
+        assert_eq!(graph.edge_count(), 1);
+        assert_eq!(graph.edges[0].weight, 3, "weights still accumulate");
+        assert_eq!(
+            graph.edges[0].resolution,
+            Resolution::SameFile,
+            "merge should keep the highest-confidence resolution"
+        );
     }
 
     #[test]
@@ -534,6 +722,7 @@ mod tests {
                 target: NodeId(tgt),
                 kind,
                 weight: 1,
+                resolution: Resolution::GlobalUnique,
             });
         }
 
@@ -620,6 +809,7 @@ mod tests {
             target: NodeId(tgt.into()),
             kind,
             weight: 1,
+            resolution: Resolution::GlobalUnique,
         }
     }
 
@@ -635,6 +825,29 @@ mod tests {
         assert_eq!(sub.aggregated_edges.len(), 0);
         assert_eq!(sub.edges[0].source, NodeId("fnA1".into()));
         assert_eq!(sub.edges[0].target, NodeId("fnB1".into()));
+    }
+
+    #[test]
+    fn subgraph_aggregation_skips_pairs_with_direct_edge() {
+        // fileA imports fileB directly (file->file) AND has an Import edge to a
+        // block inside fileB (file->block). With fileB collapsed, the lifted
+        // file->block edge must NOT duplicate the direct file->file edge.
+        let mut g = sample_graph();
+        g.add_edge(edge("fileA", "fileB", EdgeKind::Import));
+        g.add_edge(edge("fileA", "fnB1", EdgeKind::Import));
+
+        let render: Vec<NodeId> = ["fileA", "fileB"]
+            .iter()
+            .map(|s| NodeId(s.to_string()))
+            .collect();
+        let sub = SubGraph::from_graph(&g, &render, &all_kinds());
+
+        assert_eq!(sub.edges.len(), 1, "one direct file->file edge");
+        assert_eq!(
+            sub.aggregated_edges.len(),
+            0,
+            "lifted file->block edge must not duplicate the direct pair"
+        );
     }
 
     #[test]
@@ -762,5 +975,122 @@ mod tests {
         assert_eq!(result.nodes.len(), g.nodes.len());
         assert!(result.node_edge_kinds.contains_key(&NodeId("fnA1".into())));
         assert!(result.node_edge_kinds.contains_key(&NodeId("fnB1".into())));
+    }
+
+    // --- Neighborhood (focus / drill-down) tests ---
+
+    fn only_import() -> HashSet<EdgeKind> {
+        [EdgeKind::Import].into_iter().collect()
+    }
+
+    #[test]
+    fn neighborhood_unknown_node_returns_none() {
+        let g = sample_graph();
+        assert!(g
+            .neighborhood(&NodeId("does_not_exist".into()), 1, &all_kinds())
+            .is_none());
+    }
+
+    #[test]
+    fn neighborhood_includes_callers_and_callees_at_depth_1() {
+        // fnA1 -> fnB1 (callee) and fnA2 -> fnA1 (caller of fnA1).
+        let mut g = sample_graph();
+        g.add_edge(edge("fnA1", "fnB1", EdgeKind::FunctionCall));
+        g.add_edge(edge("fnA2", "fnA1", EdgeKind::FunctionCall));
+
+        let n = g
+            .neighborhood(&NodeId("fnA1".into()), 1, &all_kinds())
+            .expect("known node");
+        let ids: HashSet<&str> = n.node_ids.iter().map(|id| id.0.as_str()).collect();
+
+        // BOTH the callee (fnB1) and the caller (fnA2) are within one hop.
+        assert!(ids.contains("fnA1"), "focus itself");
+        assert!(ids.contains("fnB1"), "callee reached via forward_adj");
+        assert!(ids.contains("fnA2"), "caller reached via reverse_adj");
+        // Edges among the neighborhood carry resolution.
+        assert_eq!(n.edges.len(), 2);
+        assert!(n.edges.iter().all(|e| e.resolution == Resolution::GlobalUnique));
+    }
+
+    #[test]
+    fn neighborhood_respects_depth_bounds() {
+        // Chain: fnA1 -> fnA2 -> fnB1. From fnA1 at depth 1, fnB1 is NOT reached;
+        // at depth 2 it is.
+        let mut g = sample_graph();
+        g.add_edge(edge("fnA1", "fnA2", EdgeKind::FunctionCall));
+        g.add_edge(edge("fnA2", "fnB1", EdgeKind::FunctionCall));
+
+        let d1 = g
+            .neighborhood(&NodeId("fnA1".into()), 1, &all_kinds())
+            .unwrap();
+        let ids1: HashSet<&str> = d1.node_ids.iter().map(|id| id.0.as_str()).collect();
+        assert!(ids1.contains("fnA2"), "one hop reaches fnA2");
+        assert!(!ids1.contains("fnB1"), "two hops away, excluded at depth 1");
+
+        let d2 = g
+            .neighborhood(&NodeId("fnA1".into()), 2, &all_kinds())
+            .unwrap();
+        let ids2: HashSet<&str> = d2.node_ids.iter().map(|id| id.0.as_str()).collect();
+        assert!(ids2.contains("fnB1"), "two hops away, included at depth 2");
+    }
+
+    #[test]
+    fn neighborhood_depth_is_clamped_to_1_2() {
+        let mut g = sample_graph();
+        g.add_edge(edge("fnA1", "fnA2", EdgeKind::FunctionCall));
+        // depth 0 clamps up to 1; depth 5 clamps down to 2.
+        assert_eq!(
+            g.neighborhood(&NodeId("fnA1".into()), 0, &all_kinds())
+                .unwrap()
+                .depth,
+            1
+        );
+        assert_eq!(
+            g.neighborhood(&NodeId("fnA1".into()), 5, &all_kinds())
+                .unwrap()
+                .depth,
+            2
+        );
+    }
+
+    #[test]
+    fn neighborhood_filters_by_edge_kind() {
+        // fnA1 -Import-> fnB1 and fnA1 -FunctionCall-> fnA2.
+        let mut g = sample_graph();
+        g.add_edge(edge("fnA1", "fnB1", EdgeKind::Import));
+        g.add_edge(edge("fnA1", "fnA2", EdgeKind::FunctionCall));
+
+        let n = g
+            .neighborhood(&NodeId("fnA1".into()), 1, &only_import())
+            .unwrap();
+        let ids: HashSet<&str> = n.node_ids.iter().map(|id| id.0.as_str()).collect();
+        assert!(ids.contains("fnB1"), "import neighbor kept");
+        assert!(
+            !ids.contains("fnA2"),
+            "function-call neighbor filtered out by kind"
+        );
+        // Only the import edge survives.
+        assert_eq!(n.edges.len(), 1);
+        assert_eq!(n.edges[0].kind, EdgeKind::Import);
+    }
+
+    #[test]
+    fn neighborhood_includes_container_chain() {
+        // fnA1 -> fnB1: neighborhood nodes are {fnA1, fnB1}; container chain adds
+        // their files (fileA, fileB) and the root.
+        let mut g = sample_graph();
+        g.add_edge(edge("fnA1", "fnB1", EdgeKind::FunctionCall));
+
+        let n = g
+            .neighborhood(&NodeId("fnA1".into()), 1, &all_kinds())
+            .unwrap();
+        let ids: HashSet<&str> = n.node_ids.iter().map(|id| id.0.as_str()).collect();
+        assert!(ids.contains("fileA"), "container of fnA1");
+        assert!(ids.contains("fileB"), "container of fnB1");
+        assert!(ids.contains("root"), "root of the container chain");
+        // Container-only nodes contribute no edges: still exactly the 1 direct edge.
+        assert_eq!(n.edges.len(), 1);
+        assert_eq!(n.edges[0].source, NodeId("fnA1".into()));
+        assert_eq!(n.edges[0].target, NodeId("fnB1".into()));
     }
 }

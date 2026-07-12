@@ -85,6 +85,7 @@ The PixiRenderer (orchestrator) delegates to focused sub-modules:
 1. Canvas component subscribes to graphStore changes
 2. On graph/expansion/visibility change, calls `pixiRenderer.updateGraph(graph, expanded, visible, edgeKinds)`
 3. PixiRenderer builds parent map, calls `layoutGraph()` (async)
+   - `elkLayout.ts` runs ELK in a web worker (via `elkjs/lib/elk-api` with `workerFactory: () => new ElkWorker()`, where `ElkWorker` is imported from `elkjs/lib/elk-worker.min.js?worker`). Layout computation therefore happens off the main thread, so large graphs no longer freeze the UI. `layoutGraph()` is already async and PixiRenderer already discards stale results, so no other behavior changes.
 4. On layout result, `renderFromLayout()`:
    a. Clears existing displays
    b. Creates NodeDisplay for each layout node via `createNodeDisplay()`

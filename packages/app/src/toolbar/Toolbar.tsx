@@ -25,12 +25,16 @@ export function Toolbar() {
   const isParsing = useGraphStore((s) => s.isParsing);
   const enabledEdgeKinds = useGraphStore((s) => s.enabledEdgeKinds);
   const hideUnconnectedNodes = useGraphStore((s) => s.hideUnconnectedNodes);
+  const hideAmbiguousEdges = useGraphStore((s) => s.hideAmbiguousEdges);
+  const viewMode = useGraphStore((s) => s.viewMode);
   const setRepoPath = useGraphStore((s) => s.setRepoPath);
   const setGraph = useGraphStore((s) => s.setGraph);
   const setIsParsing = useGraphStore((s) => s.setIsParsing);
   const handleParseEvent = useGraphStore((s) => s.handleParseEvent);
   const toggleEdgeKind = useGraphStore((s) => s.toggleEdgeKind);
   const setHideUnconnectedNodes = useGraphStore((s) => s.setHideUnconnectedNodes);
+  const setHideAmbiguousEdges = useGraphStore((s) => s.setHideAmbiguousEdges);
+  const setViewMode = useGraphStore((s) => s.setViewMode);
 
   const edgeLODSettings = useViewportStore((s) => s.edgeLODSettings);
   const setEdgeLODSettings = useViewportStore((s) => s.setEdgeLODSettings);
@@ -264,8 +268,47 @@ export function Toolbar() {
       {/* Spacer */}
       <div style={{ flex: 1 }} />
 
-      {/* Edge type toggles */}
-      {graph && graph.edgeCount > 0 && (
+      {/* View mode segmented control (Module | Symbol) */}
+      {graph && (
+        <div
+          role="group"
+          aria-label="View mode"
+          style={{
+            display: "flex",
+            border: "1px solid #475569",
+            borderRadius: 6,
+            overflow: "hidden",
+            marginRight: 8,
+            flexShrink: 0,
+          }}
+        >
+          {(["module", "symbol"] as const).map((mode) => (
+            <button
+              key={mode}
+              onClick={() => setViewMode(mode)}
+              title={
+                mode === "module"
+                  ? "Module view: trustworthy import graph (files collapsed)"
+                  : "Symbol view: expandable files and all edge kinds"
+              }
+              style={{
+                padding: "3px 10px",
+                fontSize: 11,
+                fontWeight: 600,
+                border: "none",
+                cursor: "pointer",
+                background: viewMode === mode ? "#3b82f6" : "#334155",
+                color: viewMode === mode ? "white" : "#cbd5e1",
+              }}
+            >
+              {mode === "module" ? "Module" : "Symbol"}
+            </button>
+          ))}
+        </div>
+      )}
+
+      {/* Edge type toggles (symbol view only -- module view is import-only) */}
+      {graph && graph.edgeCount > 0 && viewMode === "symbol" && (
         <div
           style={{
             display: "flex",
@@ -300,6 +343,33 @@ export function Toolbar() {
               }}
             />
             Hide unconnected
+          </label>
+
+          <label
+            title="Hide ambiguous edges: low-confidence guesses where a name matched multiple candidates"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 5,
+              fontSize: 11,
+              color: "#cbd5e1",
+              whiteSpace: "nowrap",
+              marginRight: 8,
+              cursor: "pointer",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={hideAmbiguousEdges}
+              onChange={(e) => setHideAmbiguousEdges(e.currentTarget.checked)}
+              style={{
+                cursor: "pointer",
+                width: 13,
+                height: 13,
+                margin: 0,
+              }}
+            />
+            Hide ambiguous
           </label>
 
           <span

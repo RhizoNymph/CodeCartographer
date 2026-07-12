@@ -1,5 +1,6 @@
-import ELK, { type ElkNode, type ElkExtendedEdge } from "elkjs/lib/elk.bundled.js";
-import type { CodeGraph, CodeNode, EdgeKind } from "../../api/types";
+import ELK, { type ElkNode, type ElkExtendedEdge } from "elkjs/lib/elk-api";
+import ElkWorker from "elkjs/lib/elk-worker.min.js?worker";
+import type { CodeGraph, CodeNode, EdgeKind, Resolution } from "../../api/types";
 import { EDGE_COLORS } from "../../api/types";
 import { getSubgraph } from "../../api/commands";
 import { useDebugStore } from "../../stores/debugStore";
@@ -12,7 +13,7 @@ import {
 } from "./edgeGeometry";
 import { getNodeSize } from "../utils/graphUtils";
 
-const elk = new ELK();
+const elk = new ELK({ workerFactory: () => new ElkWorker() });
 
 /** Above this many rendered nodes, ELK edge routing is skipped for performance. */
 const EDGE_ROUTING_NODE_LIMIT = 1500;
@@ -30,7 +31,9 @@ const ALL_EDGE_KINDS: EdgeKind[] = [
 /**
  * A view edge with resolved display info, ready to feed to ELK and extractLayout.
  * `kind` is null-safe: aggregated edges carry the kind of the first underlying
- * edge; `weight`/`count` drive tooltip counts and edge-width scaling.
+ * edge; `count` drives tooltip counts and edge-width scaling. `resolution` is
+ * null for aggregated edges (no single confidence) and carries the direct
+ * edge's confidence otherwise (drives ambiguous styling).
  */
 interface ViewEdge {
   source: string;
@@ -38,6 +41,7 @@ interface ViewEdge {
   color: string;
   kind: EdgeKind | null;
   count: number;
+  resolution: Resolution | null;
 }
 
 export interface LayoutNodePosition {
@@ -54,6 +58,8 @@ export interface LayoutEdge {
   kind: EdgeKind | null; // null when the underlying kind is unknown
   /** Number of underlying edges (1 for direct, N for aggregated). Drives tooltip count + width. */
   count: number;
+  /** Resolution confidence for direct edges; null for aggregated edges. */
+  resolution: Resolution | null;
   points: Point[];
   sourceAnchor: EdgeAnchor;
   targetAnchor: EdgeAnchor;
@@ -120,7 +126,8 @@ export async function layoutGraph(
   graph: CodeGraph,
   expandedNodes: Set<string>,
   visibleNodes: Set<string>,
-  enabledEdgeKinds?: Set<EdgeKind>
+  enabledEdgeKinds?: Set<EdgeKind>,
+  hideAmbiguousEdges = false
 ): Promise<LayoutResult> {
   const rootNode = graph.nodes[graph.root];
   if (!rootNode) {
@@ -167,12 +174,16 @@ export async function layoutGraph(
   try {
     const sub = await getSubgraph(renderIds, enabledKinds);
     for (const e of sub.edges) {
+      // Ambiguous direct edges can be hidden client-side (imports are exact so
+      // this only ever affects reference edges).
+      if (hideAmbiguousEdges && e.resolution === "Ambiguous") continue;
       viewEdges.push({
         source: e.source,
         target: e.target,
         color: EDGE_COLORS[e.kind] || "#64748b",
         kind: e.kind,
         count: e.weight,
+        resolution: e.resolution,
       });
     }
     for (const ae of sub.aggregated_edges) {
@@ -182,6 +193,7 @@ export async function layoutGraph(
         color: EDGE_COLORS[ae.kind] || "#64748b",
         kind: ae.kind,
         count: ae.count,
+        resolution: null,
       });
     }
   } catch (err) {
@@ -325,6 +337,7 @@ function extractLayout(
         const color = info?.color ?? "#64748b";
         const kind = info?.kind ?? null;
         const count = info?.count ?? 1;
+        const resolution = info?.resolution ?? null;
 
         const points: Point[] = [];
         if (edge.sections) {
@@ -390,6 +403,7 @@ function extractLayout(
             color,
             kind,
             count,
+            resolution,
             points: anchorEdgePolyline(
               normalizedPoints,
               sourcePos,
@@ -426,7 +440,8 @@ function extractLayout(
       target: string,
       color: string,
       kind: EdgeKind | null,
-      count: number
+      count: number,
+      resolution: Resolution | null
     ): LayoutEdge | null => {
       const sourcePos = result.nodes[source];
       const targetPos = result.nodes[target];
@@ -472,6 +487,7 @@ function extractLayout(
         color,
         kind,
         count,
+        resolution,
         points: anchorEdgePolyline(
           [startPoint, endPoint],
           sourcePos,
@@ -492,7 +508,8 @@ function extractLayout(
         ve.target,
         ve.color,
         ve.kind,
-        ve.count
+        ve.count,
+        ve.resolution
       );
       if (fallbackEdge) {
         result.edges.push(fallbackEdge);

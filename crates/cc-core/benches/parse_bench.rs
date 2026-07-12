@@ -305,6 +305,7 @@ fn bench_extract_many_files(c: &mut Criterion) {
 fn bench_full_pipeline(c: &mut Criterion) {
     use cc_core::model::{CodeGraph, CodeNode, NodeId};
     use cc_core::resolver::SymbolTable;
+    use std::collections::HashMap;
 
     let mut group = c.benchmark_group("full_pipeline");
 
@@ -355,7 +356,7 @@ fn bench_full_pipeline(c: &mut Criterion) {
 
                 // Resolve references into edges
                 let symbol_table = SymbolTable::build_from_graph(&graph);
-                let edges = symbol_table.resolve_references(&all_refs);
+                let edges = symbol_table.resolve_references(&all_refs, &HashMap::new());
                 for edge in edges {
                     graph.add_edge(edge);
                 }

@@ -20,7 +20,7 @@ export default defineConfig({
       output: {
         manualChunks: {
           pixi: ["pixi.js"],
-          elk: ["elkjs/lib/elk.bundled.js"],
+          elk: ["elkjs/lib/elk-api"],
           vendor: ["react", "react-dom", "zustand"],
         },
       },

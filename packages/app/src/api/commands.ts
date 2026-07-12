@@ -1,5 +1,5 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
-import type { ParseEvent, ParseResult, SubGraph } from "./types";
+import type { ParseEvent, ParseResult, SubGraph, Neighborhood } from "./types";
 
 export async function scanRepo(path: string): Promise<ParseResult> {
   return invoke<ParseResult>("scan_repo", { path });
@@ -29,6 +29,24 @@ export async function getSubgraph(
 ): Promise<SubGraph> {
   return invoke<SubGraph>("get_subgraph", {
     renderIds,
+    edgeKinds,
+  });
+}
+
+/**
+ * Fetch the local neighborhood around `nodeId` for focus / drill-down. BFS over
+ * both edge directions bounded by `depth` (1 or 2 hops), filtered to
+ * `edgeKinds`. Returns the neighborhood node ids (incl. container chain) and the
+ * direct edges among them.
+ */
+export async function getNeighborhood(
+  nodeId: string,
+  depth: number,
+  edgeKinds: string[]
+): Promise<Neighborhood> {
+  return invoke<Neighborhood>("get_neighborhood", {
+    nodeId,
+    depth,
     edgeKinds,
   });
 }

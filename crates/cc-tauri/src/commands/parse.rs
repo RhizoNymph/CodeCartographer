@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use cc_core::model::{
-    CodeGraph, CodeNode, EdgeKind, Language, NodeId, ParseResult, SubGraph,
+    CodeGraph, CodeNode, EdgeKind, Language, Neighborhood, NodeId, ParseResult, SubGraph,
 };
 use cc_core::parser::{Extractor, ParseEvent};
 use cc_core::resolver::{ImportResolver, SymbolTable};
@@ -134,7 +134,19 @@ pub async fn parse_repo(
         }
     }
 
-    let edges = symbol_table.resolve_references(&all_refs);
+    // Resolve import paths FIRST: this yields file-level import edges and an
+    // import map (source file -> imported files) that the symbol resolver uses
+    // as the "imported" tier of its precision ladder.
+    let (import_edges, import_map) = ImportResolver::resolve(&graph, &all_refs);
+    tracing::info!("Resolved {} file-level import edges", import_edges.len());
+    for edge in &import_edges {
+        graph.add_edge(edge.clone());
+    }
+    tracing::info!("Graph now has {} edges after adding", graph.edges.len());
+
+    // Resolve references into edges via the precision ladder (uses import_map),
+    // so each edge carries a Resolution confidence.
+    let edges = symbol_table.resolve_references(&all_refs, &import_map);
     tracing::info!(
         "Resolved {} refs into {} edges (symbols: {})",
         all_refs.len(),
@@ -142,14 +154,6 @@ pub async fn parse_repo(
         symbol_table.symbols.len()
     );
     for edge in &edges {
-        graph.add_edge(edge.clone());
-    }
-    tracing::info!("Graph now has {} edges after adding", graph.edges.len());
-
-    // Resolve import paths to file-level edges
-    let import_edges = ImportResolver::resolve(&graph, &all_refs);
-    tracing::info!("Resolved {} file-level import edges", import_edges.len());
-    for edge in &import_edges {
         graph.add_edge(edge.clone());
     }
 
@@ -226,7 +230,15 @@ pub async fn get_subgraph(
         .ok_or_else(|| "No graph in state. Run scan_repo first.".to_string())?;
 
     let render: Vec<NodeId> = render_ids.into_iter().map(NodeId).collect();
-    let kinds: HashSet<EdgeKind> = edge_kinds
+    let kinds = parse_edge_kinds(edge_kinds)?;
+
+    Ok(SubGraph::from_graph(graph, &render, &kinds))
+}
+
+/// Parse a list of edge-kind names into a set of `EdgeKind`, erroring on any
+/// unknown name. Shared by `get_subgraph` and `get_neighborhood`.
+fn parse_edge_kinds(edge_kinds: Vec<String>) -> Result<HashSet<EdgeKind>, String> {
+    edge_kinds
         .into_iter()
         .map(|s| match s.as_str() {
             "Import" => Ok(EdgeKind::Import),
@@ -238,16 +250,42 @@ pub async fn get_subgraph(
             "VariableUsage" => Ok(EdgeKind::VariableUsage),
             other => Err(format!("Unknown edge kind: {}", other)),
         })
-        .collect::<Result<_, _>>()?;
+        .collect()
+}
 
-    Ok(SubGraph::from_graph(graph, &render, &kinds))
+/// Compute the local neighborhood around `node_id` for focus / drill-down. BFS
+/// over both forward and reverse adjacency, bounded by `depth` (clamped to
+/// 1..=2) and filtered to `edge_kinds`. Returns the neighborhood node ids
+/// (including the container chain up to the root) and the direct edges among
+/// them (carrying resolution). Errors if the node is unknown.
+#[command]
+pub async fn get_neighborhood(
+    node_id: String,
+    depth: u8,
+    edge_kinds: Vec<String>,
+    state: tauri::State<'_, GraphState>,
+) -> Result<Neighborhood, String> {
+    let guard = state
+        .0
+        .lock()
+        .map_err(|e| format!("Lock poisoned: {}", e))?;
+    let graph = guard
+        .as_ref()
+        .ok_or_else(|| "No graph in state. Run scan_repo first.".to_string())?;
+
+    let kinds = parse_edge_kinds(edge_kinds)?;
+    let focus = NodeId(node_id);
+
+    graph
+        .neighborhood(&focus, depth, &kinds)
+        .ok_or_else(|| format!("Unknown node: {}", focus))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use cc_core::model::{
-        BlockKind, CodeEdge, CodeNode, EdgeKind, NodeId, Span, Visibility,
+        BlockKind, CodeEdge, CodeNode, EdgeKind, NodeId, Resolution, Span, Visibility,
     };
 
     fn file_node(id: &str) -> CodeNode {
@@ -295,6 +333,7 @@ mod tests {
             target: block_id.clone(),
             kind: EdgeKind::FunctionCall,
             weight: 1,
+            resolution: Resolution::GlobalUnique,
         });
 
         strip_parsed_state(&mut graph);
@@ -329,6 +368,7 @@ mod tests {
             target: block_id,
             kind: EdgeKind::FunctionCall,
             weight: 1,
+            resolution: Resolution::GlobalUnique,
         });
 
         strip_parsed_state(&mut graph);

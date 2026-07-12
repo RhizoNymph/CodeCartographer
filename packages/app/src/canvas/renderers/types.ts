@@ -5,7 +5,7 @@
  * PixiRenderer, EdgeDrawingManager, DragManager, and nodeCreation all operate on.
  */
 
-import type { CodeNode, EdgeKind } from "../../api/types";
+import type { CodeNode, EdgeKind, Resolution } from "../../api/types";
 import type { EdgeAnchor, Point } from "../layout/edgeGeometry";
 
 // Re-export NodeDisplay from nodeCreation (canonical definition lives there).
@@ -39,6 +39,8 @@ export interface EdgeDatum {
   target: string;
   color: string;
   kind: EdgeKind | null;
+  /** Resolution confidence; "Ambiguous" edges are rendered dashed/dimmed. */
+  resolution: Resolution | null;
   originalPoints: Point[];
   sourceAnchor: EdgeAnchor;
   targetAnchor: EdgeAnchor;

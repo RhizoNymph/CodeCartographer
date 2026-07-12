@@ -3,6 +3,7 @@ import { Toolbar } from "./toolbar/Toolbar";
 import { Sidebar } from "./sidebar/Sidebar";
 import { Canvas } from "./canvas/Canvas";
 import { Tooltip } from "./canvas/Tooltip";
+import { FocusBreadcrumb } from "./canvas/FocusBreadcrumb";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { useGraphStore } from "./stores/graphStore";
 
@@ -42,6 +43,7 @@ export function App() {
           <Canvas />
         </ErrorBoundary>
         <Tooltip />
+        <FocusBreadcrumb />
       </div>
     </div>
   );

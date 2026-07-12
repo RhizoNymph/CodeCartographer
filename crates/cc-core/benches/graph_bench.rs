@@ -1,6 +1,6 @@
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 
-use cc_core::model::{CodeEdge, CodeGraph, EdgeKind, NodeId};
+use cc_core::model::{CodeEdge, CodeGraph, EdgeKind, NodeId, Resolution};
 
 /// Build a graph pre-loaded with `n` unique edges so we can benchmark add_edge
 /// against a populated graph (the hot path for duplicate checking).
@@ -12,6 +12,7 @@ fn make_graph_with_edges(n: usize) -> CodeGraph {
             target: NodeId(format!("tgt_{i}")),
             kind: EdgeKind::FunctionCall,
             weight: 1,
+            resolution: Resolution::GlobalUnique,
         });
     }
     graph
@@ -30,6 +31,7 @@ fn bench_add_edge_unique(c: &mut Criterion) {
                         target: NodeId(format!("tgt_{i}")),
                         kind: EdgeKind::FunctionCall,
                         weight: 1,
+                        resolution: Resolution::GlobalUnique,
                     });
                 }
                 black_box(&graph);
@@ -54,6 +56,7 @@ fn bench_add_edge_all_duplicates(c: &mut Criterion) {
                         target: NodeId("b".into()),
                         kind: EdgeKind::FunctionCall,
                         weight: 1,
+                        resolution: Resolution::GlobalUnique,
                     });
                 }
                 black_box(&graph);
@@ -81,6 +84,7 @@ fn bench_add_edge_mixed(c: &mut Criterion) {
                             target: NodeId(format!("hot_tgt_{hot}")),
                             kind: EdgeKind::FunctionCall,
                             weight: 1,
+                            resolution: Resolution::GlobalUnique,
                         }
                     } else {
                         CodeEdge {
@@ -88,6 +92,7 @@ fn bench_add_edge_mixed(c: &mut Criterion) {
                             target: NodeId(format!("tgt_{i}")),
                             kind: EdgeKind::FunctionCall,
                             weight: 1,
+                            resolution: Resolution::GlobalUnique,
                         }
                     }
                 })
@@ -144,6 +149,7 @@ fn bench_subgraph_extraction(c: &mut Criterion) {
                 target: NodeId(format!("file_{}", (i + 1) % total)),
                 kind: EdgeKind::Import,
                 weight: 1,
+                resolution: Resolution::GlobalUnique,
             });
         }
 

@@ -79,15 +79,27 @@ impl LanguageSupport for RustSupport {
         let current = *node;
         match current.kind() {
             "use_declaration" => {
-                if let Some(name) = Extractor::extract_use_name(&current, source) {
-                    refs.push(RawReference {
-                        from_node: from_id.clone(),
-                        kind: RawRefKind::Import {
-                            module_path: name.clone(),
-                        },
-                        name,
-                        span: Extractor::node_span(&current),
-                    });
+                // Expand the use tree into full paths so the import resolver
+                // can map them to files: `use crate::model::{graph, edge};`
+                // yields "crate::model::graph" and "crate::model::edge".
+                if let Some(argument) = current.child_by_field_name("argument") {
+                    for full_path in expand_use_paths(&argument, source) {
+                        // The symbol name is the last real path segment
+                        // (skipping a trailing `*` from wildcard imports).
+                        let name = full_path
+                            .rsplit("::")
+                            .find(|seg| *seg != "*")
+                            .unwrap_or(&full_path)
+                            .to_string();
+                        refs.push(RawReference {
+                            from_node: from_id.clone(),
+                            kind: RawRefKind::Import {
+                                module_path: full_path,
+                            },
+                            name,
+                            span: Extractor::node_span(&current),
+                        });
+                    }
                 }
             }
             "call_expression" => {
@@ -146,6 +158,76 @@ impl LanguageSupport for RustSupport {
 
     fn tree_sitter_language(&self) -> tree_sitter::Language {
         tree_sitter_rust::LANGUAGE.into()
+    }
+}
+
+/// Expand a `use` tree into full module paths. `use crate::model::{graph, edge as E};`
+/// yields `["crate::model::graph", "crate::model::edge"]`; a wildcard
+/// `use crate::model::*;` yields the module itself (`["crate::model"]`); and
+/// `use a::b::{self, c}` maps `self` to the prefix (`["a::b", "a::b::c"]`).
+fn expand_use_paths(node: &tree_sitter::Node, source: &str) -> Vec<String> {
+    fn text(n: &tree_sitter::Node, source: &str) -> String {
+        n.utf8_text(source.as_bytes())
+            .unwrap_or("")
+            .trim()
+            .to_string()
+    }
+
+    match node.kind() {
+        "use_list" => {
+            let mut out = Vec::new();
+            let mut cursor = node.walk();
+            for child in node.children(&mut cursor) {
+                if child.is_named() {
+                    out.extend(expand_use_paths(&child, source));
+                }
+            }
+            out
+        }
+        "scoped_use_list" => {
+            let prefix = node
+                .child_by_field_name("path")
+                .map(|p| text(&p, source))
+                .unwrap_or_default();
+            let mut out = Vec::new();
+            if let Some(list) = node.child_by_field_name("list") {
+                for item in expand_use_paths(&list, source) {
+                    if prefix.is_empty() {
+                        out.push(item);
+                    } else if item == "self" {
+                        // `use a::b::{self, c}` -- `self` is the module itself.
+                        out.push(prefix.clone());
+                    } else {
+                        out.push(format!("{}::{}", prefix, item));
+                    }
+                }
+            }
+            out
+        }
+        "use_as_clause" => node
+            .child_by_field_name("path")
+            .map(|p| expand_use_paths(&p, source))
+            .unwrap_or_default(),
+        "use_wildcard" => {
+            // `path::*` imports the module itself.
+            let t = text(node, source);
+            let t = t.trim_end_matches('*').trim_end_matches("::").to_string();
+            if t.is_empty() {
+                Vec::new()
+            } else {
+                vec![t]
+            }
+        }
+        // identifier, scoped_identifier, crate, self, super, ... -- the node
+        // text is already a full path.
+        _ => {
+            let t = text(node, source);
+            if t.is_empty() {
+                Vec::new()
+            } else {
+                vec![t]
+            }
+        }
     }
 }
 
