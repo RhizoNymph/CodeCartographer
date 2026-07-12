@@ -364,6 +364,12 @@ function renderSingleEdge(
   showStartCap: boolean,
   dashed = false
 ): void {
+  // Degenerate polylines (routing can collapse edges whose endpoints coincide,
+  // e.g. mid-drag) cannot be stroked and would crash the arrowhead indexing.
+  if (points.length < 2) {
+    return;
+  }
+
   if (dashed) {
     drawDashedPolyline(gfx, points, DASH_LENGTH, DASH_GAP);
   } else {

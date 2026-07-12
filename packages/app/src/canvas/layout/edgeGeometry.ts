@@ -601,12 +601,28 @@ export function routePolylineAroundObstacles(
   referencePolylines: Point[][] = []
 ): Point[] {
   if (points.length < 2 || obstacles.length === 0) {
-    return normalizeRoutedPolyline(points);
+    return ensureDrawablePolyline(normalizeRoutedPolyline(points), points);
   }
 
   const inflatedObstacles = obstacles.map((box) => inflateBox(box, NODE_OBSTACLE_MARGIN));
   const normalized = normalizeRoutedPolyline(points);
-  return routeByLocalObstacleDetours(normalized, inflatedObstacles, referencePolylines);
+  return ensureDrawablePolyline(
+    routeByLocalObstacleDetours(normalized, inflatedObstacles, referencePolylines),
+    points
+  );
+}
+
+/**
+ * Normalization (orthogonalize + loop erasure) can collapse a degenerate
+ * polyline below 2 points -- e.g. while dragging a node on top of its edge
+ * partner both endpoints coincide. Fall back to the original endpoints so
+ * callers can always draw a segment (a zero-length one renders as nothing).
+ */
+function ensureDrawablePolyline(routed: Point[], original: Point[]): Point[] {
+  if (routed.length >= 2 || original.length < 2) {
+    return routed;
+  }
+  return [original[0], original[original.length - 1]];
 }
 
 function segmentMatchesAnchorAxis(from: Point, to: Point, side: EdgeAnchorSide): boolean {
