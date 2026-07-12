@@ -31,7 +31,7 @@ Features Index:
         doc: docs/features/canvas-rendering.md
 
     graph-layout:
-        description: ELK-based hierarchical graph layout. Fetches per-view direct + aggregated edges from the backend (get_subgraph) rather than filtering client-side, feeds them to ELK for routing, and falls back to straight-line edges (also used as the layout guard for views over 1500 rendered nodes).
+        description: ELK-based hierarchical graph layout running in a web worker (elk-api + elk-worker.min.js?worker) so layout does not block the UI thread. Fetches per-view direct + aggregated edges from the backend (get_subgraph) rather than filtering client-side, feeds them to ELK for routing, and falls back to straight-line edges (also used as the layout guard for views over 1500 rendered nodes).
         entry_points: [packages/app/src/canvas/layout/elkLayout.ts]
         depends_on: [graph-model]
         doc: docs/features/graph-layout.md

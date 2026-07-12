@@ -1,4 +1,5 @@
-import ELK, { type ElkNode, type ElkExtendedEdge } from "elkjs/lib/elk.bundled.js";
+import ELK, { type ElkNode, type ElkExtendedEdge } from "elkjs/lib/elk-api";
+import ElkWorker from "elkjs/lib/elk-worker.min.js?worker";
 import type { CodeGraph, CodeNode, EdgeKind, Resolution } from "../../api/types";
 import { EDGE_COLORS } from "../../api/types";
 import { getSubgraph } from "../../api/commands";
@@ -12,7 +13,7 @@ import {
 } from "./edgeGeometry";
 import { getNodeSize } from "../utils/graphUtils";
 
-const elk = new ELK();
+const elk = new ELK({ workerFactory: () => new ElkWorker() });
 
 /** Above this many rendered nodes, ELK edge routing is skipped for performance. */
 const EDGE_ROUTING_NODE_LIMIT = 1500;
