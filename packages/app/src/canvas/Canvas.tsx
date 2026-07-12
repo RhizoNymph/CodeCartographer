@@ -17,6 +17,7 @@ export function Canvas() {
     hoveredNodeId,
     enabledEdgeKinds,
     hideUnconnectedNodes,
+    hideAmbiguousEdges,
     layoutVersion,
   } = useGraphStore(
     useShallow((s) => ({
@@ -27,6 +28,7 @@ export function Canvas() {
       hoveredNodeId: s.hoveredNodeId,
       enabledEdgeKinds: s.enabledEdgeKinds,
       hideUnconnectedNodes: s.hideUnconnectedNodes,
+      hideAmbiguousEdges: s.hideAmbiguousEdges,
       layoutVersion: s.layoutVersion,
     }))
   );
@@ -74,9 +76,15 @@ export function Canvas() {
       layoutVersion,
     });
     if (rendererRef.current && graph) {
-      rendererRef.current.updateGraph(graph, expandedNodes, displayVisibleNodes, enabledEdgeKinds);
+      rendererRef.current.updateGraph(
+        graph,
+        expandedNodes,
+        displayVisibleNodes,
+        enabledEdgeKinds,
+        hideAmbiguousEdges
+      );
     }
-  }, [graph, layoutVersion, enabledEdgeKinds]);
+  }, [graph, layoutVersion, enabledEdgeKinds, hideAmbiguousEdges]);
 
   // Update visibility immediately when nodes are checked/unchecked (without full relayout)
   useEffect(() => {

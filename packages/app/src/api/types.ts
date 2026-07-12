@@ -32,6 +32,17 @@ export type EdgeKind =
   | "TraitImpl"
   | "VariableUsage";
 
+/**
+ * How confidently a reference was resolved to its target. Matches the Rust
+ * `Resolution` enum's serde output (externally-tagged unit variants serialize
+ * to their plain variant name). Ordered worst -> best.
+ */
+export type Resolution =
+  | "Ambiguous"
+  | "GlobalUnique"
+  | "Imported"
+  | "SameFile";
+
 export interface DirectoryNode {
   type: "Directory";
   id: string;
@@ -68,6 +79,7 @@ export interface CodeEdge {
   target: string;
   kind: EdgeKind;
   weight: number;
+  resolution: Resolution;
 }
 
 export interface AggregatedEdge {

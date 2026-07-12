@@ -41,6 +41,10 @@ impl CodeGraph {
     pub fn add_edge(&mut self, edge: CodeEdge) {
         if let Some(idx) = self.edge_index.get(&edge.source, &edge.target, &edge.kind) {
             self.edges[idx].weight = self.edges[idx].weight.saturating_add(edge.weight);
+            // Keep the highest-confidence resolution among the merged duplicates.
+            if edge.resolution > self.edges[idx].resolution {
+                self.edges[idx].resolution = edge.resolution;
+            }
             return;
         }
         let idx = self.edges.len();
@@ -137,6 +141,7 @@ impl SubGraph {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::model::Resolution;
 
     #[test]
     fn add_edge_merges_duplicates_by_kind_and_endpoint_pair() {
@@ -147,18 +152,21 @@ mod tests {
             target: NodeId("b".into()),
             kind: EdgeKind::FunctionCall,
             weight: 1,
+            resolution: Resolution::GlobalUnique,
         });
         graph.add_edge(CodeEdge {
             source: NodeId("a".into()),
             target: NodeId("b".into()),
             kind: EdgeKind::FunctionCall,
             weight: 1,
+            resolution: Resolution::GlobalUnique,
         });
         graph.add_edge(CodeEdge {
             source: NodeId("a".into()),
             target: NodeId("b".into()),
             kind: EdgeKind::MethodCall,
             weight: 1,
+            resolution: Resolution::GlobalUnique,
         });
 
         assert_eq!(graph.edges.len(), 2);
@@ -182,6 +190,7 @@ mod tests {
                 target: NodeId(format!("tgt_{}", i)),
                 kind: EdgeKind::FunctionCall,
                 weight: 1,
+                resolution: Resolution::GlobalUnique,
             });
         }
         assert_eq!(graph.edge_count(), 1000);
@@ -199,6 +208,7 @@ mod tests {
                 target: NodeId(format!("b_{}", i)),
                 kind: EdgeKind::Import,
                 weight: 1,
+                resolution: Resolution::GlobalUnique,
             });
         }
 
@@ -209,6 +219,7 @@ mod tests {
                 target: NodeId(format!("b_{}", i)),
                 kind: EdgeKind::Import,
                 weight: 1,
+                resolution: Resolution::GlobalUnique,
             });
         }
 
@@ -219,6 +230,7 @@ mod tests {
                 target: NodeId(format!("b_{}", i)),
                 kind: EdgeKind::MethodCall,
                 weight: 1,
+                resolution: Resolution::GlobalUnique,
             });
         }
 
@@ -253,6 +265,7 @@ mod tests {
                 target: NodeId("y".into()),
                 kind: EdgeKind::FunctionCall,
                 weight: 1,
+                resolution: Resolution::GlobalUnique,
             });
         }
 
@@ -277,6 +290,7 @@ mod tests {
                     EdgeKind::MethodCall
                 },
                 weight: 1,
+                resolution: Resolution::GlobalUnique,
             })
             .collect();
 
@@ -316,6 +330,7 @@ mod tests {
             target: NodeId("b".into()),
             kind: EdgeKind::Import,
             weight: 3,
+            resolution: Resolution::GlobalUnique,
         });
         // Add the same edge again
         graph.add_edge(CodeEdge {
@@ -323,12 +338,51 @@ mod tests {
             target: NodeId("b".into()),
             kind: EdgeKind::Import,
             weight: 7,
+            resolution: Resolution::GlobalUnique,
         });
 
         // Edge count should still be 1
         assert_eq!(graph.edge_count(), 1);
         // Weight should be summed
         assert_eq!(graph.edges[0].weight, 10);
+    }
+
+    #[test]
+    fn add_edge_merge_keeps_highest_confidence_resolution() {
+        let mut graph = CodeGraph::new(NodeId("root".into()));
+
+        // First add a low-confidence (Ambiguous) edge...
+        graph.add_edge(CodeEdge {
+            source: NodeId("a".into()),
+            target: NodeId("b".into()),
+            kind: EdgeKind::FunctionCall,
+            weight: 1,
+            resolution: Resolution::Ambiguous,
+        });
+        // ...then a higher-confidence (SameFile) duplicate.
+        graph.add_edge(CodeEdge {
+            source: NodeId("a".into()),
+            target: NodeId("b".into()),
+            kind: EdgeKind::FunctionCall,
+            weight: 1,
+            resolution: Resolution::SameFile,
+        });
+        // ...and a middling one that must NOT downgrade the kept resolution.
+        graph.add_edge(CodeEdge {
+            source: NodeId("a".into()),
+            target: NodeId("b".into()),
+            kind: EdgeKind::FunctionCall,
+            weight: 1,
+            resolution: Resolution::Imported,
+        });
+
+        assert_eq!(graph.edge_count(), 1);
+        assert_eq!(graph.edges[0].weight, 3, "weights still accumulate");
+        assert_eq!(
+            graph.edges[0].resolution,
+            Resolution::SameFile,
+            "merge should keep the highest-confidence resolution"
+        );
     }
 
     #[test]
@@ -362,6 +416,7 @@ mod tests {
                 target: NodeId(tgt),
                 kind,
                 weight: 1,
+                resolution: Resolution::GlobalUnique,
             });
         }
 

@@ -1,5 +1,5 @@
 import ELK, { type ElkNode, type ElkExtendedEdge } from "elkjs/lib/elk.bundled.js";
-import type { CodeGraph, CodeNode, CodeEdge, EdgeKind } from "../../api/types";
+import type { CodeGraph, CodeNode, CodeEdge, EdgeKind, Resolution } from "../../api/types";
 import { EDGE_COLORS } from "../../api/types";
 import { useDebugStore } from "../../stores/debugStore";
 import {
@@ -46,16 +46,19 @@ function computeAggregatedEdges(
   graph: CodeGraph,
   elkNodeIds: Set<string>,
   parentMap: Map<string, string>,
-  enabledEdgeKinds?: Set<EdgeKind>
+  enabledEdgeKinds?: Set<EdgeKind>,
+  hideAmbiguousEdges = false
 ): Array<{ source: string; target: string; color: string; kind: EdgeKind | null }> {
   // Use a Map to deduplicate edges by source-target pair
   // Key: "source->target", Value: { color, kind } (we pick one, could aggregate later)
   const aggregatedMap = new Map<string, { color: string; kind: EdgeKind }>();
 
-  // Filter edges by enabled kinds
-  const filteredEdges = enabledEdgeKinds
-    ? graph.edges.filter((e) => enabledEdgeKinds.has(e.kind))
-    : graph.edges;
+  // Filter edges by enabled kinds and, optionally, hide ambiguous edges.
+  const filteredEdges = graph.edges.filter(
+    (e) =>
+      (!enabledEdgeKinds || enabledEdgeKinds.has(e.kind)) &&
+      !(hideAmbiguousEdges && e.resolution === "Ambiguous")
+  );
 
   for (const edge of filteredEdges) {
     const sourceInTree = elkNodeIds.has(edge.source);
@@ -119,6 +122,7 @@ export interface LayoutEdge {
   target: string;
   color: string;
   kind: EdgeKind | null; // null for aggregated edges
+  resolution: Resolution | null; // null for aggregated edges
   points: Point[];
   sourceAnchor: EdgeAnchor;
   targetAnchor: EdgeAnchor;
@@ -185,7 +189,8 @@ export async function layoutGraph(
   graph: CodeGraph,
   expandedNodes: Set<string>,
   visibleNodes: Set<string>,
-  enabledEdgeKinds?: Set<EdgeKind>
+  enabledEdgeKinds?: Set<EdgeKind>,
+  hideAmbiguousEdges = false
 ): Promise<LayoutResult> {
   const rootNode = graph.nodes[graph.root];
   if (!rootNode) {
@@ -224,10 +229,12 @@ export async function layoutGraph(
   // Build parent map for finding visible ancestors
   const parentMap = buildParentMap(graph);
 
-  // Filter edges by enabled edge kinds first
-  const kindFilteredEdges = enabledEdgeKinds
-    ? graph.edges.filter((e) => enabledEdgeKinds.has(e.kind))
-    : graph.edges;
+  // Filter edges by enabled edge kinds first, and optionally hide ambiguous edges.
+  const kindFilteredEdges = graph.edges.filter(
+    (e) =>
+      (!enabledEdgeKinds || enabledEdgeKinds.has(e.kind)) &&
+      !(hideAmbiguousEdges && e.resolution === "Ambiguous")
+  );
 
   // Build edges - only include edges where both endpoints are in the ELK tree
   const edgesInTree = kindFilteredEdges.filter(
@@ -238,7 +245,13 @@ export async function layoutGraph(
   );
 
   // Compute aggregated edges for collapsed containers
-  const aggregatedEdges = computeAggregatedEdges(graph, elkNodeIds, parentMap, enabledEdgeKinds);
+  const aggregatedEdges = computeAggregatedEdges(
+    graph,
+    elkNodeIds,
+    parentMap,
+    enabledEdgeKinds,
+    hideAmbiguousEdges
+  );
 
   if (import.meta.env.DEV) {
     useDebugStore.getState().addLog(
@@ -384,15 +397,18 @@ function extractLayout(
 
         let color: string;
         let kind: EdgeKind | null;
+        let resolution: Resolution | null;
         if (aggInfo) {
           color = aggInfo.color;
           kind = aggInfo.kind;
+          resolution = null; // aggregated edges have no single resolution
         } else {
           const graphEdge = edgeLookup.get(`${sourceId}->${targetId}`);
           color = graphEdge
             ? EDGE_COLORS[graphEdge.kind]
             : "#64748b";
           kind = graphEdge?.kind ?? null;
+          resolution = graphEdge?.resolution ?? null;
         }
 
         const points: Point[] = [];
@@ -458,6 +474,7 @@ function extractLayout(
             target: targetId,
             color,
             kind,
+            resolution,
             points: anchorEdgePolyline(
               normalizedPoints,
               sourcePos,
@@ -492,7 +509,8 @@ function extractLayout(
       source: string,
       target: string,
       color: string,
-      kind: EdgeKind | null
+      kind: EdgeKind | null,
+      resolution: Resolution | null
     ): LayoutEdge | null => {
       const sourcePos = result.nodes[source];
       const targetPos = result.nodes[target];
@@ -537,6 +555,7 @@ function extractLayout(
         target,
         color,
         kind,
+        resolution,
         points: anchorEdgePolyline(
           [startPoint, endPoint],
           sourcePos,
@@ -555,7 +574,8 @@ function extractLayout(
         edge.source,
         edge.target,
         EDGE_COLORS[edge.kind] || "#64748b",
-        edge.kind
+        edge.kind,
+        edge.resolution ?? null
       );
       if (fallbackEdge) {
         result.edges.push(fallbackEdge);
@@ -565,7 +585,7 @@ function extractLayout(
     // Generate fallback for aggregated edges
     for (const [key, info] of aggregatedEdgeInfo) {
       const [source, target] = key.split("->");
-      const fallbackEdge = createFallbackEdge(source, target, info.color, info.kind);
+      const fallbackEdge = createFallbackEdge(source, target, info.color, info.kind, null);
       if (fallbackEdge) {
         result.edges.push(fallbackEdge);
       }

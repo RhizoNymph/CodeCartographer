@@ -132,7 +132,18 @@ pub async fn parse_repo(
         }
     }
 
-    let edges = symbol_table.resolve_references(&all_refs);
+    // Resolve import paths FIRST: this yields file-level import edges and an
+    // import map (source file -> imported files) that the symbol resolver uses
+    // as the "imported" tier of its precision ladder.
+    let (import_edges, import_map) = ImportResolver::resolve(&graph, &all_refs);
+    tracing::info!("Resolved {} file-level import edges", import_edges.len());
+    for edge in &import_edges {
+        graph.add_edge(edge.clone());
+    }
+    tracing::info!("Graph now has {} edges after adding", graph.edges.len());
+
+    // Resolve references into edges via the precision ladder (uses import_map).
+    let edges = symbol_table.resolve_references(&all_refs, &import_map);
     tracing::info!(
         "Resolved {} refs into {} edges (symbols: {})",
         all_refs.len(),
@@ -140,14 +151,6 @@ pub async fn parse_repo(
         symbol_table.symbols.len()
     );
     for edge in &edges {
-        graph.add_edge(edge.clone());
-    }
-    tracing::info!("Graph now has {} edges after adding", graph.edges.len());
-
-    // Resolve import paths to file-level edges
-    let import_edges = ImportResolver::resolve(&graph, &all_refs);
-    tracing::info!("Resolved {} file-level import edges", import_edges.len());
-    for edge in &import_edges {
         graph.add_edge(edge.clone());
     }
 
@@ -242,7 +245,7 @@ pub async fn get_subgraph(
 mod tests {
     use super::*;
     use cc_core::model::{
-        BlockKind, CodeEdge, CodeNode, EdgeKind, NodeId, Span, Visibility,
+        BlockKind, CodeEdge, CodeNode, EdgeKind, NodeId, Resolution, Span, Visibility,
     };
 
     fn file_node(id: &str) -> CodeNode {
@@ -290,6 +293,7 @@ mod tests {
             target: block_id.clone(),
             kind: EdgeKind::FunctionCall,
             weight: 1,
+            resolution: Resolution::GlobalUnique,
         });
 
         strip_parsed_state(&mut graph);
@@ -324,6 +328,7 @@ mod tests {
             target: block_id,
             kind: EdgeKind::FunctionCall,
             weight: 1,
+            resolution: Resolution::GlobalUnique,
         });
 
         strip_parsed_state(&mut graph);

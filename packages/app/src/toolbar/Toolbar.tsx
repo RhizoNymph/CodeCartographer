@@ -25,12 +25,14 @@ export function Toolbar() {
   const isParsing = useGraphStore((s) => s.isParsing);
   const enabledEdgeKinds = useGraphStore((s) => s.enabledEdgeKinds);
   const hideUnconnectedNodes = useGraphStore((s) => s.hideUnconnectedNodes);
+  const hideAmbiguousEdges = useGraphStore((s) => s.hideAmbiguousEdges);
   const setRepoPath = useGraphStore((s) => s.setRepoPath);
   const setGraph = useGraphStore((s) => s.setGraph);
   const setIsParsing = useGraphStore((s) => s.setIsParsing);
   const handleParseEvent = useGraphStore((s) => s.handleParseEvent);
   const toggleEdgeKind = useGraphStore((s) => s.toggleEdgeKind);
   const setHideUnconnectedNodes = useGraphStore((s) => s.setHideUnconnectedNodes);
+  const setHideAmbiguousEdges = useGraphStore((s) => s.setHideAmbiguousEdges);
 
   const edgeLODSettings = useViewportStore((s) => s.edgeLODSettings);
   const setEdgeLODSettings = useViewportStore((s) => s.setEdgeLODSettings);
@@ -300,6 +302,33 @@ export function Toolbar() {
               }}
             />
             Hide unconnected
+          </label>
+
+          <label
+            title="Hide ambiguous edges: low-confidence guesses where a name matched multiple candidates"
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 5,
+              fontSize: 11,
+              color: "#cbd5e1",
+              whiteSpace: "nowrap",
+              marginRight: 8,
+              cursor: "pointer",
+            }}
+          >
+            <input
+              type="checkbox"
+              checked={hideAmbiguousEdges}
+              onChange={(e) => setHideAmbiguousEdges(e.currentTarget.checked)}
+              style={{
+                cursor: "pointer",
+                width: 13,
+                height: 13,
+                margin: 0,
+              }}
+            />
+            Hide ambiguous
           </label>
 
           <span

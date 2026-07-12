@@ -115,7 +115,8 @@ fn test_end_to_end_scan_parse_resolve() {
         "symbol table should contain 'helper'"
     );
 
-    let edges = symbol_table.resolve_references(&all_refs);
+    let edges =
+        symbol_table.resolve_references(&all_refs, &std::collections::HashMap::new());
 
     // Add resolved edges to graph
     for edge in &edges {

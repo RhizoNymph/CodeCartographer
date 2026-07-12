@@ -48,6 +48,8 @@ interface GraphState {
   // Edge filter state
   enabledEdgeKinds: Set<EdgeKind>;
   hideUnconnectedNodes: boolean;
+  /** When true, ambiguous (low-confidence) edges are hidden from the layout. */
+  hideAmbiguousEdges: boolean;
 
   // Layout state - manual relayout
   needsRelayout: boolean;
@@ -66,6 +68,7 @@ interface GraphState {
   setHoveredEdge: (info: HoveredEdgeInfo | null) => void;
   toggleEdgeKind: (kind: EdgeKind) => void;
   setHideUnconnectedNodes: (hide: boolean) => void;
+  setHideAmbiguousEdges: (hide: boolean) => void;
   getVisibleNodeIds: () => string[];
   requestRelayout: () => void;
   saveCurrentState: () => void;
@@ -93,6 +96,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   hoveredEdgeInfo: null,
   enabledEdgeKinds: new Set<EdgeKind>(ALL_EDGE_KINDS),
   hideUnconnectedNodes: false,
+  hideAmbiguousEdges: false,
   needsRelayout: false,
   layoutVersion: 0,
 
@@ -278,6 +282,14 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     if (get().hideUnconnectedNodes === hide) return;
     set({
       hideUnconnectedNodes: hide,
+      layoutVersion: get().layoutVersion + 1,
+    });
+  },
+
+  setHideAmbiguousEdges: (hide) => {
+    if (get().hideAmbiguousEdges === hide) return;
+    set({
+      hideAmbiguousEdges: hide,
       layoutVersion: get().layoutVersion + 1,
     });
   },

@@ -254,7 +254,8 @@ export class PixiRenderer {
     graph: CodeGraph,
     expandedNodes: Set<string>,
     visibleNodes: Set<string>,
-    enabledEdgeKinds?: Set<EdgeKind>
+    enabledEdgeKinds?: Set<EdgeKind>,
+    hideAmbiguousEdges = false
   ) {
     if (import.meta.env.DEV) {
       const codeBlocks = Object.values(graph.nodes).filter(n => n.type === "CodeBlock").length;
@@ -278,7 +279,7 @@ export class PixiRenderer {
 
     // Run layout with edge kind filtering (with cancellation token for stale results)
     const requestId = ++this._layoutRequestId;
-    layoutGraph(graph, expandedNodes, visibleNodes, enabledEdgeKinds).then((layout) => {
+    layoutGraph(graph, expandedNodes, visibleNodes, enabledEdgeKinds, hideAmbiguousEdges).then((layout) => {
       if (requestId !== this._layoutRequestId) return; // stale -- discard
       this.lastLayout = layout;
       this.renderFromLayout(graph, layout, expandedNodes, visibleNodes);

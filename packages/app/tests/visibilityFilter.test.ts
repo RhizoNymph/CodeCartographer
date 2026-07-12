@@ -22,12 +22,14 @@ const graph: CodeGraph = {
       target: "fn2",
       kind: "FunctionCall",
       weight: 1,
+      resolution: "GlobalUnique",
     },
     {
       source: "orphanFn",
       target: "fn1",
       kind: "Import",
       weight: 1,
+      resolution: "GlobalUnique",
     },
   ],
   nodes: {

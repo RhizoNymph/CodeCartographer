@@ -33,6 +33,7 @@ interface LayoutEdgeLike {
   target: string;
   color: string;
   kind: string | null;
+  resolution?: string | null;
   points: Point[];
   sourceAnchor: EdgeAnchor;
   targetAnchor: EdgeAnchor;
@@ -62,9 +63,11 @@ function buildEdgeDataPure(edges: LayoutEdgeLike[]): {
       target: e.target,
       color: e.color,
       kind: e.kind as EdgeDatum["kind"],
+      resolution: (e.resolution ?? null) as EdgeDatum["resolution"],
       originalPoints: e.points.map((p) => ({ x: p.x, y: p.y })),
       sourceAnchor: e.sourceAnchor,
       targetAnchor: e.targetAnchor,
+      count: 1,
     };
   });
 
@@ -315,4 +318,82 @@ test("Empty edge data produces empty indices", () => {
   const { edgeData, nodeToEdgeIndices } = buildEdgeDataPure([]);
   assert.equal(edgeData.length, 0);
   assert.equal(nodeToEdgeIndices.size, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Ambiguous-edge filtering
+// ---------------------------------------------------------------------------
+
+interface GraphEdgeLike {
+  source: string;
+  target: string;
+  kind: string;
+  resolution: string;
+}
+
+/**
+ * Mirrors the ambiguous-edge filter predicate used in elkLayout.ts
+ * (`kindFilteredEdges` and `computeAggregatedEdges`). Pure reimplementation so
+ * it can be tested without pulling in ELK/pixi.
+ */
+function filterEdges(
+  edges: GraphEdgeLike[],
+  enabledKinds: Set<string> | null,
+  hideAmbiguousEdges: boolean
+): GraphEdgeLike[] {
+  return edges.filter(
+    (e) =>
+      (!enabledKinds || enabledKinds.has(e.kind)) &&
+      !(hideAmbiguousEdges && e.resolution === "Ambiguous")
+  );
+}
+
+test("filterEdges keeps ambiguous edges when hideAmbiguousEdges is false", () => {
+  const edges: GraphEdgeLike[] = [
+    { source: "a", target: "b", kind: "FunctionCall", resolution: "SameFile" },
+    { source: "a", target: "c", kind: "FunctionCall", resolution: "Ambiguous" },
+  ];
+  const kept = filterEdges(edges, null, false);
+  assert.equal(kept.length, 2);
+});
+
+test("filterEdges drops ambiguous edges when hideAmbiguousEdges is true", () => {
+  const edges: GraphEdgeLike[] = [
+    { source: "a", target: "b", kind: "FunctionCall", resolution: "SameFile" },
+    { source: "a", target: "c", kind: "FunctionCall", resolution: "Ambiguous" },
+    { source: "a", target: "d", kind: "FunctionCall", resolution: "GlobalUnique" },
+  ];
+  const kept = filterEdges(edges, null, true);
+  assert.equal(kept.length, 2);
+  assert.ok(!kept.some((e) => e.resolution === "Ambiguous"));
+});
+
+test("filterEdges combines kind filter with ambiguous filter", () => {
+  const edges: GraphEdgeLike[] = [
+    { source: "a", target: "b", kind: "FunctionCall", resolution: "Ambiguous" },
+    { source: "a", target: "c", kind: "Import", resolution: "Imported" },
+    { source: "a", target: "d", kind: "FunctionCall", resolution: "SameFile" },
+  ];
+  const kept = filterEdges(edges, new Set(["FunctionCall"]), true);
+  // Only the SameFile FunctionCall survives (Import excluded by kind, the
+  // ambiguous FunctionCall excluded by resolution).
+  assert.equal(kept.length, 1);
+  assert.equal(kept[0].target, "d");
+});
+
+test("buildEdgeData carries the resolution through to EdgeDatum", () => {
+  const edges: LayoutEdgeLike[] = [
+    {
+      source: "a",
+      target: "b",
+      color: "#ff0000",
+      kind: "FunctionCall",
+      resolution: "Ambiguous",
+      points: [{ x: 0, y: 0 }, { x: 10, y: 0 }],
+      sourceAnchor: { side: "right", offset: 20 },
+      targetAnchor: { side: "left", offset: 20 },
+    },
+  ];
+  const { edgeData } = buildEdgeDataPure(edges);
+  assert.equal(edgeData[0].resolution, "Ambiguous");
 });

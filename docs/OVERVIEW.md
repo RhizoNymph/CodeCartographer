@@ -17,7 +17,7 @@ Overview:
     data_flow:
         1. User selects a repository path via the toolbar.
         2. Frontend calls scan_repo (Tauri IPC) -> cc-tauri scans directory tree -> returns CodeGraph with Directory/File nodes.
-        3. Frontend calls parse_repo (Tauri IPC) -> cc-tauri first strips any prior parse state so re-parsing is idempotent -> parses each file with tree-sitter (parallel via rayon) in a single tree walk that attributes each raw reference to its innermost enclosing block (top-level imports/refs attributed to the File) and populates each block's children hierarchy -> only top-level blocks are appended to File children -> resolves references into edges via SymbolTable -> returns enriched CodeGraph.
+        3. Frontend calls parse_repo (Tauri IPC) -> cc-tauri first strips any prior parse state so re-parsing is idempotent -> parses each file with tree-sitter (parallel via rayon) in a single tree walk that attributes each raw reference to its innermost enclosing block (top-level imports/refs attributed to the File) and populates each block's children hierarchy -> only top-level blocks are appended to File children -> resolves imports first (yielding file-to-file Import edges plus an import map), then resolves references into edges via SymbolTable using a precision ladder (same-file > imported-file > global-unique > ambiguous, dropping references matching more than 5 global symbols) so each edge carries a Resolution confidence -> returns enriched CodeGraph.
         4. Frontend graphStore receives the CodeGraph, computes visibility/expansion state.
         5. Canvas component passes graph + state to PixiRenderer.
         6. PixiRenderer delegates to elkLayout for node positioning, then renders nodes and edges on the Pixi.js canvas.
@@ -47,6 +47,12 @@ Features Index:
         entry_points: [crates/cc-core/src/parser/extract.rs, crates/cc-core/src/parser/language.rs, crates/cc-tauri/src/commands/parse.rs]
         depends_on: [graph-model]
         doc: docs/features/parsing.md
+
+    resolution_precision:
+        description: Precision ladder that resolves each raw reference to the highest-confidence target (same-file > imported-file > single global match > up to 5 ambiguous candidates; more than 5 dropped). Every edge carries a Resolution; ambiguous edges are rendered dashed/dimmed and can be hidden via a toolbar toggle.
+        entry_points: [crates/cc-core/src/resolver/symbol_table.rs, crates/cc-core/src/resolver/import_resolver.rs, crates/cc-tauri/src/commands/parse.rs]
+        depends_on: [parsing, graph-model]
+        doc: docs/features/resolution_precision.md
 
     state-management:
         description: Zustand stores for graph state, viewport state, debug logging, and persistence.

@@ -351,6 +351,9 @@ function resolveEdgeDraw(
 
 /**
  * Draw a single edge (path + start cap + arrowhead) into a Graphics object.
+ *
+ * When `dashed` is true (used for ambiguous, low-confidence edges) the path is
+ * drawn as a dashed polyline instead of the continuous rounded path.
  */
 function renderSingleEdge(
   gfx: Graphics,
@@ -358,9 +361,14 @@ function renderSingleEdge(
   color: number,
   alpha: number,
   width: number,
-  showStartCap: boolean
+  showStartCap: boolean,
+  dashed = false
 ): void {
-  drawEdgePath(gfx, points, Math.max(4, width * 2.2));
+  if (dashed) {
+    drawDashedPolyline(gfx, points, DASH_LENGTH, DASH_GAP);
+  } else {
+    drawEdgePath(gfx, points, Math.max(4, width * 2.2));
+  }
   gfx.stroke({
     color,
     width,
@@ -441,6 +449,7 @@ export class EdgeDrawingManager {
         target: e.target,
         color: e.color,
         kind: e.kind,
+        resolution: e.resolution,
         originalPoints: e.points.map((p) => ({ x: p.x, y: p.y })),
         sourceAnchor: e.sourceAnchor,
         targetAnchor: e.targetAnchor,
@@ -517,7 +526,11 @@ export class EdgeDrawingManager {
 
       const style = edge.kind ? EDGE_STYLES[edge.kind] : DEFAULT_EDGE_STYLE;
       const color = parseInt(edge.color.replace("#", ""), 16);
-      const alpha = style.baseAlpha * lodOpacityMultiplier;
+      const ambiguous = edge.resolution === "Ambiguous";
+      const alpha =
+        style.baseAlpha *
+        lodOpacityMultiplier *
+        (ambiguous ? AMBIGUOUS_ALPHA_MULTIPLIER : 1);
       // Scale width by edge count (log scale so bundled edges are visually thicker)
       const countScale = edge.count > 1 ? 1 + Math.log2(edge.count) * 0.4 : 1;
       const width = style.width * getLODEdgeWidthMultiplier(currentLOD) * countScale;
@@ -525,7 +538,7 @@ export class EdgeDrawingManager {
       // Skip edges that are too faint
       if (alpha < 0.05) continue;
 
-      renderSingleEdge(gfx, points, color, alpha, width, currentLOD !== "minimap");
+      renderSingleEdge(gfx, points, color, alpha, width, currentLOD !== "minimap", ambiguous);
     }
 
     edgeLayer.addChild(gfx);
@@ -599,10 +612,11 @@ export class EdgeDrawingManager {
 
       const style = edge.kind ? EDGE_STYLES[edge.kind] : DEFAULT_EDGE_STYLE;
       const color = parseInt(edge.color.replace("#", ""), 16);
+      const ambiguous = edge.resolution === "Ambiguous";
       const alpha = 1.0;
       const width = style.width + 1;
 
-      renderSingleEdge(gfx, points, color, alpha, width, currentLOD !== "minimap");
+      renderSingleEdge(gfx, points, color, alpha, width, currentLOD !== "minimap", ambiguous);
     }
 
     this._lastEdgeLayer.addChild(gfx);
@@ -720,6 +734,61 @@ export function getLODEdgeWidthMultiplier(currentLOD: LODLevel): number {
     case "detail":
     default:
       return 1.0;
+  }
+}
+
+/** Dash geometry for ambiguous (low-confidence) edges, in layout units. */
+const DASH_LENGTH = 6;
+const DASH_GAP = 5;
+/** Extra alpha reduction applied to ambiguous edges so they read as dimmed. */
+export const AMBIGUOUS_ALPHA_MULTIPLIER = 0.45;
+
+/**
+ * Draw a polyline as a dashed line into `gfx` (moveTo/lineTo pairs per dash).
+ * Pixi has no native dash support; this walks each segment placing alternating
+ * on/off runs. Kept cheap (straight segments, no curves) since it runs per redraw.
+ */
+export function drawDashedPolyline(
+  gfx: Graphics,
+  points: Point[],
+  dashLength: number,
+  gapLength: number
+): void {
+  if (points.length < 2) return;
+
+  let drawing = true; // whether the current run is a dash (vs a gap)
+  let remaining = dashLength; // distance left in the current run
+
+  for (let i = 0; i < points.length - 1; i++) {
+    let from = points[i];
+    const to = points[i + 1];
+    let segDx = to.x - from.x;
+    let segDy = to.y - from.y;
+    let segLen = Math.hypot(segDx, segDy);
+    if (segLen < 1e-6) continue;
+
+    let ux = segDx / segLen;
+    let uy = segDy / segLen;
+
+    while (segLen > 0) {
+      const step = Math.min(remaining, segLen);
+      const nx = from.x + ux * step;
+      const ny = from.y + uy * step;
+
+      if (drawing) {
+        gfx.moveTo(from.x, from.y);
+        gfx.lineTo(nx, ny);
+      }
+
+      from = { x: nx, y: ny };
+      segLen -= step;
+      remaining -= step;
+
+      if (remaining <= 1e-6) {
+        drawing = !drawing;
+        remaining = drawing ? dashLength : gapLength;
+      }
+    }
   }
 }
 
