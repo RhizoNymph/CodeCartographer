@@ -50,7 +50,12 @@ impl ImportResolver {
                             slot.insert(id.clone());
                         }
                         Entry::Occupied(mut slot) => {
-                            if stripped_key_rank(path) > stripped_key_rank(&slot.get().0) {
+                            let replace = {
+                                let incumbent = slot.get().0.as_str();
+                                (stripped_key_rank(path), path.as_str())
+                                    > (stripped_key_rank(incumbent), incumbent)
+                            };
+                            if replace {
                                 slot.insert(id.clone());
                             }
                         }
@@ -409,8 +414,15 @@ impl ImportResolver {
 ///
 /// Several files can strip to the same key (`pkg/mod.py` and `pkg/mod.pyi` both
 /// strip to `pkg/mod`). A `.pyi` stub only carries signatures, so the real
-/// module must always win; higher rank wins, and equal ranks keep the incumbent
-/// so the result never depends on `HashMap` iteration order for this case.
+/// module must always win; higher rank wins.
+///
+/// Rank alone does not settle every collision: in a polyglot repo `foo.py` and
+/// `foo.ts` also strip to `foo` and rank equally. The caller therefore breaks
+/// ties on the full path, which is arbitrary but *stable* -- without it the
+/// winner would depend on `HashMap` iteration order and resolution could differ
+/// between runs of the same scan. Picking the language-correct file in that case
+/// is a separate concern (the stripped key is consulted before language-aware
+/// extension probing); see `probe_path`.
 fn stripped_key_rank(path: &str) -> u8 {
     if path.ends_with(".pyi") {
         0
@@ -672,6 +684,47 @@ mod tests {
 
             assert_eq!(edges.len(), 1);
             assert_eq!(edges[0].target, NodeId::file("src/mypkg/mod.py"));
+        }
+    }
+
+    #[test]
+    fn polyglot_stripped_key_collision_resolves_deterministically() {
+        // `shared/util.py` and `shared/util.ts` both strip to `shared/util` and
+        // rank equally, so the path-map winner used to depend on `HashMap`
+        // iteration order -- the same scan could resolve `./util` differently
+        // between runs. The tie is now broken on the full path, so whatever the
+        // outcome is, it must be the same every time.
+        let mut seen: Option<NodeId> = None;
+
+        for run in 0..16 {
+            let mut graph = CodeGraph::new(NodeId::directory(""));
+            py_file(&mut graph, "shared/util.py");
+            graph.add_node(CodeNode::File {
+                id: NodeId::file("shared/util.ts"),
+                name: "shared/util.ts".to_string(),
+                path: "shared/util.ts".to_string(),
+                language: Some(Language::TypeScript),
+                children: Vec::new(),
+            });
+            graph.add_node(CodeNode::File {
+                id: NodeId::file("shared/app.ts"),
+                name: "shared/app.ts".to_string(),
+                path: "shared/app.ts".to_string(),
+                language: Some(Language::TypeScript),
+                children: Vec::new(),
+            });
+
+            let refs = vec![import_ref("shared/app.ts", "./util")];
+            let (edges, _map) = ImportResolver::resolve(&graph, &refs);
+
+            assert_eq!(edges.len(), 1, "expected one import edge on run {run}");
+            match &seen {
+                None => seen = Some(edges[0].target.clone()),
+                Some(first) => assert_eq!(
+                    &edges[0].target, first,
+                    "polyglot collision resolved differently on run {run}"
+                ),
+            }
         }
     }
 

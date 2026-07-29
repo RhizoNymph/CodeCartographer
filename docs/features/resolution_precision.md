@@ -76,6 +76,12 @@ This branch runs for **all** Python absolute imports — dotted (`pkg.sub.mod`) 
 - `PYTHON_EXTENSIONS` probes `.py`, `/__init__.py`, `.pyi`, `/__init__.pyi` in that order.
 - `path_to_id` also holds extension-stripped keys, and `pkg/mod.py` / `pkg/mod.pyi` collide on `pkg/mod`. `stripped_key_rank` ranks `.pyi` below everything else, so the winner is chosen by rank rather than by `HashMap` iteration order.
 
+### Stripped-key collisions across languages
+
+Rank does not settle every collision: in a polyglot repo `shared/util.py` and `shared/util.ts` also strip to `shared/util` and rank equally. Ties are therefore broken on the full path, making the winner arbitrary but **stable** — otherwise the same scan could resolve the same import differently between runs, since the map is built by iterating a `HashMap`.
+
+Stability is all this guarantees. The stripped key is consulted *before* language-aware extension probing, so a cross-language collision can still resolve to a file in the wrong language. That is a pre-existing limitation, not a Python-specific one; fixing it means reordering exact-match and probe steps in `resolve_import_path`.
+
 ## Files
 
 | File | Role | Key exports/interfaces |
@@ -89,6 +95,7 @@ This branch runs for **all** Python absolute imports — dotted (`pkg.sub.mod`) 
 | `crates/cc-core/src/repo/scanner.rs` | Scanning + ignore rules | `RepoScanner::scan`, `DirIgnoreRule`, `dir_ignore_rule` |
 | `crates/cc-core/src/model/node.rs` | Language mapping | `Language::from_extension` (`py`, `pyi` -> Python) |
 | `crates/cc-core/tests/fixtures/python_src_layout/` | On-disk fixture | src layout + subpackage + `tests/` + `.pyi` stub + `venv/`/`__pycache__/`/`build/` decoys |
+| `crates/cc-core/tests/python_seam_test.rs` | Extraction/resolution seam | Pins the two halves together on aliased, multi-name, star and bare-package imports; fails if either half regresses |
 | `crates/cc-core/tests/python_resolution_test.rs` | End-to-end test | scan -> parse -> `ImportResolver::resolve` over the fixture |
 | `crates/cc-tauri/src/commands/parse.rs` | Orchestration | imports resolved before symbol references; passes `import_map` |
 | `packages/app/src/api/types.ts` | FE types | `Resolution` union, `CodeEdge.resolution` |
