@@ -3,7 +3,11 @@ use std::collections::HashMap;
 use crate::model::{Language, NodeId};
 
 const TS_JS_EXTENSIONS: &[&str] = &["", ".ts", ".tsx", ".js", ".jsx", "/index.ts", "/index.js"];
-const PYTHON_EXTENSIONS: &[&str] = &[".py", "/__init__.py"];
+
+/// Python candidates, **most authoritative first**: a real module or package
+/// always wins over its `.pyi` type stub, which carries signatures only.
+const PYTHON_EXTENSIONS: &[&str] = &[".py", "/__init__.py", ".pyi", "/__init__.pyi"];
+
 const RUST_EXTENSIONS: &[&str] = &[".rs", "/mod.rs"];
 
 /// All extensions combined, used when language is unknown.
@@ -17,6 +21,8 @@ const ALL_EXTENSIONS: &[&str] = &[
     "/index.js",
     ".py",
     "/__init__.py",
+    ".pyi",
+    "/__init__.pyi",
     ".rs",
     "/mod.rs",
 ];

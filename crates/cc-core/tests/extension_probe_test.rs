@@ -54,6 +54,55 @@ fn test_probe_python_init() {
 }
 
 #[test]
+fn test_probe_python_pyi_stub() {
+    let mut map = HashMap::new();
+    map.insert("src/utils.pyi".to_string(), NodeId::file("src/utils.pyi"));
+    assert_eq!(
+        probe_path("src/utils", Language::Python, &map),
+        Some(NodeId::file("src/utils.pyi"))
+    );
+}
+
+#[test]
+fn test_probe_python_pyi_package_stub() {
+    let mut map = HashMap::new();
+    map.insert(
+        "src/utils/__init__.pyi".to_string(),
+        NodeId::file("src/utils/__init__.pyi"),
+    );
+    assert_eq!(
+        probe_path("src/utils", Language::Python, &map),
+        Some(NodeId::file("src/utils/__init__.pyi"))
+    );
+}
+
+#[test]
+fn test_probe_python_prefers_module_over_stub() {
+    let mut map = HashMap::new();
+    map.insert("src/utils.py".to_string(), NodeId::file("src/utils.py"));
+    map.insert("src/utils.pyi".to_string(), NodeId::file("src/utils.pyi"));
+    assert_eq!(
+        probe_path("src/utils", Language::Python, &map),
+        Some(NodeId::file("src/utils.py")),
+        "a real module must win over its stub"
+    );
+}
+
+#[test]
+fn test_probe_python_prefers_package_init_over_stub() {
+    let mut map = HashMap::new();
+    map.insert(
+        "src/utils/__init__.py".to_string(),
+        NodeId::file("src/utils/__init__.py"),
+    );
+    map.insert("src/utils.pyi".to_string(), NodeId::file("src/utils.pyi"));
+    assert_eq!(
+        probe_path("src/utils", Language::Python, &map),
+        Some(NodeId::file("src/utils/__init__.py"))
+    );
+}
+
+#[test]
 fn test_probe_rust_mod_rs() {
     let mut map = HashMap::new();
     map.insert(
@@ -66,10 +115,7 @@ fn test_probe_rust_mod_rs() {
 #[test]
 fn test_probe_rust_rs_extension() {
     let mut map = HashMap::new();
-    map.insert(
-        "src/parser.rs".to_string(),
-        NodeId::file("src/parser.rs"),
-    );
+    map.insert("src/parser.rs".to_string(), NodeId::file("src/parser.rs"));
     assert!(probe_path("src/parser", Language::Rust, &map).is_some());
 }
 
