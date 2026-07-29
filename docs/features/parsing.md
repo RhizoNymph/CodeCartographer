@@ -5,6 +5,7 @@
 **In scope:**
 - Tree-sitter based source code parsing for Python, TypeScript, JavaScript, and Rust
 - Extraction of code blocks (functions, classes, structs, enums, traits, interfaces, impls, modules, constants, type aliases)
+- Decorator references (Python)
 - Visibility detection for code symbols
 - Collection of raw references (imports, function calls, method calls, type references, inheritance, trait implementations)
 - Language-specific classification via the `LanguageSupport` trait
@@ -15,6 +16,10 @@
 - Type inference
 - Cross-file reference resolution (handled by resolver subsystem)
 - Language-specific formatting or pretty-printing
+- Recording the imported *symbol* names of `from x import Thing` (only the module
+  path is captured) and mapping `import x as y` aliases back to the original symbol
+- Resolving `self.helper()` to the enclosing class rather than by bare method name
+- Python string forward references in annotations (`x: "Fwd"`)
 
 ## Data/Control Flow
 
@@ -41,9 +46,87 @@ Defines the interface every language must implement:
 - `tree_sitter_language()` - Return the tree-sitter grammar
 
 ### Language Implementations
-- `PythonSupport` (`parser/python.rs`) - Python functions, classes, imports, calls, type annotations, inheritance
+- `PythonSupport` (`parser/python.rs`) - Python functions, classes, module-level constants/type aliases, imports, calls, decorators, type annotations, inheritance. See "Python extraction rules" below.
 - `TypeScriptSupport` / `JavaScriptSupport` (`parser/typescript.rs`) - TS/JS functions, classes, interfaces, type aliases, enums, arrow functions, imports, calls, type refs, inheritance
 - `RustSupport` (`parser/rust_lang.rs`) - Rust functions, structs, enums, traits, impls, modules, constants, type aliases, use declarations, calls, type refs, trait impls. Includes improved visibility detection for `pub`, `pub(crate)`, and `pub(super)`. Use declarations expand to full module paths (`expand_use_paths`): use lists yield one Import ref per leaf, aliases resolve to the original path, `self` maps to the module, wildcards import the module itself.
+
+### Python extraction rules (`parser/python.rs`)
+
+Every rule below inspects a single tree-sitter node plus (at most) that node's own
+parent chain and direct children. Nothing recurses into a subtree, so each raw
+reference is attributed to exactly one node.
+
+**Blocks (`classify_node`)**
+
+| Node kind | Block | Notes |
+|---|---|---|
+| `function_definition` | `Function` | |
+| `class_definition` | `Class` | |
+| `assignment` | `Constant` / `TypeAlias` | module-level, single-identifier target only |
+
+Module-level bindings are deliberately narrow to keep the graph from exploding:
+the `assignment` must sit directly in the module body (`module > expression_statement >
+assignment`) and bind a single plain `identifier`. Class-body fields, function
+locals, tuple unpacking (`a, b = ...`), and subscript/attribute targets
+(`REGISTRY['a'] = ...`, `obj.attr = ...`) never become nodes. A binding is
+`TypeAlias` when annotated `: TypeAlias` or initialized from
+`TypeVar` / `NewType` / `ParamSpec` / `TypeVarTuple`; otherwise `Constant`.
+
+**Visibility (`python_visibility`)** — `__dunder__` (leading and trailing double
+underscore, length > 4) is `Public` because it is part of the public protocol;
+`__mangled` (leading double underscore, no trailing dunder) and `_internal` are
+`Private`; everything else is `Public`. Applied to functions, classes, and
+module-level bindings alike.
+
+**Imports** — `RawRefKind::Import { module_path }` is the clean dotted module path
+exactly as written in source, with the `as` alias clause stripped and imported
+symbol names excluded. One ref per imported module. `RawReference::name` equals
+`module_path`. This is the contract the import resolver consumes:
+
+| Source | `module_path` |
+|---|---|
+| `import os, sys` | `os`, `sys` (two refs) |
+| `import numpy as np` | `numpy` |
+| `import a.b.c` | `a.b.c` |
+| `from mypkg.mod import Thing, other` | `mypkg.mod` |
+| `from .rel import X as Y` | `.rel` |
+| `from . import x` | `.` |
+| `from ..pkg.sub import y` | `..pkg.sub` |
+| `from pkg.mod import *` | `pkg.mod` |
+
+`import_statement` iterates every `name:` field (so multi-name imports are not
+dropped) and unwraps `aliased_import` to its `name:` child. `import_from_statement`
+reads only `module_name:`, whose text is already correct for both `dotted_name` and
+`relative_import` (leading dots preserved). `future_import_statement`
+(`from __future__ import ...`) emits nothing.
+
+**Type annotations** — only leaf names are emitted; the raw text of a composite
+annotation is never used. Each annotation node kind contributes its own leaf and
+lets the walk reach the rest:
+- `type` emits its child when the child is an `identifier` or `attribute` (last segment).
+- `generic_type` emits its base name only (`MyGeneric[Inner]` -> `MyGeneric`); the
+  parameters are nested `type` nodes visited separately.
+- `binary_operator` emits its `left`/`right` leaf operands, but only when an
+  ancestor walk through nested `binary_operator`s lands on a `type` node. Nested
+  operands that are themselves `binary_operator`s are visited on their own.
+
+Names matching `is_python_builtin_type` or `is_typing_construct` (`Optional`,
+`List`, `Dict`, `Union`, `Any`, `Callable`, `Protocol`, ...) are dropped. Result:
+`list[MyClass]` yields exactly one `TypeReference` named `MyClass`. String forward
+references (`x: "Fwd"`) are not resolved.
+
+**Inheritance** — an `argument_list` whose parent is a `class_definition` emits one
+`Inheritance` ref per base: `identifier` and `attribute` (last segment) directly,
+`subscript` via its `value:` field (`Generic[T]` -> `Generic`), and
+`keyword_argument` via its `value:` field (`metaclass=Meta` -> `Meta`). Base names
+are not filtered against the builtin/typing lists.
+
+**Decorators** — a `decorator` node whose child is an `identifier` emits a
+`FunctionCall` ref, and whose child is an `attribute` emits a `MethodCall` ref for
+the last segment. Call-form decorators (`@app.route("/x")`) wrap a `call` node that
+the `call` arm already handles, so the `decorator` arm skips them; there is no
+double-counting. Decorators sit above the definition inside `decorated_definition`,
+so their refs attribute to the enclosing scope, not the decorated block.
 
 ### Shared Framework (`parser/extract.rs`)
 - `Extractor` struct with `extract_file()` public API (unchanged from original)
@@ -78,3 +161,9 @@ Consolidates extension probing logic used by the import resolver:
 - Every block's `children` vec lists exactly its direct child blocks (blocks whose `parent` equals that block); the File node's children list only top-level blocks (parent == File).
 - `parse_repo` is idempotent: it strips all CodeBlock nodes, block ids from File children, and edges before re-parsing.
 - The `Visibility` enum reuses `Protected` for Rust's `pub(super)` and `Crate` for `pub(crate)`.
+- Python `RawRefKind::Import { module_path }` is always a clean dotted path as
+  written in source (no alias clause, no imported symbol names), one ref per
+  module. The import resolver depends on this exact shape.
+- Python module-level bindings only become blocks when the assignment is a direct
+  child of the module body and binds a single identifier; nothing inside a class
+  body or function body is ever classified.

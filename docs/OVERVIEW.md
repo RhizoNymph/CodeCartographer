@@ -44,7 +44,7 @@ Features Index:
         doc: docs/features/server_side_graph_state.md
 
     parsing:
-        description: Tree-sitter based source code parsing using a trait-based LanguageSupport system. Extracts code blocks and raw references from Python, TypeScript, JavaScript, and Rust files. Includes extension probing for import resolution.
+        description: Tree-sitter based source code parsing using a trait-based LanguageSupport system. Extracts code blocks and raw references from Python, TypeScript, JavaScript, and Rust files. Includes extension probing for import resolution. Python extraction additionally emits clean dotted Import module paths (multi-name and aliased imports handled, alias clauses and imported symbol names excluded), module-level Constant/TypeAlias blocks (module body + single-identifier target only, so class fields and function locals never become nodes), leaf-only type annotation refs (builtins and typing constructs filtered), attribute/subscript/keyword-argument class bases, bare decorator refs, and dunder-aware visibility.
         entry_points: [crates/cc-core/src/parser/extract.rs, crates/cc-core/src/parser/language.rs, crates/cc-tauri/src/commands/parse.rs]
         depends_on: [graph-model]
         doc: docs/features/parsing.md
