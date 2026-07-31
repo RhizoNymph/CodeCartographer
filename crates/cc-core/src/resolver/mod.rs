@@ -1,5 +1,6 @@
 pub mod extension_probe;
 mod import_resolver;
+pub mod path_index;
 pub mod python_roots;
 mod symbol_table;
 
