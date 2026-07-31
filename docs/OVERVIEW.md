@@ -16,7 +16,7 @@ Overview:
 
     data_flow:
         1. User selects a repository path via the toolbar.
-        2. Frontend calls scan_repo (Tauri IPC) -> cc-tauri scans directory tree -> stores the graph in server-side GraphState and returns an edge-less ParseResult with Directory/File nodes.
+        2. Frontend calls scan_repo (Tauri IPC) -> cc-tauri scans directory tree (respecting .gitignore plus explicit directory ignore rules for virtualenvs/caches/build output, and mapping .py/.pyi to Python) -> stores the graph in server-side GraphState and returns an edge-less ParseResult with Directory/File nodes.
         3. Frontend calls parse_repo (Tauri IPC) -> cc-tauri first strips any prior parse state so re-parsing is idempotent -> parses each file with tree-sitter (parallel via rayon) in a single tree walk that attributes each raw reference to its innermost enclosing block (top-level imports/refs attributed to the File) and populates each block's children hierarchy -> only top-level blocks are appended to File children -> resolves imports first (yielding file-to-file Import edges plus an import map), then resolves references into edges via SymbolTable using a precision ladder (same-file > imported-file > global-unique > ambiguous, dropping references matching more than 5 global symbols) so each edge carries a Resolution confidence -> keeps the full graph (nodes + edges, with adjacency rebuilt) in server-side GraphState and returns an edge-less ParseResult (nodes, root, edge_count, node_edge_kinds connectivity map).
         4. Frontend graphStore converts the ParseResult into a CodeGraph (node tree + nodeEdgeKinds Map, no edges) and computes visibility/expansion state. The hideUnconnectedNodes filter (visibilityFilter) runs synchronously from nodeEdgeKinds.
         5. Canvas derives the effective layout inputs from the zoom-level viewMode (default "module"): module view forces edge kinds to {Import} and treats files as collapsed (saved state preserved but ignored); symbol view uses the user's edge kinds + expansion; a focus neighborhood, when active, restricts visibility/expansion to the fetched neighborhood ids. Canvas passes the (edge-less) graph + effective state to PixiRenderer.
@@ -44,16 +44,21 @@ Features Index:
         doc: docs/features/server_side_graph_state.md
 
     parsing:
-        description: Tree-sitter based source code parsing using a trait-based LanguageSupport system. Extracts code blocks and raw references from Python, TypeScript, JavaScript, and Rust files. Includes extension probing for import resolution.
+        description: Tree-sitter based source code parsing using a trait-based LanguageSupport system. Extracts code blocks and raw references from Python, TypeScript, JavaScript, and Rust files. Includes extension probing for import resolution. Python extraction additionally emits clean dotted Import module paths (multi-name and aliased imports handled, alias clauses and imported symbol names excluded), module-level Constant/TypeAlias blocks (module body + single-identifier target only, so class fields and function locals never become nodes), leaf-only type annotation refs (builtins and typing constructs filtered), attribute/subscript/keyword-argument class bases, bare decorator refs, and dunder-aware visibility.
         entry_points: [crates/cc-core/src/parser/extract.rs, crates/cc-core/src/parser/language.rs, crates/cc-tauri/src/commands/parse.rs]
         depends_on: [graph-model]
         doc: docs/features/parsing.md
 
     resolution_precision:
-        description: Precision ladder that resolves each raw reference to the highest-confidence target (same-file > imported-file > single global match > up to 5 ambiguous candidates; more than 5 dropped). Every edge carries a Resolution; ambiguous edges are rendered dashed/dimmed and can be hidden via a toolbar toggle.
-        entry_points: [crates/cc-core/src/resolver/symbol_table.rs, crates/cc-core/src/resolver/import_resolver.rs, crates/cc-tauri/src/commands/parse.rs]
-        depends_on: [parsing, graph-model]
+        description: Precision ladder that resolves each raw reference to the highest-confidence target (same-file > imported-file > single global match > up to 5 ambiguous candidates; more than 5 dropped). Every edge carries a Resolution; ambiguous edges are rendered dashed/dimmed and can be hidden via a toolbar toggle. Import resolution covers Python relative imports, Python absolute imports resolved against detected package roots (repo root, src/ dirs, package-chain parents -- nearest the importing file first, so src layouts and monorepo packages/*/ layouts work), Rust use paths, and TS/JS relative paths. Python .pyi stubs resolve as targets but always rank behind the real module.
+        entry_points: [crates/cc-core/src/resolver/symbol_table.rs, crates/cc-core/src/resolver/import_resolver.rs, crates/cc-core/src/resolver/python_roots.rs, crates/cc-tauri/src/commands/parse.rs]
+        depends_on: [parsing, graph-model, repo-scanning]
         doc: docs/features/resolution_precision.md
+
+    repo-scanning:
+        description: Directory-tree walk producing Directory/File nodes. Respects .gitignore/.git/exclude and hidden files, and additionally applies explicit directory ignore rules (DirIgnoreRule) so Python virtualenvs, __pycache__, site-packages, .tox/.nox/.mypy_cache/.pytest_cache/.ruff_cache and *.egg-info are never scanned; build/ and dist/ are skipped only when they are not Python packages. File language is derived from the extension (.py/.pyi -> Python, .ts/.tsx, .js/.jsx, .rs).
+        entry_points: [crates/cc-core/src/repo/scanner.rs, crates/cc-core/src/model/node.rs]
+        depends_on: [graph-model]
 
     zoom-views:
         description: Two zoom-level views selected by a toolbar segmented control. Module view (default on load) is the trustworthy zoomed-out import graph -- files render collapsed and only Import edges show, as DERIVED constraints over the user's saved state (never mutating it). Symbol view is the detailed expandable view with all enabled edge kinds. Focus mode drills into a bounded neighborhood of a node (cc-core Neighborhood BFS via get_neighborhood) so the full symbol graph is never laid out; entered from the Sidebar/Tooltip Focus buttons or a module-view File double-click, exited via a breadcrumb chip (name + 1/2-hop depth + X) or Esc. viewMode persists per folder.

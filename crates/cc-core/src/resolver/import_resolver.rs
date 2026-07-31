@@ -1,3 +1,4 @@
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
@@ -5,6 +6,7 @@ use crate::model::{CodeEdge, CodeGraph, CodeNode, EdgeKind, Language, NodeId, Re
 use crate::parser::{RawRefKind, RawReference};
 
 use super::extension_probe::{probe_path, probe_path_all};
+use super::python_roots::PythonPackageRoots;
 
 /// Map of `source file path -> set of file paths it imports`.
 ///
@@ -28,19 +30,43 @@ impl ImportResolver {
 
         // Build a map of file paths to NodeIds for fast lookup
         let mut path_to_id: HashMap<String, NodeId> = HashMap::new();
+        let mut file_paths: Vec<String> = Vec::new();
         for (id, node) in &graph.nodes {
             if let CodeNode::File { path, .. } = node {
+                file_paths.push(path.clone());
+
                 // Store with and without extension
                 path_to_id.insert(path.clone(), id.clone());
 
-                // Also store without extension for import resolution
+                // Also store without extension for import resolution. Several
+                // files can strip to the same key (`mod.py` vs `mod.pyi`), so
+                // the winner is chosen by rank rather than by (unordered)
+                // iteration order.
                 if let Some(stem) = Path::new(path).file_stem() {
                     let parent = Path::new(path).parent().unwrap_or(Path::new(""));
                     let without_ext = parent.join(stem).to_string_lossy().to_string();
-                    path_to_id.insert(without_ext, id.clone());
+                    match path_to_id.entry(without_ext) {
+                        Entry::Vacant(slot) => {
+                            slot.insert(id.clone());
+                        }
+                        Entry::Occupied(mut slot) => {
+                            let replace = {
+                                let incumbent = slot.get().0.as_str();
+                                (stripped_key_rank(path), path.as_str())
+                                    > (stripped_key_rank(incumbent), incumbent)
+                            };
+                            if replace {
+                                slot.insert(id.clone());
+                            }
+                        }
+                    }
                 }
             }
         }
+
+        // Candidate roots for Python absolute imports, derived from the scanned
+        // file set (repo root, `src/` dirs, package-chain parents).
+        let package_roots = PythonPackageRoots::from_file_paths(&file_paths);
 
         for raw_ref in refs {
             if let RawRefKind::Import { module_path } = &raw_ref.kind {
@@ -53,6 +79,7 @@ impl ImportResolver {
                     &from_file,
                     from_language.as_ref(),
                     &path_to_id,
+                    &package_roots,
                 ) {
                     // Import edge from file to file
                     let source_file_id = NodeId::file(&from_file);
@@ -107,6 +134,7 @@ impl ImportResolver {
         from_file: &str,
         language: Option<&Language>,
         path_map: &HashMap<String, NodeId>,
+        package_roots: &PythonPackageRoots,
     ) -> Option<NodeId> {
         // Handle Python-style leading-dot relative imports (`.foo`, `..pkg.mod`,
         // or a bare `.` / `..` for `from . import x`). These are distinguished
@@ -114,9 +142,7 @@ impl ImportResolver {
         // the leading dots. Must be checked BEFORE the generic `starts_with('.')`
         // branch below (which only understands `./`-style paths).
         if matches!(language, Some(Language::Python)) && module_path.starts_with('.') {
-            if let Some(id) =
-                Self::resolve_python_relative(module_path, from_file, path_map)
-            {
+            if let Some(id) = Self::resolve_python_relative(module_path, from_file, path_map) {
                 return Some(id);
             }
             // Fall through to the generic handling below if the Python-specific
@@ -140,6 +166,13 @@ impl ImportResolver {
                 return probe_path(&normalized, lang.clone(), path_map);
             }
             return probe_path_all(&normalized, path_map);
+        }
+
+        // Python absolute imports (`pkg.sub.mod`, `pkg`, `module`) are resolved
+        // against every candidate package root, nearest the importing file
+        // first, so `src/` layouts and monorepo `packages/*/` layouts work.
+        if matches!(language, Some(Language::Python)) {
+            return Self::resolve_python_absolute(module_path, from_file, path_map, package_roots);
         }
 
         // Handle Python dotted imports (foo.bar.baz -> foo/bar/baz.py)
@@ -261,6 +294,47 @@ impl ImportResolver {
         }
     }
 
+    /// Resolve a Python absolute import (`pkg.sub.mod`, `pkg`, `module`).
+    ///
+    /// The dotted path is converted to a relative path and probed against each
+    /// candidate root from [`PythonPackageRoots`] in nearest-first order, so
+    /// `src/mypkg/app.py` importing `mypkg.mod` finds `src/mypkg/mod.py`, and
+    /// `tests/test_app.py` importing the same module finds it too. A bare
+    /// package name (`import mypkg`) resolves to that package's `__init__.py`
+    /// via extension probing. Imports of installed/stdlib modules find no
+    /// candidate and yield no edge.
+    fn resolve_python_absolute(
+        module_path: &str,
+        from_file: &str,
+        path_map: &HashMap<String, NodeId>,
+        package_roots: &PythonPackageRoots,
+    ) -> Option<NodeId> {
+        if module_path.is_empty() {
+            return None;
+        }
+        let relative = module_path.replace('.', "/");
+
+        for root in package_roots.ordered_for(from_file) {
+            let candidate = if root.is_empty() {
+                relative.clone()
+            } else {
+                format!("{}/{}", root, relative)
+            };
+
+            // Exact match first (the path map also holds extension-stripped
+            // keys), then language-specific probing (`.py`, `/__init__.py`,
+            // then the `.pyi` stub forms).
+            if let Some(id) = path_map.get(&candidate) {
+                return Some(id.clone());
+            }
+            if let Some(id) = probe_path(&candidate, Language::Python, path_map) {
+                return Some(id);
+            }
+        }
+
+        None
+    }
+
     /// Resolve a Python leading-dot relative import.
     ///
     /// Counts the leading dots: 1 dot means the source file's own package
@@ -333,6 +407,27 @@ impl ImportResolver {
             }
         }
         parts.join("/")
+    }
+}
+
+/// Rank of a file path competing for an extension-stripped path-map key.
+///
+/// Several files can strip to the same key (`pkg/mod.py` and `pkg/mod.pyi` both
+/// strip to `pkg/mod`). A `.pyi` stub only carries signatures, so the real
+/// module must always win; higher rank wins.
+///
+/// Rank alone does not settle every collision: in a polyglot repo `foo.py` and
+/// `foo.ts` also strip to `foo` and rank equally. The caller therefore breaks
+/// ties on the full path, which is arbitrary but *stable* -- without it the
+/// winner would depend on `HashMap` iteration order and resolution could differ
+/// between runs of the same scan. Picking the language-correct file in that case
+/// is a separate concern (the stripped key is consulted before language-aware
+/// extension probing); see `probe_path`.
+fn stripped_key_rank(path: &str) -> u8 {
+    if path.ends_with(".pyi") {
+        0
+    } else {
+        1
     }
 }
 
@@ -446,6 +541,292 @@ mod tests {
         assert_eq!(edges[0].target, NodeId::file("pkg/subpkg/__init__.py"));
     }
 
+    // --- Python absolute imports -------------------------------------------
+
+    #[test]
+    fn python_src_layout_absolute_import_resolves() {
+        // src/mypkg/app.py does `import mypkg.mod` -> src/mypkg/mod.py.
+        // `src` is a package root even though it has no __init__.py.
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        py_file(&mut graph, "src/mypkg/__init__.py");
+        py_file(&mut graph, "src/mypkg/app.py");
+        py_file(&mut graph, "src/mypkg/mod.py");
+
+        let refs = vec![import_ref("src/mypkg/app.py", "mypkg.mod")];
+        let (edges, map) = ImportResolver::resolve(&graph, &refs);
+
+        assert_eq!(edges.len(), 1, "src-layout absolute import must resolve");
+        assert_eq!(edges[0].target, NodeId::file("src/mypkg/mod.py"));
+        assert!(map["src/mypkg/app.py"].contains("src/mypkg/mod.py"));
+    }
+
+    #[test]
+    fn python_src_layout_import_from_tests_dir_resolves() {
+        // tests/test_app.py sits outside the source root but still imports the
+        // package by its absolute name.
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        py_file(&mut graph, "src/mypkg/__init__.py");
+        py_file(&mut graph, "src/mypkg/mod.py");
+        py_file(&mut graph, "tests/test_app.py");
+
+        let refs = vec![import_ref("tests/test_app.py", "mypkg.mod")];
+        let (edges, _map) = ImportResolver::resolve(&graph, &refs);
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, NodeId::file("src/mypkg/mod.py"));
+    }
+
+    #[test]
+    fn python_src_layout_deep_dotted_import_resolves() {
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        py_file(&mut graph, "src/mypkg/__init__.py");
+        py_file(&mut graph, "src/mypkg/app.py");
+        py_file(&mut graph, "src/mypkg/sub/__init__.py");
+        py_file(&mut graph, "src/mypkg/sub/helper.py");
+
+        let refs = vec![import_ref("src/mypkg/app.py", "mypkg.sub.helper")];
+        let (edges, _map) = ImportResolver::resolve(&graph, &refs);
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, NodeId::file("src/mypkg/sub/helper.py"));
+    }
+
+    #[test]
+    fn python_flat_layout_absolute_import_still_resolves() {
+        // Regression guard: the pre-existing flat layout must keep working.
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        py_file(&mut graph, "flatpkg/__init__.py");
+        py_file(&mut graph, "flatpkg/util.py");
+        py_file(&mut graph, "app.py");
+
+        let refs = vec![import_ref("app.py", "flatpkg.util")];
+        let (edges, _map) = ImportResolver::resolve(&graph, &refs);
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, NodeId::file("flatpkg/util.py"));
+    }
+
+    #[test]
+    fn python_bare_package_import_resolves_to_init() {
+        // `import flatpkg` where flatpkg/__init__.py exists.
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        py_file(&mut graph, "flatpkg/__init__.py");
+        py_file(&mut graph, "app.py");
+
+        let refs = vec![import_ref("app.py", "flatpkg")];
+        let (edges, _map) = ImportResolver::resolve(&graph, &refs);
+
+        assert_eq!(
+            edges.len(),
+            1,
+            "bare package import must resolve to __init__"
+        );
+        assert_eq!(edges[0].target, NodeId::file("flatpkg/__init__.py"));
+    }
+
+    #[test]
+    fn python_bare_module_import_at_root_still_resolves() {
+        // Regression guard: `import config` -> config.py at the repo root.
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        py_file(&mut graph, "config.py");
+        py_file(&mut graph, "app.py");
+
+        let refs = vec![import_ref("app.py", "config")];
+        let (edges, _map) = ImportResolver::resolve(&graph, &refs);
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, NodeId::file("config.py"));
+    }
+
+    #[test]
+    fn python_monorepo_package_import_resolves_against_its_own_root() {
+        // packages/svc/svc/... and packages/web/web/... are separate roots.
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        py_file(&mut graph, "packages/svc/svc/__init__.py");
+        py_file(&mut graph, "packages/svc/svc/core.py");
+        py_file(&mut graph, "packages/web/web/__init__.py");
+        py_file(&mut graph, "packages/web/web/app.py");
+
+        let refs = vec![import_ref("packages/web/web/app.py", "svc.core")];
+        let (edges, _map) = ImportResolver::resolve(&graph, &refs);
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, NodeId::file("packages/svc/svc/core.py"));
+    }
+
+    #[test]
+    fn python_stub_only_module_resolves_to_pyi() {
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        py_file(&mut graph, "src/mypkg/__init__.py");
+        py_file(&mut graph, "src/mypkg/app.py");
+        py_file(&mut graph, "src/mypkg/typed.pyi");
+
+        let refs = vec![import_ref("src/mypkg/app.py", "mypkg.typed")];
+        let (edges, _map) = ImportResolver::resolve(&graph, &refs);
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, NodeId::file("src/mypkg/typed.pyi"));
+    }
+
+    #[test]
+    fn python_real_module_wins_over_its_stub() {
+        // Both mod.py and mod.pyi exist; the real module must always win, and
+        // the outcome must not depend on node iteration order.
+        for _ in 0..16 {
+            let mut graph = CodeGraph::new(NodeId::directory(""));
+            py_file(&mut graph, "src/mypkg/__init__.py");
+            py_file(&mut graph, "src/mypkg/app.py");
+            py_file(&mut graph, "src/mypkg/mod.py");
+            py_file(&mut graph, "src/mypkg/mod.pyi");
+
+            let refs = vec![import_ref("src/mypkg/app.py", "mypkg.mod")];
+            let (edges, _map) = ImportResolver::resolve(&graph, &refs);
+
+            assert_eq!(edges.len(), 1);
+            assert_eq!(edges[0].target, NodeId::file("src/mypkg/mod.py"));
+        }
+    }
+
+    #[test]
+    fn polyglot_stripped_key_collision_resolves_deterministically() {
+        // `shared/util.py` and `shared/util.ts` both strip to `shared/util` and
+        // rank equally, so the path-map winner used to depend on `HashMap`
+        // iteration order -- the same scan could resolve `./util` differently
+        // between runs. The tie is now broken on the full path, so whatever the
+        // outcome is, it must be the same every time.
+        let mut seen: Option<NodeId> = None;
+
+        for run in 0..16 {
+            let mut graph = CodeGraph::new(NodeId::directory(""));
+            py_file(&mut graph, "shared/util.py");
+            graph.add_node(CodeNode::File {
+                id: NodeId::file("shared/util.ts"),
+                name: "shared/util.ts".to_string(),
+                path: "shared/util.ts".to_string(),
+                language: Some(Language::TypeScript),
+                children: Vec::new(),
+            });
+            graph.add_node(CodeNode::File {
+                id: NodeId::file("shared/app.ts"),
+                name: "shared/app.ts".to_string(),
+                path: "shared/app.ts".to_string(),
+                language: Some(Language::TypeScript),
+                children: Vec::new(),
+            });
+
+            let refs = vec![import_ref("shared/app.ts", "./util")];
+            let (edges, _map) = ImportResolver::resolve(&graph, &refs);
+
+            assert_eq!(edges.len(), 1, "expected one import edge on run {run}");
+            match &seen {
+                None => seen = Some(edges[0].target.clone()),
+                Some(first) => assert_eq!(
+                    &edges[0].target, first,
+                    "polyglot collision resolved differently on run {run}"
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn python_relative_import_of_stub_package_resolves() {
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        py_file(&mut graph, "pkg/a.py");
+        py_file(&mut graph, "pkg/stubpkg/__init__.pyi");
+
+        let refs = vec![import_ref("pkg/a.py", ".stubpkg")];
+        let (edges, _map) = ImportResolver::resolve(&graph, &refs);
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, NodeId::file("pkg/stubpkg/__init__.pyi"));
+    }
+
+    #[test]
+    fn python_third_party_import_does_not_resolve() {
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        py_file(&mut graph, "src/mypkg/__init__.py");
+        py_file(&mut graph, "src/mypkg/app.py");
+
+        let refs = vec![
+            import_ref("src/mypkg/app.py", "os"),
+            import_ref("src/mypkg/app.py", "numpy"),
+            import_ref("src/mypkg/app.py", "os.path"),
+        ];
+        let (edges, map) = ImportResolver::resolve(&graph, &refs);
+
+        assert!(
+            edges.is_empty(),
+            "stdlib/third-party imports must not resolve"
+        );
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn python_multi_import_emits_one_edge_per_module() {
+        // Per the extractor contract, `import mypkg.mod, mypkg.other` produces
+        // one Import ref per module.
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        py_file(&mut graph, "src/mypkg/__init__.py");
+        py_file(&mut graph, "src/mypkg/app.py");
+        py_file(&mut graph, "src/mypkg/mod.py");
+        py_file(&mut graph, "src/mypkg/other.py");
+
+        let refs = vec![
+            import_ref("src/mypkg/app.py", "mypkg.mod"),
+            import_ref("src/mypkg/app.py", "mypkg.other"),
+        ];
+        let (edges, map) = ImportResolver::resolve(&graph, &refs);
+
+        assert_eq!(edges.len(), 2);
+        assert_eq!(map["src/mypkg/app.py"].len(), 2);
+    }
+
+    #[test]
+    fn python_self_import_emits_no_edge() {
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        py_file(&mut graph, "src/mypkg/__init__.py");
+        py_file(&mut graph, "src/mypkg/app.py");
+
+        let refs = vec![import_ref("src/mypkg/app.py", "mypkg.app")];
+        let (edges, map) = ImportResolver::resolve(&graph, &refs);
+
+        assert!(edges.is_empty());
+        assert!(map.is_empty());
+    }
+
+    #[test]
+    fn python_nested_package_chain_root_is_outermost_parent() {
+        // proj/pkg and proj/pkg/sub are packages; `proj` is the root, so an
+        // absolute `pkg.sub.m` import resolves through it.
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        py_file(&mut graph, "proj/pkg/__init__.py");
+        py_file(&mut graph, "proj/pkg/app.py");
+        py_file(&mut graph, "proj/pkg/sub/__init__.py");
+        py_file(&mut graph, "proj/pkg/sub/m.py");
+
+        let refs = vec![import_ref("proj/pkg/app.py", "pkg.sub.m")];
+        let (edges, _map) = ImportResolver::resolve(&graph, &refs);
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, NodeId::file("proj/pkg/sub/m.py"));
+    }
+
+    #[test]
+    fn rust_use_path_is_unaffected_by_python_absolute_branch() {
+        // A Rust file in a repo that also has Python packages must still take
+        // the Rust branch.
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        py_file(&mut graph, "src/mypkg/__init__.py");
+        rs_file(&mut graph, "src/main.rs");
+        rs_file(&mut graph, "src/model/mod.rs");
+
+        let refs = vec![import_ref("src/main.rs", "crate::model::CodeGraph")];
+        let (edges, _map) = ImportResolver::resolve(&graph, &refs);
+
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, NodeId::file("src/model/mod.rs"));
+    }
+
     fn rs_file(graph: &mut CodeGraph, path: &str) {
         graph.add_node(CodeNode::File {
             id: NodeId::file(path),
@@ -473,7 +854,10 @@ mod tests {
         let (edges, map) = ImportResolver::resolve(&graph, &refs);
 
         assert_eq!(edges.len(), 1);
-        assert_eq!(edges[0].target, NodeId::file("crates/core/src/model/graph.rs"));
+        assert_eq!(
+            edges[0].target,
+            NodeId::file("crates/core/src/model/graph.rs")
+        );
         assert!(map["crates/core/src/lib.rs"].contains("crates/core/src/model/graph.rs"));
     }
 

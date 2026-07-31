@@ -148,7 +148,13 @@ impl Extractor {
         let mut cursor = node.walk();
         for child in node.children(&mut cursor) {
             Self::walk_tree(
-                file_path, source, lang, &child, &current_id, out_nodes, out_refs,
+                file_path,
+                source,
+                lang,
+                &child,
+                &current_id,
+                out_nodes,
+                out_refs,
             );
         }
     }
@@ -194,10 +200,7 @@ impl Extractor {
     }
 
     /// Extract a rough signature from the first line of a node.
-    pub(crate) fn extract_signature(
-        node: &tree_sitter::Node,
-        source: &str,
-    ) -> Option<String> {
+    pub(crate) fn extract_signature(node: &tree_sitter::Node, source: &str) -> Option<String> {
         let text = node.utf8_text(source.as_bytes()).ok()?;
         let first_line = text.lines().next()?;
         Some(first_line.trim().to_string())
@@ -231,7 +234,6 @@ impl Extractor {
 
         text.to_string()
     }
-
 }
 
 #[cfg(test)]
@@ -580,6 +582,435 @@ mod tests {
         }
     }
 
+    // -- Python extraction gap tests (imports, inheritance, annotations,
+    //    module-level bindings, decorators, dunder visibility) --
+
+    /// Collect the `module_path` of every Import ref, in source order.
+    fn python_import_paths(source: &str) -> Vec<String> {
+        let (_, refs) = extract(source, &Language::Python);
+        refs.iter()
+            .filter_map(|r| match &r.kind {
+                RawRefKind::Import { module_path } => Some(module_path.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Collect TypeReference ref names, sorted for stable comparison.
+    fn python_type_ref_names(source: &str) -> Vec<String> {
+        let (_, refs) = extract(source, &Language::Python);
+        let mut names: Vec<String> = refs
+            .iter()
+            .filter(|r| matches!(r.kind, RawRefKind::TypeReference))
+            .map(|r| r.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// Collect Inheritance ref names, sorted.
+    fn python_inheritance_names(source: &str) -> Vec<String> {
+        let (_, refs) = extract(source, &Language::Python);
+        let mut names: Vec<String> = refs
+            .iter()
+            .filter(|r| matches!(r.kind, RawRefKind::Inheritance))
+            .map(|r| r.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    fn block_names(nodes: &[CodeNode]) -> Vec<String> {
+        nodes
+            .iter()
+            .filter_map(|n| match n {
+                CodeNode::CodeBlock { name, .. } => Some(name.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn block_kind_of(nodes: &[CodeNode], name: &str) -> BlockKind {
+        match find_block(nodes, name) {
+            CodeNode::CodeBlock { kind, .. } => kind.clone(),
+            _ => panic!("expected CodeBlock"),
+        }
+    }
+
+    fn block_visibility_of(nodes: &[CodeNode], name: &str) -> Option<Visibility> {
+        match find_block(nodes, name) {
+            CodeNode::CodeBlock { visibility, .. } => visibility.clone(),
+            _ => panic!("expected CodeBlock"),
+        }
+    }
+
+    // -- B1: import module_path contract --
+
+    #[test]
+    fn test_python_import_module_path_contract() {
+        // This table is the cross-workstream contract consumed by the import
+        // resolver: a clean dotted module path exactly as written in source,
+        // with the `as` alias clause stripped and imported symbols excluded.
+        assert_eq!(python_import_paths("import os, sys"), vec!["os", "sys"]);
+        assert_eq!(python_import_paths("import numpy as np"), vec!["numpy"]);
+        assert_eq!(python_import_paths("import a.b.c"), vec!["a.b.c"]);
+        assert_eq!(
+            python_import_paths("from mypkg.mod import Thing, other"),
+            vec!["mypkg.mod"]
+        );
+        assert_eq!(python_import_paths("from .rel import X as Y"), vec![".rel"]);
+        assert_eq!(python_import_paths("from . import x"), vec!["."]);
+        assert_eq!(
+            python_import_paths("from ..pkg.sub import y"),
+            vec!["..pkg.sub"]
+        );
+    }
+
+    #[test]
+    fn test_python_import_multi_and_alias_combined() {
+        assert_eq!(
+            python_import_paths("import os, numpy as np, a.b.c"),
+            vec!["os", "numpy", "a.b.c"]
+        );
+    }
+
+    #[test]
+    fn test_python_import_wildcard_yields_module_only() {
+        assert_eq!(
+            python_import_paths("from pkg.mod import *"),
+            vec!["pkg.mod"]
+        );
+    }
+
+    #[test]
+    fn test_python_import_symbols_never_leak_as_imports() {
+        // `from x import A, B` must produce exactly one Import ref (the module),
+        // never one per imported symbol.
+        let paths = python_import_paths("from mypkg.mod import Thing, other");
+        assert_eq!(
+            paths.len(),
+            1,
+            "expected exactly one Import ref, got {:?}",
+            paths
+        );
+        assert!(
+            !paths
+                .iter()
+                .any(|p| p.contains("Thing") || p.contains("other")),
+            "imported symbol names must not appear in module_path, got {:?}",
+            paths
+        );
+    }
+
+    #[test]
+    fn test_python_import_ref_name_matches_module_path() {
+        let (_, refs) = extract("import numpy as np", &Language::Python);
+        let import_ref = refs
+            .iter()
+            .find(|r| matches!(r.kind, RawRefKind::Import { .. }))
+            .expect("expected an Import ref");
+        assert_eq!(import_ref.name, "numpy");
+    }
+
+    // -- B2: inheritance beyond bare identifiers --
+
+    #[test]
+    fn test_python_inheritance_attribute_subscript_and_keyword() {
+        let source = "class A(base.Mixin, Generic[T], metaclass=Meta):\n    pass";
+        assert_eq!(
+            python_inheritance_names(source),
+            vec!["Generic", "Meta", "Mixin"]
+        );
+    }
+
+    #[test]
+    fn test_python_inheritance_dotted_metaclass() {
+        let source = "class D(object, metaclass=abc.ABCMeta):\n    pass";
+        assert_eq!(python_inheritance_names(source), vec!["ABCMeta", "object"]);
+    }
+
+    #[test]
+    fn test_python_inheritance_dotted_subscript_base() {
+        let source = "class E(pkg.mod.Base[T]):\n    pass";
+        assert_eq!(python_inheritance_names(source), vec!["Base"]);
+    }
+
+    #[test]
+    fn test_python_inheritance_attributed_to_class_block() {
+        let source = "class Foo(Bar):\n    pass";
+        let (nodes, refs) = extract(source, &Language::Python);
+        let class_id = block_id_of(&nodes, "Foo");
+        let inherit: Vec<_> = refs
+            .iter()
+            .filter(|r| matches!(r.kind, RawRefKind::Inheritance))
+            .collect();
+        assert_eq!(inherit.len(), 1);
+        assert_eq!(inherit[0].from_node, class_id);
+    }
+
+    // -- B3: generic annotations emit only leaf type names --
+
+    #[test]
+    fn test_python_generic_annotation_emits_single_leaf() {
+        // `list[MyClass]` must yield exactly ONE TypeReference, named MyClass.
+        assert_eq!(
+            python_type_ref_names("def f(x: list[MyClass]):\n    pass"),
+            vec!["MyClass"]
+        );
+    }
+
+    #[test]
+    fn test_python_annotations_skip_builtins_and_typing_constructs() {
+        let source = "def f(x: list[MyClass], y: Optional[Other]) -> Dict[str, Thing]:\n    pass";
+        assert_eq!(
+            python_type_ref_names(source),
+            vec!["MyClass", "Other", "Thing"]
+        );
+    }
+
+    #[test]
+    fn test_python_dotted_and_union_annotations() {
+        let source = "def f(a: mod.Thing, b: A | B) -> pkg.sub.Result:\n    pass";
+        assert_eq!(
+            python_type_ref_names(source),
+            vec!["A", "B", "Result", "Thing"]
+        );
+    }
+
+    #[test]
+    fn test_python_nested_union_annotation() {
+        assert_eq!(
+            python_type_ref_names("def f(a: A | B | C):\n    pass"),
+            vec!["A", "B", "C"]
+        );
+    }
+
+    #[test]
+    fn test_python_user_generic_base_is_emitted() {
+        assert_eq!(
+            python_type_ref_names("def f(x: MyGeneric[Inner]):\n    pass"),
+            vec!["Inner", "MyGeneric"]
+        );
+    }
+
+    #[test]
+    fn test_python_nested_generic_annotation_no_duplicates() {
+        assert_eq!(
+            python_type_ref_names("def f(x: list[list[X]]):\n    pass"),
+            vec!["X"]
+        );
+    }
+
+    #[test]
+    fn test_python_none_return_annotation_emits_nothing() {
+        assert!(python_type_ref_names("def g() -> None:\n    pass").is_empty());
+    }
+
+    // -- B4: module-level constants and type aliases --
+
+    #[test]
+    fn test_python_module_level_constant_block() {
+        let (nodes, _) = extract("MAX = 10", &Language::Python);
+        assert_eq!(block_kind_of(&nodes, "MAX"), BlockKind::Constant);
+        let file_id = NodeId::file("test.file");
+        if let CodeNode::CodeBlock { parent, .. } = find_block(&nodes, "MAX") {
+            assert_eq!(
+                *parent, file_id,
+                "module-level constant parents to the file"
+            );
+        }
+    }
+
+    #[test]
+    fn test_python_module_level_binding_defaults_to_constant() {
+        let (nodes, _) = extract("Alias = MyClass", &Language::Python);
+        assert_eq!(block_kind_of(&nodes, "Alias"), BlockKind::Constant);
+    }
+
+    #[test]
+    fn test_python_module_level_type_alias_shapes() {
+        let source = "T = TypeVar('T')\nUserId = NewType('UserId', int)\nX: TypeAlias = MyClass\nP = ParamSpec('P')";
+        let (nodes, _) = extract(source, &Language::Python);
+        assert_eq!(block_kind_of(&nodes, "T"), BlockKind::TypeAlias);
+        assert_eq!(block_kind_of(&nodes, "UserId"), BlockKind::TypeAlias);
+        assert_eq!(block_kind_of(&nodes, "X"), BlockKind::TypeAlias);
+        assert_eq!(block_kind_of(&nodes, "P"), BlockKind::TypeAlias);
+    }
+
+    #[test]
+    fn test_python_annotated_module_constant() {
+        let (nodes, _) = extract("CONFIG: Settings = Settings()", &Language::Python);
+        assert_eq!(block_kind_of(&nodes, "CONFIG"), BlockKind::Constant);
+    }
+
+    #[test]
+    fn test_python_module_constant_owns_its_initializer_refs() {
+        let (nodes, refs) = extract("CONFIG: Settings = Settings()", &Language::Python);
+        let const_id = block_id_of(&nodes, "CONFIG");
+        let type_refs: Vec<_> = refs
+            .iter()
+            .filter(|r| matches!(r.kind, RawRefKind::TypeReference))
+            .collect();
+        assert!(
+            type_refs.iter().all(|r| r.from_node == const_id),
+            "annotation refs should attribute to the constant block"
+        );
+    }
+
+    #[test]
+    fn test_python_local_and_class_field_assignments_create_no_blocks() {
+        let source = "class C:\n    field = 1\n    typed: int = 2\n    def m(self):\n        x = 1\n        y: int = 2";
+        let (nodes, _) = extract(source, &Language::Python);
+        let mut names = block_names(&nodes);
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["C", "m"],
+            "only the class and method should be blocks; got {:?}",
+            names
+        );
+    }
+
+    #[test]
+    fn test_python_function_local_assignment_creates_no_block() {
+        let (nodes, _) = extract("def f():\n    x = 1", &Language::Python);
+        let mut names = block_names(&nodes);
+        names.sort();
+        assert_eq!(names, vec!["f"]);
+    }
+
+    #[test]
+    fn test_python_tuple_unpacking_creates_no_block() {
+        let (nodes, _) = extract("a, b = 1, 2", &Language::Python);
+        assert!(
+            block_names(&nodes).is_empty(),
+            "tuple unpacking should not create blocks, got {:?}",
+            block_names(&nodes)
+        );
+    }
+
+    #[test]
+    fn test_python_subscript_assignment_creates_no_block() {
+        let (nodes, _) = extract("REGISTRY['a'] = 1\nobj.attr = 2", &Language::Python);
+        assert!(
+            block_names(&nodes).is_empty(),
+            "non-identifier assignment targets should not create blocks, got {:?}",
+            block_names(&nodes)
+        );
+    }
+
+    #[test]
+    fn test_python_module_constant_visibility() {
+        let (nodes, _) = extract("MAX = 1\n_HIDDEN = 2", &Language::Python);
+        assert_eq!(block_visibility_of(&nodes, "MAX"), Some(Visibility::Public));
+        assert_eq!(
+            block_visibility_of(&nodes, "_HIDDEN"),
+            Some(Visibility::Private)
+        );
+    }
+
+    // -- B5: decorators --
+
+    #[test]
+    fn test_python_bare_decorator_reference() {
+        let source = "@my_decorator\ndef handler():\n    pass";
+        let (_, refs) = extract(source, &Language::Python);
+        let hits: Vec<_> = refs.iter().filter(|r| r.name == "my_decorator").collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "expected exactly one ref for the bare decorator, got {:?}",
+            hits.iter().map(|r| (&r.name, &r.kind)).collect::<Vec<_>>()
+        );
+        assert!(matches!(hits[0].kind, RawRefKind::FunctionCall));
+    }
+
+    #[test]
+    fn test_python_dotted_decorator_reference() {
+        let source = "@decorators.cached\ndef handler():\n    pass";
+        let (_, refs) = extract(source, &Language::Python);
+        let hits: Vec<_> = refs.iter().filter(|r| r.name == "cached").collect();
+        assert_eq!(hits.len(), 1);
+        assert!(matches!(hits[0].kind, RawRefKind::MethodCall));
+    }
+
+    #[test]
+    fn test_python_call_decorator_not_double_counted() {
+        let source = "@app.route('/x')\ndef handler():\n    pass";
+        let (_, refs) = extract(source, &Language::Python);
+        let hits: Vec<_> = refs.iter().filter(|r| r.name == "route").collect();
+        assert_eq!(
+            hits.len(),
+            1,
+            "call-form decorator must not be double-counted, got {:?}",
+            hits.iter().map(|r| (&r.name, &r.kind)).collect::<Vec<_>>()
+        );
+        assert!(matches!(hits[0].kind, RawRefKind::MethodCall));
+        // The decorated function's receiver `app` must not become a ref of its own.
+        assert!(!refs.iter().any(|r| r.name == "app"));
+    }
+
+    #[test]
+    fn test_python_decorator_on_class() {
+        let source = "@decorators.cached\nclass K:\n    pass";
+        let (_, refs) = extract(source, &Language::Python);
+        assert!(refs.iter().any(|r| r.name == "cached"));
+    }
+
+    #[test]
+    fn test_python_decorator_ref_attributed_to_enclosing_scope() {
+        // The decorator sits above the function_definition inside
+        // decorated_definition, so it attributes to the enclosing scope (file),
+        // not the decorated function.
+        let source = "@my_decorator\ndef handler():\n    pass";
+        let (_, refs) = extract(source, &Language::Python);
+        let file_id = NodeId::file("test.file");
+        let hit = refs
+            .iter()
+            .find(|r| r.name == "my_decorator")
+            .expect("decorator ref");
+        assert_eq!(hit.from_node, file_id);
+    }
+
+    // -- B6: dunder visibility --
+
+    #[test]
+    fn test_python_dunder_methods_are_public() {
+        let source = "class C:\n    def __init__(self):\n        pass\n    def __repr__(self):\n        pass\n    def __mangled(self):\n        pass\n    def _protected(self):\n        pass\n    def plain(self):\n        pass";
+        let (nodes, _) = extract(source, &Language::Python);
+        assert_eq!(
+            block_visibility_of(&nodes, "__init__"),
+            Some(Visibility::Public),
+            "dunder methods are part of the public protocol"
+        );
+        assert_eq!(
+            block_visibility_of(&nodes, "__repr__"),
+            Some(Visibility::Public)
+        );
+        assert_eq!(
+            block_visibility_of(&nodes, "__mangled"),
+            Some(Visibility::Private),
+            "name-mangled __x (no trailing dunder) stays private"
+        );
+        assert_eq!(
+            block_visibility_of(&nodes, "_protected"),
+            Some(Visibility::Private)
+        );
+        assert_eq!(
+            block_visibility_of(&nodes, "plain"),
+            Some(Visibility::Public)
+        );
+    }
+
+    #[test]
+    fn test_python_class_visibility_follows_underscore_convention() {
+        let (nodes, _) = extract("class _Internal:\n    pass", &Language::Python);
+        assert_eq!(
+            block_visibility_of(&nodes, "_Internal"),
+            Some(Visibility::Private)
+        );
+    }
+
     // -- TypeScript tests --
 
     #[test]
@@ -838,7 +1269,8 @@ mod tests {
 
         // Use lists expand into one ref per leaf, aliases resolve to the
         // original path, and `self` maps to the module itself.
-        let source_list = "use crate::model::{graph, edge as E};\nuse super::util::{self, helpers};";
+        let source_list =
+            "use crate::model::{graph, edge as E};\nuse super::util::{self, helpers};";
         let (_, refs_list) = extract(source_list, &Language::Rust);
         let mut paths: Vec<String> = refs_list
             .iter()
@@ -1094,10 +1526,7 @@ mod tests {
         }
 
         // TypeScript function
-        let (nodes, _) = extract(
-            "function baz() {\n    return 1;\n}",
-            &Language::TypeScript,
-        );
+        let (nodes, _) = extract("function baz() {\n    return 1;\n}", &Language::TypeScript);
         let block = find_block(&nodes, "baz");
         if let CodeNode::CodeBlock { signature, .. } = block {
             let sig = signature.as_ref().expect("signature should be present");

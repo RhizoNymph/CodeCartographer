@@ -147,11 +147,31 @@ pub enum Language {
 impl Language {
     pub fn from_extension(ext: &str) -> Option<Self> {
         match ext {
-            "py" => Some(Language::Python),
+            // `.pyi` type stubs parse with the Python grammar and participate
+            // in import resolution (as a fallback behind the real module).
+            "py" | "pyi" => Some(Language::Python),
             "ts" | "tsx" => Some(Language::TypeScript),
             "js" | "jsx" => Some(Language::JavaScript),
             "rs" => Some(Language::Rust),
             _ => None,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn python_extensions_include_stubs() {
+        assert_eq!(Language::from_extension("py"), Some(Language::Python));
+        assert_eq!(Language::from_extension("pyi"), Some(Language::Python));
+    }
+
+    #[test]
+    fn unknown_extensions_have_no_language() {
+        assert_eq!(Language::from_extension("pyc"), None);
+        assert_eq!(Language::from_extension("txt"), None);
+        assert_eq!(Language::from_extension(""), None);
     }
 }

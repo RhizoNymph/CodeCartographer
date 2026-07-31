@@ -8,6 +8,8 @@
 - Capping ambiguous fan-out: 2..=5 candidate names produce one flagged edge each; more than 5 are dropped entirely.
 - Producing an import map (source file -> imported files) from the import resolver and feeding it to the symbol resolver as the "imported" tier.
 - Python leading-dot relative import resolution (`.foo`, `..pkg.mod`, `from . import x` / `.`), including package `__init__.py` targets.
+- Python absolute import resolution (`import pkg.sub.mod`, `import pkg`, `import module`) against detected **package roots**, so `src/` layouts, monorepo `packages/*/` layouts, and sibling `tests/` trees all resolve.
+- Python `.pyi` type stubs as resolution targets, always ranked behind the real module they stub.
 - Rust use-path resolution (`crate::`, `super::`, `self::`): paths name modules and items rather than files, so the resolver probes progressively shorter prefixes against the source file's crate `src` root (workspace-aware) until a file (`.rs` / `mod.rs`, falling back to `lib.rs`/`main.rs`) matches. External-crate paths (`std::`, dependencies) do not resolve.
 - Merging duplicate edges keeps the highest-confidence resolution.
 - Frontend: dashed/dimmed rendering of ambiguous edges and a toolbar toggle to hide them.
@@ -16,6 +18,8 @@
 - Full semantic/type-directed name resolution (no scope analysis, no type inference).
 - Disambiguating ambiguous names beyond the same-file / imported-file tiers.
 - Non-Python relative import syntaxes (TS/JS `./`, `../` are handled by the pre-existing generic branch).
+- Recording the *symbols* named by `from x import Thing, other` (and mapping `as` aliases back to their original symbol). Import refs carry only the module path, so an import edge says "file A imports file B", never "A imports symbol S from B".
+- Reading `sys.path`, `pyproject.toml`/`setup.cfg` package metadata, or installed site-packages. Roots are inferred from the scanned file set only; third-party and stdlib imports deliberately resolve to nothing.
 
 ## Data/Control Flow
 
@@ -51,8 +55,32 @@ Resolution runs inside `parse_repo` (`crates/cc-tauri/src/commands/parse.rs`) af
 
 `ImportResolver::resolve_python_relative` runs (for Python source only) before the generic `starts_with('.')` branch:
 - Counts leading dots: 1 dot = the source file's package directory; each extra dot walks one parent directory up.
-- Converts the dotted remainder to a path segment, joins onto the base dir, normalizes, and probes `<path>.py` and `<path>/__init__.py` (via `probe_path` with `Language::Python`).
+- Converts the dotted remainder to a path segment, joins onto the base dir, normalizes, and probes `<path>.py`, `<path>/__init__.py`, then the `.pyi` stub forms (via `probe_path` with `Language::Python`).
 - A bare `.`/`..` (as in `from . import x`, module path `.`) resolves to the base directory's `__init__.py`.
+
+### Python absolute imports and package roots
+
+Python's runtime resolution of `import mypkg.mod` searches `sys.path`. A static scan has no `sys.path`, so `resolver/python_roots.rs` reconstructs a plausible candidate set from the scanned file paths alone (`PythonPackageRoots::from_file_paths`):
+
+1. The repository root (`""`) is always a candidate.
+2. Every directory literally named `src` is a candidate (`src` is never itself an importable package).
+3. For every *package* directory (containing `__init__.py` or `__init__.pyi`), walk up while the parent is also a package; the **parent of the topmost package** in that unbroken chain is a candidate. This is what makes monorepo `packages/<name>/<name>/__init__.py` layouts yield `packages/<name>` as a root.
+
+`PythonPackageRoots::ordered_for(from_file)` then orders the candidates per importing file: roots that contain the importing file first (deepest first), then the rest (deepest first), lexicographic tie-break. `ImportResolver::resolve_python_absolute` converts the dotted module path to `a/b/c` and, for each root in that order, tries an exact path-map hit and then `probe_path(.., Language::Python, ..)`. The first hit wins; nothing matching means no edge (stdlib/third-party).
+
+This branch runs for **all** Python absolute imports — dotted (`pkg.sub.mod`) and bare (`pkg`, `module`) alike — replacing the previous repo-root-only dotted probe and the bare exact-match lookup.
+
+### `.pyi` stubs
+
+`.pyi` maps to `Language::Python` (`model/node.rs`), so stubs are scanned, parsed, and resolvable. Ordering guarantees a real module always beats its stub:
+- `PYTHON_EXTENSIONS` probes `.py`, `/__init__.py`, `.pyi`, `/__init__.pyi` in that order.
+- `path_to_id` also holds extension-stripped keys, and `pkg/mod.py` / `pkg/mod.pyi` collide on `pkg/mod`. `stripped_key_rank` ranks `.pyi` below everything else, so the winner is chosen by rank rather than by `HashMap` iteration order.
+
+### Stripped-key collisions across languages
+
+Rank does not settle every collision: in a polyglot repo `shared/util.py` and `shared/util.ts` also strip to `shared/util` and rank equally. Ties are therefore broken on the full path, making the winner arbitrary but **stable** — otherwise the same scan could resolve the same import differently between runs, since the map is built by iterating a `HashMap`.
+
+Stability is all this guarantees. The stripped key is consulted *before* language-aware extension probing, so a cross-language collision can still resolve to a file in the wrong language. That is a pre-existing limitation, not a Python-specific one; fixing it means reordering exact-match and probe steps in `resolve_import_path`.
 
 ## Files
 
@@ -60,9 +88,15 @@ Resolution runs inside `parse_repo` (`crates/cc-tauri/src/commands/parse.rs`) af
 |------|------|------------------------|
 | `crates/cc-core/src/model/edge.rs` | Edge model | `Resolution` enum (ordered worst->best), `CodeEdge { resolution }`, `CodeEdge::new(..)` |
 | `crates/cc-core/src/model/graph.rs` | Graph + merge | `CodeGraph::add_edge` keeps max resolution on merge |
-| `crates/cc-core/src/resolver/import_resolver.rs` | Import resolution | `ImportResolver::resolve -> (Vec<CodeEdge>, ImportMap)`, `ImportMap`, `resolve_python_relative` |
+| `crates/cc-core/src/resolver/import_resolver.rs` | Import resolution | `ImportResolver::resolve -> (Vec<CodeEdge>, ImportMap)`, `ImportMap`, `resolve_python_relative`, `resolve_python_absolute`, `stripped_key_rank` |
+| `crates/cc-core/src/resolver/python_roots.rs` | Python package-root detection | `PythonPackageRoots::from_file_paths`, `roots`, `ordered_for` |
 | `crates/cc-core/src/resolver/symbol_table.rs` | Precision ladder | `SymbolTable { by_file, node_to_file }`, `resolve_references(refs, imports)`, `resolve_via_ladder`, `MAX_AMBIGUOUS_CANDIDATES` |
-| `crates/cc-core/src/resolver/extension_probe.rs` | Extension probing | `probe_path` (Python probes `.py` + `/__init__.py`) |
+| `crates/cc-core/src/resolver/extension_probe.rs` | Extension probing | `probe_path` (Python probes `.py`, `/__init__.py`, `.pyi`, `/__init__.pyi` in that order) |
+| `crates/cc-core/src/repo/scanner.rs` | Scanning + ignore rules | `RepoScanner::scan`, `DirIgnoreRule`, `dir_ignore_rule` |
+| `crates/cc-core/src/model/node.rs` | Language mapping | `Language::from_extension` (`py`, `pyi` -> Python) |
+| `crates/cc-core/tests/fixtures/python_src_layout/` | On-disk fixture | src layout + subpackage + `tests/` + `.pyi` stub + `venv/`/`__pycache__/`/`build/` decoys |
+| `crates/cc-core/tests/python_seam_test.rs` | Extraction/resolution seam | Pins the two halves together on aliased, multi-name, star and bare-package imports; fails if either half regresses |
+| `crates/cc-core/tests/python_resolution_test.rs` | End-to-end test | scan -> parse -> `ImportResolver::resolve` over the fixture |
 | `crates/cc-tauri/src/commands/parse.rs` | Orchestration | imports resolved before symbol references; passes `import_map` |
 | `packages/app/src/api/types.ts` | FE types | `Resolution` union, `CodeEdge.resolution` |
 | `packages/app/src/canvas/layout/elkLayout.ts` | Layout + filter | `LayoutEdge.resolution`, `hideAmbiguousEdges` param |
@@ -83,3 +117,9 @@ Resolution runs inside `parse_repo` (`crates/cc-tauri/src/commands/parse.rs`) af
 - The serde form of `Resolution` is the plain variant name; the frontend `Resolution` union must match it exactly.
 - Aggregated (collapsed-container) edges have `resolution === null` and are always drawn solid; only direct edges can be ambiguous/dashed.
 - Python leading-dot handling must run before the generic `./`-style branch and only for Python source.
+- `RawRefKind::Import { module_path }` for Python is the clean dotted module path exactly as written in source, with any `as` alias clause stripped and imported symbol names excluded; one ref per imported module. The resolver relies on this shape (`"os"`, `"numpy"`, `"a.b.c"`, `"mypkg.mod"`, `".rel"`, `"."`, `"..pkg.sub"`).
+- The repo root (`""`) is always a Python package root, so flat layouts keep resolving without any `__init__.py` present.
+- `PythonPackageRoots` ordering must be total and deterministic; resolution takes the **first** root that produces a hit, so ordering is semantics, not an optimisation.
+- Root detection never inspects the filesystem — it is a pure function of the scanned file path set, so it stays correct for graphs built in memory (tests) and for cloned repos alike.
+- A `.pyi` stub must never shadow the module it stubs. Two places enforce this: the `PYTHON_EXTENSIONS` probe order and `stripped_key_rank` in the path map.
+- Scanner ignore rules match **directory names only**. `DirIgnoreRule::Always` names are dropped unconditionally; `DirIgnoreRule::UnlessPythonPackage` names (`build`, `dist`) are dropped only when the directory has no `__init__.py`/`__init__.pyi`, so a genuine package named `build` survives. The scan root itself (depth 0) is never filtered.
