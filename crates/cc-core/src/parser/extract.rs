@@ -1180,6 +1180,139 @@ mod tests {
         assert_eq!(python_type_ref_names("type Alias = A | B"), vec!["A", "B"]);
     }
 
+    // -- C3: string forward references in annotations --
+
+    #[test]
+    fn test_python_string_forward_reference() {
+        assert_eq!(
+            python_type_ref_names("def f(x: \"Fwd\") -> \"Ret\":\n    pass"),
+            vec!["Fwd", "Ret"]
+        );
+    }
+
+    #[test]
+    fn test_python_string_forward_reference_inside_generic() {
+        assert_eq!(
+            python_type_ref_names("def f(x: List[\"Fwd\"]):\n    pass"),
+            vec!["Fwd"]
+        );
+    }
+
+    #[test]
+    fn test_python_string_forward_reference_with_subscript_content() {
+        assert_eq!(
+            python_type_ref_names("def f(x: \"Optional[Fwd]\"):\n    pass"),
+            vec!["Fwd"]
+        );
+        assert_eq!(
+            python_type_ref_names("def f(x: \"dict[str, MyClass]\"):\n    pass"),
+            vec!["MyClass"]
+        );
+        assert_eq!(
+            python_type_ref_names("def f(x: \"A | B\"):\n    pass"),
+            vec!["A", "B"]
+        );
+    }
+
+    #[test]
+    fn test_python_string_forward_reference_dotted_uses_leaf() {
+        assert_eq!(
+            python_type_ref_names("def f(x: \"mod.Deep\"):\n    pass"),
+            vec!["Deep"]
+        );
+    }
+
+    #[test]
+    fn test_python_string_forward_reference_filters_builtins_and_typing() {
+        assert!(python_type_ref_names("def f(x: \"int\") -> \"None\":\n    pass").is_empty());
+        assert!(python_type_ref_names("def f(x: \"Any\"):\n    pass").is_empty());
+        assert!(python_type_ref_names("def f(x: \"Callable[[int], str]\"):\n    pass").is_empty());
+    }
+
+    #[test]
+    fn test_python_string_forward_reference_on_variable_annotation() {
+        assert_eq!(
+            python_type_ref_names("def f():\n    x: \"Fwd\" = make()"),
+            vec!["Fwd"]
+        );
+    }
+
+    #[test]
+    fn test_python_docstring_is_never_a_type_reference() {
+        let source = "def f(x: int):\n    \"\"\"MyClass does the thing.\"\"\"\n    return x";
+        assert!(
+            python_type_ref_names(source).is_empty(),
+            "docstrings must not produce type references, got {:?}",
+            python_type_ref_names(source)
+        );
+        let class_doc = "class C:\n    \"\"\"Wraps MyClass.\"\"\"\n    pass";
+        assert!(python_type_ref_names(class_doc).is_empty());
+        let module_doc = "\"\"\"Module docs mentioning MyClass.\"\"\"\n";
+        assert!(python_type_ref_names(module_doc).is_empty());
+    }
+
+    #[test]
+    fn test_python_ordinary_string_values_are_never_type_references() {
+        // Default value, plain assignment, call argument, dict value, and an
+        // annotated assignment whose *value* (not annotation) is a string.
+        for source in [
+            "def f(x: str = \"MyClass\"):\n    pass",
+            "NAME = \"MyClass\"",
+            "def f():\n    call(\"MyClass\")",
+            "def f():\n    d = {\"MyClass\": 1}",
+            "NAME: str = \"MyClass\"",
+            "def f():\n    return \"MyClass\"",
+        ] {
+            assert!(
+                python_type_ref_names(source).is_empty(),
+                "string value must not become a type reference in: {source:?} (got {:?})",
+                python_type_ref_names(source)
+            );
+        }
+    }
+
+    #[test]
+    fn test_python_literal_and_annotated_strings_are_values_not_type_references() {
+        // `Literal["a"]` enumerates string *values*; `Annotated[T, "note"]`
+        // carries metadata. Neither is a forward reference.
+        for source in [
+            "def f(x: Literal[\"MyClass\"]):\n    pass",
+            "def f(x: list[Literal[\"MyClass\", \"Other\"]]):\n    pass",
+            "NAMES: list[Literal[\"MyClass\"]] = []",
+            "def f(x: Annotated[int, \"MyClass\"]):\n    pass",
+        ] {
+            assert!(
+                python_type_ref_names(source).is_empty(),
+                "Literal/Annotated strings must not become type references in: {source:?} (got {:?})",
+                python_type_ref_names(source)
+            );
+        }
+        // A genuine forward reference in a normal generic still works.
+        assert_eq!(
+            python_type_ref_names("def f(x: list[\"MyClass\"]):\n    pass"),
+            vec!["MyClass"]
+        );
+    }
+
+    #[test]
+    fn test_python_unparseable_string_annotation_emits_nothing() {
+        for source in [
+            "def f(x: \"not a real type!\"):\n    pass",
+            "def f(x: \"lambda: 3\"):\n    pass",
+            "def f(x: \"\"):\n    pass",
+            "def f(x: \"1234\"):\n    pass",
+            "def f(x: \"Literal['a']\"):\n    pass",
+            "def f(x: f\"Fwd\"):\n    pass",
+            "def f(x: b\"Fwd\"):\n    pass",
+        ] {
+            assert!(
+                python_type_ref_names(source).is_empty(),
+                "non-name string annotation must emit nothing in: {source:?} (got {:?})",
+                python_type_ref_names(source)
+            );
+        }
+    }
+
     // -- TypeScript tests --
 
     #[test]

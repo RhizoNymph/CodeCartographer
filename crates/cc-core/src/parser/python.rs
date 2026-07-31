@@ -276,9 +276,10 @@ fn collect_decorator(source: &str, node: &Node, from_id: &NodeId, refs: &mut Vec
 // ---------------------------------------------------------------------------
 
 /// A `type` node wrapping a plain name: `x: MyClass` or `x: mod.MyClass`.
-/// Composite forms (`generic_type`, `binary_operator`, string forward refs)
-/// are handled by their own arms as the walk reaches them, so a nested
-/// annotation contributes each leaf name exactly once.
+/// Composite forms (`generic_type`, `binary_operator`) are handled by their own
+/// arms as the walk reaches them, so a nested annotation contributes each leaf
+/// name exactly once. A `string` child is a PEP 484 forward reference and is
+/// parsed here (its content is text, so the walk cannot reach into it).
 fn collect_type_annotation(
     source: &str,
     node: &Node,
@@ -291,6 +292,12 @@ fn collect_type_annotation(
     let Some(inner) = node.named_child(0) else {
         return;
     };
+    if inner.kind() == "string" {
+        if !is_string_valued_type_parameter(node, source) {
+            collect_string_forward_reference(source, &inner, from_id, refs);
+        }
+        return;
+    }
     if let Some(name) = leaf_name(&inner, source) {
         emit_type_reference(refs, from_id, name, &inner);
     }
@@ -370,6 +377,147 @@ fn is_type_alias_declaration(node: &Node) -> bool {
         current = parent;
     }
     false
+}
+
+// ---------------------------------------------------------------------------
+// String forward references
+// ---------------------------------------------------------------------------
+
+/// PEP 484 string forward references (`x: "Fwd"`, `List["Fwd"]`,
+/// `def f() -> "Optional[Fwd]"`). Only reached from inside a `type` node, so an
+/// ordinary string (docstring, default value, dict key, call argument) can
+/// never land here.
+///
+/// The content is text, not a parsed subtree, so it is scanned for the same
+/// leaf names a real annotation would emit and passed through the same
+/// builtin/typing filtering. Anything that is not a plain type expression
+/// (quotes, calls, operators other than `|`, non-identifier segments) emits
+/// nothing at all rather than guessing.
+fn collect_string_forward_reference(
+    source: &str,
+    node: &Node,
+    from_id: &NodeId,
+    refs: &mut Vec<RawReference>,
+) {
+    let Some(content) = plain_string_content(source, node) else {
+        return;
+    };
+    let Some(names) = type_expression_leaf_names(&content) else {
+        return;
+    };
+    for name in names {
+        emit_type_reference(refs, from_id, name, node);
+    }
+}
+
+/// True when this `type` node is a parameter of a generic whose strings are
+/// *values*, not forward references: `Literal["a", "b"]` enumerates literal
+/// strings, and `Annotated[T, "note"]` carries arbitrary metadata. Emitting
+/// type references from those is pure noise.
+///
+/// Looks only at the node's own parent chain (`type` -> `type_parameter` ->
+/// `generic_type`), never the subtree.
+fn is_string_valued_type_parameter(node: &Node, source: &str) -> bool {
+    let Some(param_list) = node.parent() else {
+        return false;
+    };
+    if param_list.kind() != "type_parameter" {
+        return false;
+    }
+    let Some(generic) = param_list.parent() else {
+        return false;
+    };
+    if generic.kind() != "generic_type" {
+        return false;
+    }
+    let Some(base) = generic.named_child(0) else {
+        return false;
+    };
+    matches!(
+        leaf_name(&base, source).as_deref(),
+        Some("Literal" | "Annotated")
+    )
+}
+
+/// Content of an unprefixed, non-interpolated string literal. Rejects f-strings,
+/// byte strings and raw strings (their prefix makes them something other than a
+/// forward reference) and concatenated/interpolated forms.
+fn plain_string_content(source: &str, node: &Node) -> Option<String> {
+    let mut content: Option<String> = None;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "string_start" | "string_end" => {
+                let text = node_text(&child, source)?;
+                if !text.chars().all(|c| c == '"' || c == '\'') {
+                    return None; // f"", b"", r"", u"" ...
+                }
+            }
+            "string_content" => {
+                if content.is_some() {
+                    return None; // more than one content chunk
+                }
+                content = Some(node_text(&child, source)?);
+            }
+            // `interpolation`, `escape_sequence`, anything else: not a plain name.
+            _ => return None,
+        }
+    }
+    content
+}
+
+/// Split a textual type expression into the leaf names a parsed annotation
+/// would have produced, or `None` when the text is not a type expression.
+///
+/// `"Optional[Fwd]"` -> `["Optional", "Fwd"]`, `"mod.Deep"` -> `["Deep"]`,
+/// `"A | B"` -> `["A", "B"]`. Filtering of builtins/typing names happens in
+/// [`emit_type_reference`], so `Optional` never reaches the graph.
+fn type_expression_leaf_names(content: &str) -> Option<Vec<String>> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Conservative charset: identifiers, dotted paths, subscripts, unions.
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '[' | ']' | ',' | '|' | ' '))
+    {
+        return None;
+    }
+
+    let mut names = Vec::new();
+    for token in trimmed.split(['[', ']', ',', '|', ' ']) {
+        if token.is_empty() {
+            continue;
+        }
+        let mut segments = token.split('.');
+        // Every segment must be a plain identifier; a stray literal (`3`) or an
+        // empty segment (`a..b`) means this is not a name expression.
+        let mut leaf = None;
+        for segment in &mut segments {
+            if !is_python_identifier(segment) {
+                return None;
+            }
+            leaf = Some(segment.to_string());
+        }
+        if let Some(leaf) = leaf {
+            names.push(leaf);
+        }
+    }
+    if names.is_empty() {
+        None
+    } else {
+        Some(names)
+    }
+}
+
+fn is_python_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 // ---------------------------------------------------------------------------

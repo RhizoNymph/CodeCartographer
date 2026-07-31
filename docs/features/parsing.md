@@ -20,7 +20,6 @@
   `np.array()` still resolves by the bare name `array`). Only `from x import y as z`
   *symbol* bindings are recorded.
 - Resolving `self.helper()` to the enclosing class rather than by bare method name
-- Python string forward references in annotations (`x: "Fwd"`)
 
 ## Data/Control Flow
 
@@ -143,14 +142,32 @@ lets the walk reach the rest:
 
 Names matching `is_python_builtin_type` or `is_typing_construct` (`Optional`,
 `List`, `Dict`, `Union`, `Any`, `Callable`, `Protocol`, ...) are dropped. Result:
-`list[MyClass]` yields exactly one `TypeReference` named `MyClass`. String forward
-references (`x: "Fwd"`) are not resolved.
+`list[MyClass]` yields exactly one `TypeReference` named `MyClass`.
 
 The `left:` side of a PEP 695 `type X[T] = ...` statement is skipped
 (`is_type_alias_declaration`, an ancestor walk): in the grammar the alias name
 and its parameter list are themselves `type` / `generic_type` nodes, so without
 the guard the alias block would emit a `TypeReference` to itself and to its own
 type parameters. The `right:` side behaves normally.
+
+**String forward references** — a `type` node whose child is a `string` is a
+PEP 484 forward reference (`x: "Fwd"`, `List["Fwd"]`, `def f() -> "Optional[Fwd]"`).
+Its content is text rather than a parsed subtree, so it is scanned textually and
+then passed through the *same* `emit_type_reference` filtering as a real
+annotation. Rules:
+- only unprefixed, non-interpolated string literals qualify (`f""`, `b""`, `r""`
+  and escapes are rejected);
+- the content must consist solely of identifiers, `.`, `[`, `]`, `,`, `|` and
+  spaces, and every dotted segment must be a valid identifier — otherwise
+  **nothing** is emitted rather than a guess;
+- each dotted name contributes its last segment (`"mod.Deep"` -> `Deep`), and
+  builtins/typing constructs are filtered as usual (`"Optional[Fwd]"` -> `Fwd`);
+- strings that are *values* rather than types are excluded: a `type` node whose
+  parent chain is `type_parameter` -> `generic_type` based on `Literal` or
+  `Annotated` emits nothing (`Literal["a", "b"]`, `Annotated[int, "note"]`).
+
+Because the rule fires only inside a `type` node, ordinary strings — docstrings,
+default values, dict keys, call arguments, plain assignments — can never reach it.
 
 **Inheritance** — an `argument_list` whose parent is a `class_definition` emits one
 `Inheritance` ref per base: `identifier` and `attribute` (last segment) directly,
@@ -204,6 +221,9 @@ Consolidates extension probing logic used by the import resolver:
 - `RawRefKind::ImportedSymbol` never yields an edge, in any resolver. Its
   `module_path` has exactly the same shape as `Import { module_path }`. Adding
   bindings must never change symbol-edge *volume*, only edge *targets*.
+- A string in type position is only treated as a forward reference when it
+  parses as a plain type expression; anything else emits nothing. Strings that
+  are not inside a `type` node are never inspected at all.
 - Python module-level bindings only become blocks when the assignment is a direct
   child of the module body and binds a single identifier; nothing inside a class
   body or function body is ever classified.
