@@ -4,6 +4,8 @@ import { Sidebar } from "./sidebar/Sidebar";
 import { Canvas } from "./canvas/Canvas";
 import { Tooltip } from "./canvas/Tooltip";
 import { FocusBreadcrumb } from "./canvas/FocusBreadcrumb";
+import { SelectionChip } from "./canvas/SelectionChip";
+import { useFocusHotkey } from "./canvas/useFocusHotkey";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { useGraphStore } from "./stores/graphStore";
 
@@ -11,6 +13,9 @@ export function App() {
   const graph = useGraphStore((s) => s.graph);
   const isLoaded = graph !== null;
   const saveCurrentState = useGraphStore((s) => s.saveCurrentState);
+
+  // "F" focuses the hovered (or selected) node from anywhere in the app.
+  useFocusHotkey();
 
   // Save state when the app closes
   useEffect(() => {
@@ -43,6 +48,7 @@ export function App() {
           <Canvas />
         </ErrorBoundary>
         <Tooltip />
+        <SelectionChip />
         <FocusBreadcrumb />
       </div>
     </div>

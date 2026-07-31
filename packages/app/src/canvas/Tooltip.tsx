@@ -37,7 +37,6 @@ export function Tooltip() {
   const graph = useGraphStore((s) => s.graph);
   const hoveredNodeId = useGraphStore((s) => s.hoveredNodeId);
   const hoveredEdgeInfo = useGraphStore((s) => s.hoveredEdgeInfo);
-  const enterFocus = useGraphStore((s) => s.enterFocus);
 
   // Edge tooltip (shown when hovering an edge and NOT hovering a node)
   if (!hoveredNodeId && hoveredEdgeInfo) {
@@ -103,24 +102,36 @@ export function Tooltip() {
           {node.children.length} items
         </span>
       )}
-      <button
-        onClick={() => enterFocus(node.id)}
-        title="Focus on this node's neighborhood"
+      {/*
+        A hint, not a button: this tooltip unmounts on pointerout, so anything
+        clickable here is unreachable -- the pointer has to leave the node to
+        get to it. The reachable Focus affordances are the F hotkey and the
+        selection chip.
+      */}
+      <span
         style={{
-          pointerEvents: "auto",
           marginLeft: 4,
-          padding: "1px 8px",
+          display: "flex",
+          alignItems: "center",
+          gap: 5,
           fontSize: 10,
-          fontWeight: 600,
-          border: "1px solid #3b82f6",
-          borderRadius: 4,
-          cursor: "pointer",
-          background: "#1e3a5f",
           color: "#93c5fd",
+          whiteSpace: "nowrap",
         }}
       >
-        Focus
-      </button>
+        <kbd
+          style={{
+            padding: "0 5px",
+            border: "1px solid #3b5f8f",
+            borderRadius: 3,
+            fontFamily: "inherit",
+            fontWeight: 600,
+          }}
+        >
+          F
+        </kbd>
+        focus
+      </span>
     </div>
   );
 }

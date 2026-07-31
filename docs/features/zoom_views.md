@@ -16,8 +16,9 @@
 - **Focus mode** (drill-down): scope symbol detail to a bounded neighborhood of
   a node so the full symbol graph is never laid out. Backed by the cc-core
   `neighborhood` BFS query and the `get_neighborhood` Tauri command.
-- Focus entry points: Sidebar row "Focus" button (selected node), node Tooltip
-  "Focus" button, and module-view double-click on a File.
+- Focus entry points: the `F` hotkey (hovered node, falling back to the selected
+  one), the canvas selection chip's "Focus" button, the Sidebar row "Focus"
+  button (selected node), and module-view double-click on a File.
 - Focus exit: breadcrumb chip overlay (name + 1/2-hop depth selector + X) and
   the Esc key.
 
@@ -57,7 +58,8 @@ layoutVersion + persist. Entering module view drops any active focus.
 ### Focus mode (drill-down)
 
 ```
-enterFocus(nodeId, depth) [Sidebar/Tooltip/module double-click]
+enterFocus(nodeId, depth) [F hotkey / SelectionChip / Sidebar row /
+                           module-view File double-click]
   -> getNeighborhood(nodeId, depth, enabledEdgeKinds)  (Tauri IPC)
        -> cc-core CodeGraph::neighborhood(focus, depth, kinds):
             BFS over BOTH forward_adj and reverse_adj, bounded by depth (1..=2),
@@ -78,6 +80,29 @@ Breadcrumb chip (FocusBreadcrumb.tsx):
   depth selector -> setFocusDepth(d) -> re-enterFocus(focusNodeId, d)
   X / Esc        -> exitFocus -> clear focusNodeId + focusNeighborhood,
                      bump layoutVersion (view mode stays "symbol")
+```
+
+### Canvas focus affordances (hotkey + selection chip)
+
+```
+window keydown (useFocusHotkey, mounted in App)
+  -> describeKeyEvent(e)                       (DOM -> plain fields)
+  -> resolveFocusHotkey(event, {hovered, selected, focusNodeId})   (PURE)
+       "f"/"F", no ctrl/meta/alt, not typing in INPUT/TEXTAREA/SELECT
+       or a contenteditable
+       -> target = hoveredNodeId ?? selectedNodeId   (hover wins: enterFocus
+          sets selectedNodeId, so a stale selection must not shadow the hover)
+       -> {kind:"focus", nodeId} | {kind:"ignore", reason}
+  -> enterFocus(nodeId)
+
+SelectionChip (top-centre overlay), shown when selectedNodeId && !focusNodeId:
+  name/kind + "Focus (F)" button -> enterFocus(selectedNodeId)
+  x -> setSelectedNode(null)
+  Selection is sticky (node pointerdown sets it, empty-space pointerdown
+  clears it), so the button survives pointer travel.
+
+Tooltip (bottom-centre, hover-driven): shows a non-interactive "F focus" hint
+only -- it unmounts on pointerout, so a button there is unreachable.
 ```
 
 ## Related Files
@@ -113,8 +138,18 @@ Breadcrumb chip (FocusBreadcrumb.tsx):
   selector + X + Esc).
 - `packages/app/src/toolbar/Toolbar.tsx` — Module|Symbol segmented control;
   edge-kind toggles + ambiguous checkbox hidden in module view.
+- `packages/app/src/canvas/focusHotkey.ts` — PURE `resolveFocusHotkey(event,
+  context) -> FocusHotkeyResult` (`{kind:"focus"}` | `{kind:"ignore", reason}`);
+  no DOM or store imports.
+- `packages/app/src/canvas/useFocusHotkey.ts` — window keydown listener that
+  adapts the DOM event and dispatches `enterFocus`; mounted once in `App.tsx`.
+- `packages/app/src/canvas/SelectionChip.tsx` — top-centre chip for the selected
+  node with the "Focus (F)" button; hidden while focus mode is active (the
+  breadcrumb owns that slot).
+- `packages/app/src/App.tsx` — mounts `useFocusHotkey()` and `<SelectionChip />`.
 - `packages/app/src/sidebar/Sidebar.tsx` — "Focus" button on the selected row.
-- `packages/app/src/canvas/Tooltip.tsx` — "Focus" button in the node tooltip.
+- `packages/app/src/canvas/Tooltip.tsx` — hover tooltip; carries an
+  "F focus" hint (no button — see the unreachability invariant).
 - `packages/app/src/canvas/renderers/PixiRenderer.ts` — module-view double-click
   on a File calls `enterFocus` instead of `toggleExpanded`.
 - `packages/app/src/api/{types,commands}.ts` — `Neighborhood` type +
@@ -127,6 +162,8 @@ Breadcrumb chip (FocusBreadcrumb.tsx):
 - `packages/app/tests/graphViewModel.test.ts` — module-view derivation + focus
   set derivation.
 - `packages/app/tests/focusReducer.test.ts` — focus/view reducer transitions.
+- `packages/app/tests/focusHotkey.test.ts` — hotkey resolution: hover-over-
+  selection precedence, modifier/typing/no-target/already-focused ignores.
 - `packages/app/tests/viewModePersistence.test.ts` — viewMode persistence
   round-trip + backward compat.
 
@@ -152,3 +189,15 @@ Breadcrumb chip (FocusBreadcrumb.tsx):
   so `get_neighborhood` works without an explicit `rebuild_adjacency`.
 - **Focus is transient.** Only `viewMode` persists; focus clears on new graph
   load and on switching to module view.
+- **Hover-driven overlays never hold actions.** The tooltip unmounts on
+  `pointerout`, so any control inside it is destroyed by the pointer travelling
+  toward it. Focus actions live on selection-anchored UI (SelectionChip,
+  Sidebar row) or the `F` hotkey, which need no pointer travel.
+- **Hover wins over selection for the hotkey.** `enterFocus` sets
+  `selectedNodeId` to the focus node, so resolving selection first would pin the
+  hotkey to the current focus node and make re-focusing by hover impossible.
+- **The hotkey yields to text entry.** `f` in an `INPUT`/`TEXTAREA`/`SELECT` or
+  contenteditable (e.g. sidebar search) types normally, as does any `f` with
+  ctrl/meta/alt held.
+- **One top-centre chip at a time.** `SelectionChip` renders only when
+  `focusNodeId` is null; `FocusBreadcrumb` only when it is set.
