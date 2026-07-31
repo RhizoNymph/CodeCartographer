@@ -21,13 +21,13 @@ Overview:
         4. Frontend graphStore converts the ParseResult into a CodeGraph (node tree + nodeEdgeKinds Map, no edges) and computes visibility/expansion state. The hideUnconnectedNodes filter (visibilityFilter) runs synchronously from nodeEdgeKinds.
         5. Canvas derives the effective layout inputs from the zoom-level viewMode (default "module"): module view forces edge kinds to {Import} and treats files as collapsed (saved state preserved but ignored); symbol view uses the user's edge kinds + expansion; a focus neighborhood, when active, restricts visibility/expansion to the fetched neighborhood ids. Canvas passes the (edge-less) graph + effective state to PixiRenderer.
         6. PixiRenderer delegates to elkLayout: build the ELK node tree, collect the render set (elkNodeIds), fetch per-view direct + aggregated edges via get_subgraph(render_ids, edge_kinds) computed server-side (direct edges carry a Resolution; ambiguous edges may be hidden client-side), then render nodes and edges on the Pixi.js canvas. Views over 1500 rendered nodes skip ELK edge routing and use straight-line fallback edges.
-        7. User interactions (hover, select, expand, drag, zoom) update stores and trigger re-renders. Edge tooltips read kind + count from the layout edges (aggregated edges carry a collapsed count).
+        7. User interactions (hover, select, expand, drag, zoom) update stores and trigger re-renders. Edge tooltips read kind + count from the layout edges (aggregated edges carry a collapsed count). Aggregated edges (count > 1) additionally render a world-space "×N" chip at the arc-length midpoint of their routed polyline, at the "detail" LOD only.
         8. Focus / drill-down: the user focuses a node (Sidebar/Tooltip Focus button, or a module-view File double-click) -> get_neighborhood(node_id, depth, edge_kinds) runs a bidirectional BFS in cc-core and returns the neighborhood node ids (incl. container chain) + direct edges -> the store switches to symbol view and the canvas lays out ONLY that neighborhood. A breadcrumb chip (depth selector + X) and Esc exit focus.
 
 Features Index:
     canvas-rendering:
-        description: Interactive Pixi.js canvas with node rendering, edge drawing, minimap, drag, and LOD-based visibility.
-        entry_points: [packages/app/src/canvas/renderers/PixiRenderer.ts, packages/app/src/canvas/Canvas.tsx]
+        description: Interactive Pixi.js canvas with node rendering, edge drawing, minimap, drag, and LOD-based visibility. Aggregated (collapsed-container) edges carry "xN" count chips drawn at the arc-length midpoint of their routed polyline, shown at the "detail" LOD only and dimmed in step with the edge they label.
+        entry_points: [packages/app/src/canvas/renderers/PixiRenderer.ts, packages/app/src/canvas/Canvas.tsx, packages/app/src/canvas/renderers/edgeLabels.ts]
         depends_on: [graph-layout]
         doc: docs/features/canvas-rendering.md
 
