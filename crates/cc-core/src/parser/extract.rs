@@ -47,6 +47,12 @@ pub enum RawRefKind {
     },
     FunctionCall,
     MethodCall,
+    /// A method call whose receiver is the enclosing instance itself
+    /// (`self.helper()`, `cls.build()`). Resolves exactly like
+    /// [`RawRefKind::MethodCall`] (same [`crate::model::EdgeKind`]) but the
+    /// resolver can first look for the method on the enclosing class instead of
+    /// matching any same-named method in the file. Only Python emits it.
+    SelfMethodCall,
     TypeReference,
     Inheritance,
     TraitImpl,
@@ -1128,6 +1134,89 @@ mod tests {
             .find(|r| matches!(r.kind, RawRefKind::ImportedSymbol { .. }))
             .expect("expected an ImportedSymbol ref");
         assert_eq!(binding.from_node, file_id);
+    }
+
+    // -- C4: self-receiver method calls --
+
+    /// Collect names of SelfMethodCall refs, sorted.
+    fn python_self_call_names(source: &str) -> Vec<String> {
+        let (_, refs) = extract(source, &Language::Python);
+        let mut names: Vec<String> = refs
+            .iter()
+            .filter(|r| matches!(r.kind, RawRefKind::SelfMethodCall))
+            .map(|r| r.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn test_python_self_call_is_marked_distinctly() {
+        let source = "class C:\n    def m(self):\n        self.helper()\n        other.helper()";
+        assert_eq!(python_self_call_names(source), vec!["helper"]);
+
+        // `other.helper()` stays a plain MethodCall, and the self call is not
+        // double-counted as one.
+        let (_, refs) = extract(source, &Language::Python);
+        let method_calls: Vec<&RawReference> = refs
+            .iter()
+            .filter(|r| matches!(r.kind, RawRefKind::MethodCall))
+            .collect();
+        assert_eq!(
+            method_calls.len(),
+            1,
+            "only `other.helper()` is a plain MethodCall, got {:?}",
+            method_calls
+                .iter()
+                .map(|r| (&r.name, &r.kind))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_python_cls_call_is_a_self_call() {
+        let source = "class C:\n    @classmethod\n    def make(cls):\n        return cls._build()";
+        assert_eq!(python_self_call_names(source), vec!["_build"]);
+    }
+
+    #[test]
+    fn test_python_self_attribute_call_is_not_a_self_call() {
+        // `self.client.send()` calls a method on an *attribute*, not on self.
+        let source = "class C:\n    def m(self):\n        self.client.send()";
+        assert!(
+            python_self_call_names(source).is_empty(),
+            "only a direct `self.<name>()` receiver counts, got {:?}",
+            python_self_call_names(source)
+        );
+        let (_, refs) = extract(source, &Language::Python);
+        assert!(
+            refs.iter()
+                .any(|r| matches!(r.kind, RawRefKind::MethodCall) && r.name == "send"),
+            "it is still a plain MethodCall"
+        );
+    }
+
+    #[test]
+    fn test_non_python_self_calls_are_unchanged() {
+        // TS/Rust extraction is untouched: no language emits SelfMethodCall
+        // except Python.
+        for (source, lang) in [
+            ("class C { m() { this.helper(); } }", Language::TypeScript),
+            ("fn m(&self) { self.helper(); }", Language::Rust),
+        ] {
+            let (_, refs) = extract(source, &lang);
+            assert!(
+                !refs
+                    .iter()
+                    .any(|r| matches!(r.kind, RawRefKind::SelfMethodCall)),
+                "{lang:?} must not emit SelfMethodCall"
+            );
+            assert!(
+                refs.iter()
+                    .any(|r| matches!(r.kind, RawRefKind::MethodCall) && r.name == "helper"),
+                "{lang:?} still emits a MethodCall for `helper`"
+            );
+        }
     }
 
     // -- C2: PEP 695 `type X = Y` statements --

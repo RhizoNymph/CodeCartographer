@@ -19,7 +19,8 @@
 - Mapping a *module* alias back to its module (`import numpy as np`; a later
   `np.array()` still resolves by the bare name `array`). Only `from x import y as z`
   *symbol* bindings are recorded.
-- Resolving `self.helper()` to the enclosing class rather than by bare method name
+- Resolving an *inherited* `self.helper()` to the base class that declares it
+  (only methods the enclosing class declares itself are matched precisely)
 
 ## Data/Control Flow
 
@@ -169,6 +170,14 @@ annotation. Rules:
 Because the rule fires only inside a `type` node, ordinary strings — docstrings,
 default values, dict keys, call arguments, plain assignments — can never reach it.
 
+**Calls** — a `call` whose `function:` is an `attribute` is a `MethodCall`,
+anything else a `FunctionCall`. A method call whose receiver is *literally* the
+identifier `self` or `cls` is instead a `SelfMethodCall`, which carries the same
+`EdgeKind::MethodCall` but lets the resolver look the name up on the enclosing
+class first (see `resolution_precision.md`). The check is deliberately strict:
+in `self.client.send()` the receiver of `send` is `self.client`, not `self`, so
+that call stays a plain `MethodCall`. No other language emits `SelfMethodCall`.
+
 **Inheritance** — an `argument_list` whose parent is a `class_definition` emits one
 `Inheritance` ref per base: `identifier` and `attribute` (last segment) directly,
 `subscript` via its `value:` field (`Generic[T]` -> `Generic`), and
@@ -224,6 +233,10 @@ Consolidates extension probing logic used by the import resolver:
 - A string in type position is only treated as a forward reference when it
   parses as a plain type expression; anything else emits nothing. Strings that
   are not inside a `type` node are never inspected at all.
+- `RawRefKind::SelfMethodCall` always maps to `EdgeKind::MethodCall`. It can
+  only ever *narrow* a resolution: when the enclosing class declares no such
+  member the reference falls through to the ordinary ladder, so behaviour is
+  never worse than a plain `MethodCall`.
 - Python module-level bindings only become blocks when the assignment is a direct
   child of the module body and binds a single identifier; nothing inside a class
   body or function body is ever classified.

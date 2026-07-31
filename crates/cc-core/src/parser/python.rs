@@ -243,13 +243,29 @@ fn collect_call(source: &str, node: &Node, from_id: &NodeId, refs: &mut Vec<RawR
     let Some(func) = node.child_by_field_name("function") else {
         return;
     };
-    let kind = if func.kind() == "attribute" {
-        RawRefKind::MethodCall
-    } else {
+    let kind = if func.kind() != "attribute" {
         RawRefKind::FunctionCall
+    } else if is_self_receiver(&func, source) {
+        RawRefKind::SelfMethodCall
+    } else {
+        RawRefKind::MethodCall
     };
     let name = Extractor::extract_function_name(&func, source);
     push_ref(refs, from_id, kind, name, node);
+}
+
+/// True for `self.name` / `cls.name`, i.e. an `attribute` whose `object:` is
+/// literally the identifier `self` or `cls`. Deliberately strict: in
+/// `self.client.send()` the receiver of `send` is `self.client`, not `self`,
+/// so that call stays a plain `MethodCall`.
+fn is_self_receiver(attribute: &Node, source: &str) -> bool {
+    let Some(object) = attribute.child_by_field_name("object") else {
+        return false;
+    };
+    if object.kind() != "identifier" {
+        return false;
+    }
+    matches!(node_text(&object, source).as_deref(), Some("self" | "cls"))
 }
 
 /// Bare decorators (`@my_decorator`, `@mod.cached`). Call-form decorators

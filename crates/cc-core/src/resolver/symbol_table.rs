@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 
-use crate::model::{CodeEdge, CodeGraph, CodeNode, EdgeKind, NodeId, Resolution};
+use crate::model::{BlockKind, CodeEdge, CodeGraph, CodeNode, EdgeKind, NodeId, Resolution};
 use crate::parser::RawReference;
 
 use super::import_resolver::ImportMap;
@@ -36,7 +36,20 @@ pub struct SymbolTable {
     /// Lets `resolve_references` derive the source file from a ref's `from_node`
     /// whether it is a File node (top-level import) or a nested CodeBlock.
     pub node_to_file: HashMap<NodeId, String>,
+    /// Block id -> the enclosing *block* id, when there is one. Blocks parented
+    /// directly to a File are absent. Used to walk out to the enclosing class.
+    pub parent_block: HashMap<NodeId, NodeId>,
+    /// Class block id -> (member name -> member block ids). Only
+    /// [`crate::model::BlockKind::Class`] blocks get an entry, so a
+    /// `self.helper()` call can be resolved against the methods its own class
+    /// actually declares.
+    pub class_members: HashMap<NodeId, HashMap<String, Vec<NodeId>>>,
 }
+
+/// How far out to walk looking for the class enclosing a `self.x()` call.
+/// A method sits one level below its class; the extra levels cover a call made
+/// from a nested helper function or comprehension scope.
+const MAX_ENCLOSING_CLASS_DEPTH: usize = 4;
 
 impl SymbolTable {
     pub fn new() -> Self {
@@ -70,6 +83,24 @@ impl SymbolTable {
                         .push(id.clone());
 
                     table.node_to_file.insert(id.clone(), file_path);
+
+                    // Block nesting, so `self.x()` can be resolved against the
+                    // enclosing class's own members.
+                    if let Some(CodeNode::CodeBlock {
+                        kind: parent_kind, ..
+                    }) = graph.nodes.get(parent)
+                    {
+                        table.parent_block.insert(id.clone(), parent.clone());
+                        if *parent_kind == BlockKind::Class {
+                            table
+                                .class_members
+                                .entry(parent.clone())
+                                .or_default()
+                                .entry(name.clone())
+                                .or_default()
+                                .push(id.clone());
+                        }
+                    }
                 }
                 CodeNode::File {
                     path, id: file_id, ..
@@ -108,6 +139,8 @@ impl SymbolTable {
     ///
     /// Then resolves the normalized name against the source file (derived from
     /// `raw_ref.from_node`) using the following tiers, best match first:
+    /// 0. for a `self.x()` / `cls.x()` call, a member declared by the enclosing
+    ///    class -> [`Resolution::SameFile`]
     /// 1. a match in the same file -> [`Resolution::SameFile`]
     /// 2. the symbol named by an explicit `from <module> import <name>` binding
     ///    in the source file, looked up in that module's own file
@@ -116,6 +149,11 @@ impl SymbolTable {
     /// 4. exactly one global match -> [`Resolution::GlobalUnique`]
     /// 5. 2..=5 global matches -> one [`Resolution::Ambiguous`] edge each
     /// 6. more than 5 global matches -> dropped entirely
+    ///
+    /// Tier 0 only ever *narrows*: when the enclosing class declares no such
+    /// member (an inherited or mixed-in method) the reference falls through to
+    /// the tiers below, so a `self.x()` call is never resolved worse than the
+    /// plain `MethodCall` it used to be.
     ///
     /// Tier 2 comes from [`crate::parser::RawRefKind::ImportedSymbol`] refs,
     /// which produce no edges of their own. Besides pinning the exact defining
@@ -137,11 +175,13 @@ impl SymbolTable {
                 // Resolution context only -- deliberately edge-free. See the
                 // variant's documentation in `parser/extract.rs`.
                 crate::parser::RawRefKind::ImportedSymbol { .. } => continue,
-                crate::parser::RawRefKind::FunctionCall | crate::parser::RawRefKind::MethodCall => {
+                crate::parser::RawRefKind::FunctionCall
+                | crate::parser::RawRefKind::MethodCall
+                | crate::parser::RawRefKind::SelfMethodCall => {
                     let kind = match &raw_ref.kind {
                         crate::parser::RawRefKind::FunctionCall => EdgeKind::FunctionCall,
-                        crate::parser::RawRefKind::MethodCall => EdgeKind::MethodCall,
-                        _ => unreachable!(),
+                        // A self-call is a method call; it only resolves differently.
+                        _ => EdgeKind::MethodCall,
                     };
                     // Strip method receiver: "foo.bar()" -> "bar"
                     let name = if raw_ref.name.contains('.') {
@@ -257,6 +297,26 @@ impl SymbolTable {
         bindings
     }
 
+    /// Members named `name` on the class enclosing `from_node`.
+    ///
+    /// `from_node` is normally the method the call sits in, whose parent is the
+    /// class; the walk also covers a call made from a function nested inside a
+    /// method, and the case where `from_node` is the class itself (a call in the
+    /// class body). Returns `None` when no enclosing class declares the name.
+    fn enclosing_class_member(&self, from_node: &NodeId, name: &str) -> Option<&Vec<NodeId>> {
+        let mut current = from_node;
+        for _ in 0..MAX_ENCLOSING_CLASS_DEPTH {
+            if let Some(members) = self.class_members.get(current) {
+                // The nearest enclosing class decides, even if it does not
+                // declare the name (an inherited method must not be captured by
+                // an outer class that happens to declare one).
+                return members.get(name);
+            }
+            current = self.parent_block.get(current)?;
+        }
+        None
+    }
+
     /// Apply the precision ladder for a single normalized reference, pushing the
     /// resulting edge(s) onto `edges`.
     fn resolve_via_ladder(
@@ -269,6 +329,31 @@ impl SymbolTable {
         edges: &mut Vec<CodeEdge>,
     ) {
         let source_file = self.file_of(&raw_ref.from_node).cloned();
+
+        // Tier 0: `self.helper()` / `cls.helper()` names a member of the
+        // enclosing class, not just any same-named symbol in the file. When the
+        // class declares it, that is the answer; otherwise (an inherited or
+        // mixed-in method) fall through to the normal ladder.
+        if matches!(&raw_ref.kind, crate::parser::RawRefKind::SelfMethodCall) {
+            if let Some(targets) = self.enclosing_class_member(&raw_ref.from_node, lookup_name) {
+                let mut pushed = false;
+                for target in targets {
+                    if *target != raw_ref.from_node {
+                        edges.push(CodeEdge {
+                            source: raw_ref.from_node.clone(),
+                            target: target.clone(),
+                            kind: kind.clone(),
+                            weight: 1,
+                            resolution: Resolution::SameFile,
+                        });
+                        pushed = true;
+                    }
+                }
+                if pushed {
+                    return;
+                }
+            }
+        }
 
         // Tier 1: a match in the same file.
         if let Some(file) = &source_file {
@@ -1132,6 +1217,275 @@ mod tests {
         assert!(!module_path_names_file(".", "src/pkg/__init__.py"));
         // A dot in a directory name is not an extension.
         assert!(module_path_names_file("pkg.mod", "my.dir/pkg/mod.py"));
+    }
+
+    // -- C4: self-receiver method calls --
+
+    /// Add a Python file holding `(class name, [method names])` pairs.
+    /// Returns the method ids per class, in the order given.
+    fn add_py_classes(
+        graph: &mut CodeGraph,
+        path: &str,
+        classes: &[(&str, &[&str])],
+    ) -> Vec<Vec<NodeId>> {
+        let file_id = NodeId::file(path);
+        let mut file_children = Vec::new();
+        let mut out = Vec::new();
+        let mut line = 1usize;
+        for (class_name, methods) in classes {
+            let class_id = NodeId::code_block(path, class_name, line);
+            line += 1;
+            file_children.push(class_id.clone());
+            let mut method_ids = Vec::new();
+            for method in *methods {
+                let method_id = NodeId::code_block(path, method, line);
+                line += 1;
+                method_ids.push(method_id.clone());
+                graph.add_node(CodeNode::CodeBlock {
+                    id: method_id,
+                    name: (*method).to_string(),
+                    kind: BlockKind::Function,
+                    span: make_span(),
+                    signature: None,
+                    visibility: None,
+                    parent: class_id.clone(),
+                    children: Vec::new(),
+                });
+            }
+            graph.add_node(CodeNode::CodeBlock {
+                id: class_id,
+                name: (*class_name).to_string(),
+                kind: BlockKind::Class,
+                span: make_span(),
+                signature: None,
+                visibility: None,
+                parent: file_id.clone(),
+                children: method_ids.clone(),
+            });
+            out.push(method_ids);
+        }
+        graph.add_node(CodeNode::File {
+            id: file_id,
+            name: path.to_string(),
+            path: path.to_string(),
+            language: None,
+            children: file_children,
+        });
+        out
+    }
+
+    fn self_call_ref(from: &NodeId, name: &str) -> RawReference {
+        RawReference {
+            from_node: from.clone(),
+            kind: RawRefKind::SelfMethodCall,
+            name: name.to_string(),
+            span: make_span(),
+        }
+    }
+
+    fn method_call_ref(from: &NodeId, name: &str) -> RawReference {
+        RawReference {
+            from_node: from.clone(),
+            kind: RawRefKind::MethodCall,
+            name: name.to_string(),
+            span: make_span(),
+        }
+    }
+
+    #[test]
+    fn self_call_prefers_the_enclosing_class_over_a_same_named_sibling() {
+        // Two classes in one file both declare `helper`. `self.helper()` inside
+        // A.run must reach A.helper only.
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        let classes = add_py_classes(
+            &mut graph,
+            "a.py",
+            &[("A", &["run", "helper"]), ("B", &["helper"])],
+        );
+        let a_run = classes[0][0].clone();
+        let a_helper = classes[0][1].clone();
+        let b_helper = classes[1][0].clone();
+        let table = SymbolTable::build_from_graph(&graph);
+
+        // A plain `obj.helper()` cannot tell them apart: both are same-file hits.
+        let plain = table.resolve_references(&[method_call_ref(&a_run, "helper")], &no_imports());
+        assert_eq!(plain.len(), 2, "a bare method name matches both classes");
+
+        let selfish = table.resolve_references(&[self_call_ref(&a_run, "helper")], &no_imports());
+        assert_eq!(
+            selfish.len(),
+            1,
+            "self.helper() must resolve to one target, got {selfish:?}"
+        );
+        assert_eq!(selfish[0].target, a_helper);
+        assert_ne!(selfish[0].target, b_helper);
+        assert_eq!(selfish[0].kind, EdgeKind::MethodCall);
+        assert_eq!(selfish[0].resolution, Resolution::SameFile);
+    }
+
+    #[test]
+    fn self_call_to_an_inherited_method_falls_through_to_the_normal_ladder() {
+        // A does not declare `helper`; it is inherited from a base in another
+        // file. Behaviour must be exactly what a plain MethodCall would do.
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        let classes = add_py_classes(&mut graph, "a.py", &[("A", &["run"])]);
+        add_py_file(&mut graph, "base.py", &["helper"]);
+        let a_run = classes[0][0].clone();
+        let table = SymbolTable::build_from_graph(&graph);
+
+        let imports = imports_of(&[("a.py", "base.py")]);
+        let plain = table.resolve_references(&[method_call_ref(&a_run, "helper")], &imports);
+        let selfish = table.resolve_references(&[self_call_ref(&a_run, "helper")], &imports);
+        assert_eq!(selfish.len(), 1);
+        assert_eq!(selfish[0].target, plain[0].target);
+        assert_eq!(selfish[0].resolution, Resolution::Imported);
+    }
+
+    #[test]
+    fn self_call_does_not_escape_to_an_outer_class() {
+        // A nested class declares no `helper`; the outer one does. The call must
+        // not silently bind to the outer class's method through the tier-0 walk
+        // -- it falls through to the ordinary same-file tier instead.
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        let file_id = NodeId::file("a.py");
+        let outer = NodeId::code_block("a.py", "Outer", 1);
+        let outer_helper = NodeId::code_block("a.py", "helper", 2);
+        let inner = NodeId::code_block("a.py", "Inner", 3);
+        let inner_run = NodeId::code_block("a.py", "run", 4);
+        for (id, name, kind, parent, children) in [
+            (
+                outer.clone(),
+                "Outer",
+                BlockKind::Class,
+                file_id.clone(),
+                vec![outer_helper.clone(), inner.clone()],
+            ),
+            (
+                outer_helper.clone(),
+                "helper",
+                BlockKind::Function,
+                outer.clone(),
+                vec![],
+            ),
+            (
+                inner.clone(),
+                "Inner",
+                BlockKind::Class,
+                outer.clone(),
+                vec![inner_run.clone()],
+            ),
+            (
+                inner_run.clone(),
+                "run",
+                BlockKind::Function,
+                inner.clone(),
+                vec![],
+            ),
+        ] {
+            graph.add_node(CodeNode::CodeBlock {
+                id,
+                name: name.to_string(),
+                kind,
+                span: make_span(),
+                signature: None,
+                visibility: None,
+                parent,
+                children,
+            });
+        }
+        graph.add_node(CodeNode::File {
+            id: file_id,
+            name: "a.py".to_string(),
+            path: "a.py".to_string(),
+            language: None,
+            children: vec![outer.clone()],
+        });
+        let table = SymbolTable::build_from_graph(&graph);
+
+        let edges = table.resolve_references(&[self_call_ref(&inner_run, "helper")], &no_imports());
+        // The same-file tier still finds Outer.helper -- that is the pre-existing
+        // behaviour and no worse than before -- but tier 0 must not claim it.
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, outer_helper);
+        assert_eq!(edges[0].resolution, Resolution::SameFile);
+    }
+
+    #[test]
+    fn self_call_from_a_nested_function_still_finds_the_class() {
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        let file_id = NodeId::file("a.py");
+        let class_id = NodeId::code_block("a.py", "A", 1);
+        let method = NodeId::code_block("a.py", "run", 2);
+        let nested = NodeId::code_block("a.py", "inner", 3);
+        let helper = NodeId::code_block("a.py", "helper", 4);
+        for (id, name, kind, parent, children) in [
+            (
+                class_id.clone(),
+                "A",
+                BlockKind::Class,
+                file_id.clone(),
+                vec![method.clone(), helper.clone()],
+            ),
+            (
+                method.clone(),
+                "run",
+                BlockKind::Function,
+                class_id.clone(),
+                vec![nested.clone()],
+            ),
+            (
+                nested.clone(),
+                "inner",
+                BlockKind::Function,
+                method.clone(),
+                vec![],
+            ),
+            (
+                helper.clone(),
+                "helper",
+                BlockKind::Function,
+                class_id.clone(),
+                vec![],
+            ),
+        ] {
+            graph.add_node(CodeNode::CodeBlock {
+                id,
+                name: name.to_string(),
+                kind,
+                span: make_span(),
+                signature: None,
+                visibility: None,
+                parent,
+                children,
+            });
+        }
+        graph.add_node(CodeNode::File {
+            id: file_id,
+            name: "a.py".to_string(),
+            path: "a.py".to_string(),
+            language: None,
+            children: vec![class_id],
+        });
+        let table = SymbolTable::build_from_graph(&graph);
+
+        let edges = table.resolve_references(&[self_call_ref(&nested, "helper")], &no_imports());
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, helper);
+    }
+
+    #[test]
+    fn self_call_never_produces_a_self_edge() {
+        // Recursion: `self.run()` inside `run`.
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        let classes = add_py_classes(&mut graph, "a.py", &[("A", &["run"])]);
+        let a_run = classes[0][0].clone();
+        let table = SymbolTable::build_from_graph(&graph);
+
+        let edges = table.resolve_references(&[self_call_ref(&a_run, "run")], &no_imports());
+        assert!(
+            edges.iter().all(|e| e.source != e.target),
+            "recursive self-call must not yield a self-edge, got {edges:?}"
+        );
     }
 
     #[test]
