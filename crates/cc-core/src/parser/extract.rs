@@ -16,7 +16,35 @@ pub struct RawReference {
 
 #[derive(Debug, Clone)]
 pub enum RawRefKind {
-    Import { module_path: String },
+    Import {
+        module_path: String,
+    },
+    /// A `from <module> import <original> [as <local>]` name binding.
+    ///
+    /// **This variant deliberately produces no edge.** It is resolution
+    /// *context*, not a reference: the file already emits one
+    /// [`RawRefKind::Import`] for the module (which is what draws the Import
+    /// edge), and turning every imported name into its own edge would multiply
+    /// symbol-edge volume without adding information. What it does instead is
+    /// tell [`crate::resolver::SymbolTable`] that, inside this file, the local
+    /// name `local` denotes the symbol `original` defined in `module_path`. That
+    /// lets a later use of `local` resolve to the right symbol in the right
+    /// file — including through an `as` rename, which is otherwise unresolvable.
+    ///
+    /// [`crate::resolver::ImportResolver`] matches only `Import { .. }`, so this
+    /// variant never produces a duplicate file-to-file Import edge either.
+    ///
+    /// `RawReference::name` carries `local` (the name a use site would write).
+    ImportedSymbol {
+        /// Module path exactly as written, same shape as `Import::module_path`
+        /// (leading dots preserved for relative imports).
+        module_path: String,
+        /// The name as defined in the imported module.
+        original: String,
+        /// The name bound in the importing file (equals `original` when there
+        /// is no `as` clause).
+        local: String,
+    },
     FunctionCall,
     MethodCall,
     TypeReference,
@@ -1009,6 +1037,97 @@ mod tests {
             block_visibility_of(&nodes, "_Internal"),
             Some(Visibility::Private)
         );
+    }
+
+    // -- C1: imported-symbol bindings --
+
+    /// Collect `(module_path, original, local)` for every ImportedSymbol ref,
+    /// in source order.
+    fn python_symbol_bindings(source: &str) -> Vec<(String, String, String)> {
+        let (_, refs) = extract(source, &Language::Python);
+        refs.iter()
+            .filter_map(|r| match &r.kind {
+                RawRefKind::ImportedSymbol {
+                    module_path,
+                    original,
+                    local,
+                } => Some((module_path.clone(), original.clone(), local.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_python_from_import_emits_one_binding_per_name() {
+        assert_eq!(
+            python_symbol_bindings("from mypkg.mod import Thing, other"),
+            vec![
+                ("mypkg.mod".into(), "Thing".into(), "Thing".into()),
+                ("mypkg.mod".into(), "other".into(), "other".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_python_from_import_alias_binding_keeps_original_and_local() {
+        assert_eq!(
+            python_symbol_bindings("from mypkg.mod import Thing as T"),
+            vec![("mypkg.mod".into(), "Thing".into(), "T".into())]
+        );
+    }
+
+    #[test]
+    fn test_python_relative_from_import_binding_keeps_leading_dots() {
+        assert_eq!(
+            python_symbol_bindings("from ..pkg.sub import y"),
+            vec![("..pkg.sub".into(), "y".into(), "y".into())]
+        );
+        assert_eq!(
+            python_symbol_bindings("from . import x"),
+            vec![(".".into(), "x".into(), "x".into())]
+        );
+    }
+
+    #[test]
+    fn test_python_binding_ref_name_is_the_local_name() {
+        let (_, refs) = extract("from m import Thing as T", &Language::Python);
+        let binding = refs
+            .iter()
+            .find(|r| matches!(r.kind, RawRefKind::ImportedSymbol { .. }))
+            .expect("expected an ImportedSymbol ref");
+        assert_eq!(binding.name, "T");
+    }
+
+    #[test]
+    fn test_python_wildcard_and_plain_imports_emit_no_bindings() {
+        // `from pkg import *` binds nothing nameable.
+        assert!(python_symbol_bindings("from pkg.mod import *").is_empty());
+        // `import x` / `import x as y` bind a *module*, not a symbol.
+        assert!(python_symbol_bindings("import numpy as np").is_empty());
+        assert!(python_symbol_bindings("import os, sys").is_empty());
+        // `from __future__ import annotations` is not a real module import.
+        assert!(python_symbol_bindings("from __future__ import annotations").is_empty());
+    }
+
+    #[test]
+    fn test_python_bindings_do_not_disturb_the_import_module_path_contract() {
+        // The module-path contract the import resolver consumes is unchanged:
+        // still exactly one Import ref per imported module.
+        assert_eq!(
+            python_import_paths("from mypkg.mod import Thing, other as o"),
+            vec!["mypkg.mod"]
+        );
+    }
+
+    #[test]
+    fn test_python_binding_attributed_to_enclosing_scope() {
+        let (_, refs) = extract("from m import Thing", &Language::Python);
+        let file_id = NodeId::file("test.file");
+        let binding = refs
+            .iter()
+            .find(|r| matches!(r.kind, RawRefKind::ImportedSymbol { .. }))
+            .expect("expected an ImportedSymbol ref");
+        assert_eq!(binding.from_node, file_id);
     }
 
     // -- TypeScript tests --

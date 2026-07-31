@@ -16,8 +16,9 @@
 - Type inference
 - Cross-file reference resolution (handled by resolver subsystem)
 - Language-specific formatting or pretty-printing
-- Recording the imported *symbol* names of `from x import Thing` (only the module
-  path is captured) and mapping `import x as y` aliases back to the original symbol
+- Mapping a *module* alias back to its module (`import numpy as np`; a later
+  `np.array()` still resolves by the bare name `array`). Only `from x import y as z`
+  *symbol* bindings are recorded.
 - Resolving `self.helper()` to the enclosing class rather than by bare method name
 - Python string forward references in annotations (`x: "Fwd"`)
 
@@ -100,6 +101,30 @@ reads only `module_name:`, whose text is already correct for both `dotted_name` 
 `relative_import` (leading dots preserved). `future_import_statement`
 (`from __future__ import ...`) emits nothing.
 
+**Imported-symbol bindings** — `import_from_statement` *additionally* emits one
+`RawRefKind::ImportedSymbol { module_path, original, local }` per imported name.
+`module_path` is identical to the statement's `Import` ref; `original` is the
+name as defined in the imported module and `local` is the name bound in this
+file (they differ only under an `as` rename). `RawReference::name` carries
+`local`.
+
+| Source | bindings |
+|---|---|
+| `from mypkg.mod import Thing, other` | `(mypkg.mod, Thing, Thing)`, `(mypkg.mod, other, other)` |
+| `from mypkg.mod import Thing as T` | `(mypkg.mod, Thing, T)` |
+| `from . import x` | `(., x, x)` |
+| `from pkg.mod import *` | none (`wildcard_import` has no `name:` field) |
+| `import numpy as np` | none (binds a *module*, not a symbol) |
+| `from __future__ import annotations` | none |
+
+**This variant deliberately produces no edge.** It is resolution context, not a
+reference: the module already has its own `Import` ref (and therefore its own
+Import edge), so turning every imported name into an edge would multiply
+symbol-edge volume without adding information. `ImportResolver::resolve` matches
+only `Import { .. }` and ignores it; `SymbolTable::resolve_references` folds the
+bindings into a per-file `local -> (module_path, original)` map and uses it as a
+precision tier (see `docs/features/resolution_precision.md`).
+
 **Type annotations** — only leaf names are emitted; the raw text of a composite
 annotation is never used. Each annotation node kind contributes its own leaf and
 lets the walk reach the rest:
@@ -164,6 +189,9 @@ Consolidates extension probing logic used by the import resolver:
 - Python `RawRefKind::Import { module_path }` is always a clean dotted path as
   written in source (no alias clause, no imported symbol names), one ref per
   module. The import resolver depends on this exact shape.
+- `RawRefKind::ImportedSymbol` never yields an edge, in any resolver. Its
+  `module_path` has exactly the same shape as `Import { module_path }`. Adding
+  bindings must never change symbol-edge *volume*, only edge *targets*.
 - Python module-level bindings only become blocks when the assignment is a direct
   child of the module body and binds a single identifier; nothing inside a class
   body or function body is ever classified.

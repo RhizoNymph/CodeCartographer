@@ -10,6 +10,18 @@ use super::import_resolver::ImportMap;
 /// entirely (too noisy to be useful).
 const MAX_AMBIGUOUS_CANDIDATES: usize = 5;
 
+/// What a `from <module> import <original> as <local>` statement binds: inside
+/// the importing file, `local` denotes the symbol `original` defined in
+/// `module_path`.
+#[derive(Debug, Clone)]
+struct ImportedBinding {
+    module_path: String,
+    original: String,
+}
+
+/// Importing file path -> local name -> binding.
+type SymbolBindings = HashMap<String, HashMap<String, ImportedBinding>>;
+
 /// Maps symbol names to their defining NodeIds for cross-file resolution.
 #[derive(Debug, Default)]
 pub struct SymbolTable {
@@ -59,7 +71,9 @@ impl SymbolTable {
 
                     table.node_to_file.insert(id.clone(), file_path);
                 }
-                CodeNode::File { path, id: file_id, .. } => {
+                CodeNode::File {
+                    path, id: file_id, ..
+                } => {
                     // A ref's from_node can be a File node (top-level imports),
                     // so map file ids to their own path.
                     table.node_to_file.insert(file_id.clone(), path.clone());
@@ -94,26 +108,35 @@ impl SymbolTable {
     ///
     /// Then resolves the normalized name against the source file (derived from
     /// `raw_ref.from_node`) using the following tiers, best match first:
-    /// 1. a match in the same file            -> [`Resolution::SameFile`]
-    /// 2. a match in a file the source imports -> [`Resolution::Imported`]
-    /// 3. exactly one global match             -> [`Resolution::GlobalUnique`]
-    /// 4. 2..=5 global matches                 -> one [`Resolution::Ambiguous`] edge each
-    /// 5. more than 5 global matches           -> dropped entirely
+    /// 1. a match in the same file -> [`Resolution::SameFile`]
+    /// 2. the symbol named by an explicit `from <module> import <name>` binding
+    ///    in the source file, looked up in that module's own file
+    ///    -> [`Resolution::Imported`]
+    /// 3. a match in any file the source imports -> [`Resolution::Imported`]
+    /// 4. exactly one global match -> [`Resolution::GlobalUnique`]
+    /// 5. 2..=5 global matches -> one [`Resolution::Ambiguous`] edge each
+    /// 6. more than 5 global matches -> dropped entirely
+    ///
+    /// Tier 2 comes from [`crate::parser::RawRefKind::ImportedSymbol`] refs,
+    /// which produce no edges of their own. Besides pinning the exact defining
+    /// module, a binding also carries the *original* name through an `as`
+    /// rename, so `from m import Thing as T` makes a later `T()` resolve to
+    /// `Thing`; that rename applies to tiers 3-6 as well when tier 2 misses.
     ///
     /// `imports` maps a source file path to the set of file paths it imports
     /// (produced by `ImportResolver::resolve`). Self-edges are always skipped.
-    pub fn resolve_references(
-        &self,
-        refs: &[RawReference],
-        imports: &ImportMap,
-    ) -> Vec<CodeEdge> {
+    pub fn resolve_references(&self, refs: &[RawReference], imports: &ImportMap) -> Vec<CodeEdge> {
         let mut edges = Vec::new();
+        let bindings = self.collect_symbol_bindings(refs);
 
         for raw_ref in refs {
             let (kind, lookup_name) = match &raw_ref.kind {
                 crate::parser::RawRefKind::Import { .. } => {
                     (EdgeKind::Import, raw_ref.name.clone())
                 }
+                // Resolution context only -- deliberately edge-free. See the
+                // variant's documentation in `parser/extract.rs`.
+                crate::parser::RawRefKind::ImportedSymbol { .. } => continue,
                 crate::parser::RawRefKind::FunctionCall | crate::parser::RawRefKind::MethodCall => {
                     let kind = match &raw_ref.kind {
                         crate::parser::RawRefKind::FunctionCall => EdgeKind::FunctionCall,
@@ -184,10 +207,54 @@ impl SymbolTable {
                 }
             }
 
-            self.resolve_via_ladder(raw_ref, &kind, &lookup_name, imports, &mut edges);
+            // An Import ref's name is a module path, not a local binding, so it
+            // never consults the binding map.
+            let binding = if matches!(&raw_ref.kind, crate::parser::RawRefKind::Import { .. }) {
+                None
+            } else {
+                self.file_of(&raw_ref.from_node)
+                    .and_then(|file| bindings.get(file))
+                    .and_then(|by_local| by_local.get(&lookup_name))
+            };
+
+            self.resolve_via_ladder(raw_ref, &kind, &lookup_name, binding, imports, &mut edges);
         }
 
         edges
+    }
+
+    /// Index every [`crate::parser::RawRefKind::ImportedSymbol`] ref by the file
+    /// that declared it. A file-local import (inside a function body) still
+    /// binds the name file-wide here; that is a deliberate over-approximation,
+    /// since the binding only ever *narrows* an otherwise fuzzier match.
+    ///
+    /// If a file binds the same local name twice (re-import, or a conditional
+    /// `try: from a import X / except: from b import X`), the first binding
+    /// wins and the ambiguity falls through to the later tiers.
+    fn collect_symbol_bindings(&self, refs: &[RawReference]) -> SymbolBindings {
+        let mut bindings: SymbolBindings = HashMap::new();
+        for raw_ref in refs {
+            let crate::parser::RawRefKind::ImportedSymbol {
+                module_path,
+                original,
+                local,
+            } = &raw_ref.kind
+            else {
+                continue;
+            };
+            let Some(file) = self.file_of(&raw_ref.from_node) else {
+                continue;
+            };
+            bindings
+                .entry(file.clone())
+                .or_default()
+                .entry(local.clone())
+                .or_insert_with(|| ImportedBinding {
+                    module_path: module_path.clone(),
+                    original: original.clone(),
+                });
+        }
+        bindings
     }
 
     /// Apply the precision ladder for a single normalized reference, pushing the
@@ -197,6 +264,7 @@ impl SymbolTable {
         raw_ref: &RawReference,
         kind: &EdgeKind,
         lookup_name: &str,
+        binding: Option<&ImportedBinding>,
         imports: &ImportMap,
         edges: &mut Vec<CodeEdge>,
     ) {
@@ -228,7 +296,47 @@ impl SymbolTable {
             }
         }
 
-        // Tier 2: matches in files the source file imports.
+        // Tier 2: an explicit `from <module> import <name>` binding pins both
+        // the defining module and (through an `as` rename) the original name.
+        if let (Some(file), Some(binding)) = (&source_file, binding) {
+            if let Some(imported_files) = imports.get(file) {
+                let mut bound_targets: Vec<NodeId> = Vec::new();
+                for imported in imported_files {
+                    if !module_path_names_file(&binding.module_path, imported) {
+                        continue;
+                    }
+                    if let Some(targets) = self
+                        .by_file
+                        .get(imported)
+                        .and_then(|names| names.get(&binding.original))
+                    {
+                        for target in targets {
+                            if *target != raw_ref.from_node {
+                                bound_targets.push(target.clone());
+                            }
+                        }
+                    }
+                }
+                if !bound_targets.is_empty() {
+                    for target in bound_targets {
+                        edges.push(CodeEdge {
+                            source: raw_ref.from_node.clone(),
+                            target,
+                            kind: kind.clone(),
+                            weight: 1,
+                            resolution: Resolution::Imported,
+                        });
+                    }
+                    return;
+                }
+            }
+        }
+
+        // The binding's original name carries through the remaining tiers, so
+        // an aliased import still finds the symbol it renamed.
+        let lookup_name = binding.map_or(lookup_name, |b| b.original.as_str());
+
+        // Tier 3: matches in files the source file imports.
         if let Some(file) = &source_file {
             if let Some(imported_files) = imports.get(file) {
                 let mut imported_targets: Vec<NodeId> = Vec::new();
@@ -260,7 +368,7 @@ impl SymbolTable {
             }
         }
 
-        // Tiers 3-5: global name matches.
+        // Tiers 4-6: global name matches.
         let global = match self.symbols.get(lookup_name) {
             Some(targets) => targets,
             None => return,
@@ -277,7 +385,7 @@ impl SymbolTable {
 
         match candidates.len() {
             0 => {}
-            // Tier 3: exactly one global match.
+            // Tier 4: exactly one global match.
             1 => {
                 edges.push(CodeEdge {
                     source: raw_ref.from_node.clone(),
@@ -287,8 +395,8 @@ impl SymbolTable {
                     resolution: Resolution::GlobalUnique,
                 });
             }
-            // Tier 4: 2..=MAX ambiguous candidates -> flagged edge to each.
-            // Tier 5: more than MAX -> drop entirely.
+            // Tier 5: 2..=MAX ambiguous candidates -> flagged edge to each.
+            // Tier 6: more than MAX -> drop entirely.
             n if n <= MAX_AMBIGUOUS_CANDIDATES => {
                 for target in candidates {
                     edges.push(CodeEdge {
@@ -303,6 +411,41 @@ impl SymbolTable {
             _ => {}
         }
     }
+}
+
+/// True when `file_path` is plausibly the module named by `module_path`.
+///
+/// This is only ever applied to files the import resolver already decided the
+/// source file imports, so it does not have to resolve anything: it just picks
+/// the right entry out of that small set. Leading dots are stripped because a
+/// relative import's suffix is what identifies the module either way
+/// (`.rel` -> `.../rel.py`, `..pkg.sub` -> `.../pkg/sub.py`).
+///
+/// A module path that is only dots (`from . import x`) names a package rather
+/// than a module and never matches; such references fall through to the
+/// general imported-file tier.
+fn module_path_names_file(module_path: &str, file_path: &str) -> bool {
+    let rel = module_path.trim_start_matches('.');
+    if rel.is_empty() {
+        return false;
+    }
+    let suffix = rel.replace('.', "/");
+
+    let stem = match file_path.rfind('.') {
+        // Only strip a real extension, never a dot inside a directory name.
+        Some(idx) if !file_path[idx..].contains('/') => &file_path[..idx],
+        _ => file_path,
+    };
+
+    path_ends_with_module(stem, &suffix)
+        || path_ends_with_module(stem, &format!("{suffix}/__init__"))
+}
+
+fn path_ends_with_module(stem: &str, suffix: &str) -> bool {
+    stem == suffix
+        || (stem.len() > suffix.len()
+            && stem.ends_with(suffix)
+            && stem.as_bytes()[stem.len() - suffix.len() - 1] == b'/')
 }
 
 #[cfg(test)]
@@ -554,14 +697,8 @@ mod tests {
         // and no closer tier: both edges should be produced and flagged Ambiguous.
         let edges = table.resolve_references(&refs, &no_imports());
         let targets: Vec<_> = edges.iter().map(|e| e.target.clone()).collect();
-        assert!(
-            targets.contains(&foo1_id),
-            "expected edge to foo in a.py"
-        );
-        assert!(
-            targets.contains(&foo2_id),
-            "expected edge to foo in b.py"
-        );
+        assert!(targets.contains(&foo1_id), "expected edge to foo in a.py");
+        assert!(targets.contains(&foo2_id), "expected edge to foo in b.py");
         assert!(
             edges.iter().all(|e| e.resolution == Resolution::Ambiguous),
             "ambiguous global matches should be flagged Resolution::Ambiguous"
@@ -746,6 +883,257 @@ mod tests {
         assert!(edges.iter().all(|e| e.resolution == Resolution::Ambiguous));
     }
 
+    // -- C1: imported-symbol binding tier --
+
+    fn binding_ref(from: &NodeId, module_path: &str, original: &str, local: &str) -> RawReference {
+        RawReference {
+            from_node: from.clone(),
+            kind: RawRefKind::ImportedSymbol {
+                module_path: module_path.to_string(),
+                original: original.to_string(),
+                local: local.to_string(),
+            },
+            name: local.to_string(),
+            span: make_span(),
+        }
+    }
+
+    fn imports_of(pairs: &[(&str, &str)]) -> ImportMap {
+        let mut imports = ImportMap::new();
+        for (from, to) in pairs {
+            imports
+                .entry((*from).to_string())
+                .or_default()
+                .insert((*to).to_string());
+        }
+        imports
+    }
+
+    #[test]
+    fn imported_symbol_bindings_alone_produce_no_edges() {
+        // The binding variant is resolution context, not a reference: it must
+        // never contribute an edge of its own.
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        add_py_file(&mut graph, "a.py", &["caller"]);
+        add_py_file(&mut graph, "b.py", &["Thing"]);
+        let table = SymbolTable::build_from_graph(&graph);
+
+        let file_a = NodeId::file("a.py");
+        let refs = vec![binding_ref(&file_a, "b", "Thing", "T")];
+
+        let edges = table.resolve_references(&refs, &imports_of(&[("a.py", "b.py")]));
+        assert!(
+            edges.is_empty(),
+            "ImportedSymbol refs must not produce edges, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn aliased_import_resolves_a_use_of_the_alias_to_the_original_symbol() {
+        // `from b import Thing as T` in a.py, then `T()` inside `caller`.
+        // Without the binding, `T` matches nothing at all.
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        let a_ids = add_py_file(&mut graph, "a.py", &["caller"]);
+        let b_ids = add_py_file(&mut graph, "b.py", &["Thing"]);
+        let caller = a_ids[0].clone();
+        let thing = b_ids[0].clone();
+        let table = SymbolTable::build_from_graph(&graph);
+
+        let refs = vec![
+            binding_ref(&NodeId::file("a.py"), "b", "Thing", "T"),
+            call_ref(&caller, "T"),
+        ];
+
+        let edges = table.resolve_references(&refs, &imports_of(&[("a.py", "b.py")]));
+        assert_eq!(edges.len(), 1, "expected exactly one edge, got {edges:?}");
+        assert_eq!(edges[0].target, thing);
+        assert_eq!(edges[0].source, caller);
+        assert_eq!(edges[0].kind, EdgeKind::FunctionCall);
+        assert_eq!(edges[0].resolution, Resolution::Imported);
+    }
+
+    #[test]
+    fn binding_edge_count_matches_the_unbound_baseline() {
+        // Adding binding refs must not inflate edge volume: the same use site
+        // yields exactly one edge with or without them.
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        let a_ids = add_py_file(&mut graph, "a.py", &["caller"]);
+        add_py_file(&mut graph, "b.py", &["Thing"]);
+        let caller = a_ids[0].clone();
+        let table = SymbolTable::build_from_graph(&graph);
+        let imports = imports_of(&[("a.py", "b.py")]);
+
+        let baseline = table.resolve_references(&[call_ref(&caller, "Thing")], &imports);
+        let with_binding = table.resolve_references(
+            &[
+                binding_ref(&NodeId::file("a.py"), "b", "Thing", "Thing"),
+                call_ref(&caller, "Thing"),
+            ],
+            &imports,
+        );
+        assert_eq!(baseline.len(), 1);
+        assert_eq!(
+            with_binding.len(),
+            baseline.len(),
+            "binding refs must not add edges"
+        );
+        assert_eq!(with_binding[0].target, baseline[0].target);
+    }
+
+    #[test]
+    fn binding_narrows_to_the_named_module_among_several_imports() {
+        // a.py imports both b.py and c.py, and both define `Thing`. The binding
+        // says the name came from b, so only that edge should survive.
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        let a_ids = add_py_file(&mut graph, "a.py", &["caller"]);
+        let b_ids = add_py_file(&mut graph, "pkg/b.py", &["Thing"]);
+        add_py_file(&mut graph, "pkg/c.py", &["Thing"]);
+        let caller = a_ids[0].clone();
+        let b_thing = b_ids[0].clone();
+        let table = SymbolTable::build_from_graph(&graph);
+        let imports = imports_of(&[("a.py", "pkg/b.py"), ("a.py", "pkg/c.py")]);
+
+        let unbound = table.resolve_references(&[call_ref(&caller, "Thing")], &imports);
+        assert_eq!(unbound.len(), 2, "without a binding both imports match");
+
+        let bound = table.resolve_references(
+            &[
+                binding_ref(&NodeId::file("a.py"), "pkg.b", "Thing", "Thing"),
+                call_ref(&caller, "Thing"),
+            ],
+            &imports,
+        );
+        assert_eq!(bound.len(), 1, "the binding pins one module, got {bound:?}");
+        assert_eq!(bound[0].target, b_thing);
+        assert_eq!(bound[0].resolution, Resolution::Imported);
+    }
+
+    #[test]
+    fn binding_matches_a_relative_module_path() {
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        let a_ids = add_py_file(&mut graph, "pkg/sub/a.py", &["caller"]);
+        let b_ids = add_py_file(&mut graph, "pkg/mod.py", &["Thing"]);
+        let caller = a_ids[0].clone();
+        let thing = b_ids[0].clone();
+        let table = SymbolTable::build_from_graph(&graph);
+
+        let edges = table.resolve_references(
+            &[
+                binding_ref(&NodeId::file("pkg/sub/a.py"), "..mod", "Thing", "T"),
+                call_ref(&caller, "T"),
+            ],
+            &imports_of(&[("pkg/sub/a.py", "pkg/mod.py")]),
+        );
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, thing);
+        assert_eq!(edges[0].resolution, Resolution::Imported);
+    }
+
+    #[test]
+    fn binding_matches_a_package_resolved_to_its_init() {
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        let a_ids = add_py_file(&mut graph, "a.py", &["caller"]);
+        let init_ids = add_py_file(&mut graph, "src/pkg/__init__.py", &["Thing"]);
+        let caller = a_ids[0].clone();
+        let thing = init_ids[0].clone();
+        let table = SymbolTable::build_from_graph(&graph);
+
+        let edges = table.resolve_references(
+            &[
+                binding_ref(&NodeId::file("a.py"), "pkg", "Thing", "T"),
+                call_ref(&caller, "T"),
+            ],
+            &imports_of(&[("a.py", "src/pkg/__init__.py")]),
+        );
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, thing);
+    }
+
+    #[test]
+    fn same_file_definition_still_wins_over_a_binding() {
+        // Python's own rule: a local definition shadows the imported name.
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        let a_ids = add_py_file(&mut graph, "a.py", &["caller", "Thing"]);
+        add_py_file(&mut graph, "b.py", &["Thing"]);
+        let caller = a_ids[0].clone();
+        let local_thing = a_ids[1].clone();
+        let table = SymbolTable::build_from_graph(&graph);
+
+        let edges = table.resolve_references(
+            &[
+                binding_ref(&NodeId::file("a.py"), "b", "Thing", "Thing"),
+                call_ref(&caller, "Thing"),
+            ],
+            &imports_of(&[("a.py", "b.py")]),
+        );
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, local_thing);
+        assert_eq!(edges[0].resolution, Resolution::SameFile);
+    }
+
+    #[test]
+    fn alias_falls_back_to_the_original_name_when_the_module_is_unresolved() {
+        // The module never resolved to a file (third-party, or an unscanned
+        // path), so tier 2 misses -- but the rename must still carry through
+        // to the global tier.
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        let a_ids = add_py_file(&mut graph, "a.py", &["caller"]);
+        let b_ids = add_py_file(&mut graph, "b.py", &["Thing"]);
+        let caller = a_ids[0].clone();
+        let thing = b_ids[0].clone();
+        let table = SymbolTable::build_from_graph(&graph);
+
+        let edges = table.resolve_references(
+            &[
+                binding_ref(&NodeId::file("a.py"), "vendor.pkg", "Thing", "T"),
+                call_ref(&caller, "T"),
+            ],
+            &ImportMap::new(),
+        );
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].target, thing);
+        assert_eq!(edges[0].resolution, Resolution::GlobalUnique);
+    }
+
+    #[test]
+    fn bindings_are_scoped_to_the_importing_file() {
+        // c.py never imported anything; a.py's binding must not leak into it.
+        let mut graph = CodeGraph::new(NodeId::directory(""));
+        add_py_file(&mut graph, "a.py", &["caller"]);
+        add_py_file(&mut graph, "b.py", &["Thing"]);
+        let c_ids = add_py_file(&mut graph, "c.py", &["other"]);
+        let other = c_ids[0].clone();
+        let table = SymbolTable::build_from_graph(&graph);
+
+        let edges = table.resolve_references(
+            &[
+                binding_ref(&NodeId::file("a.py"), "b", "Thing", "T"),
+                call_ref(&other, "T"),
+            ],
+            &imports_of(&[("a.py", "b.py")]),
+        );
+        assert!(
+            edges.is_empty(),
+            "a binding in a.py must not rename `T` inside c.py, got {edges:?}"
+        );
+    }
+
+    #[test]
+    fn module_path_matching_is_anchored_at_a_path_boundary() {
+        assert!(module_path_names_file("pkg.mod", "src/pkg/mod.py"));
+        assert!(module_path_names_file("pkg.mod", "pkg/mod.py"));
+        assert!(module_path_names_file(".mod", "src/pkg/mod.py"));
+        assert!(module_path_names_file("pkg", "src/pkg/__init__.py"));
+        // `mypkg/mod.py` must not be matched by the module `ypkg.mod`.
+        assert!(!module_path_names_file("ypkg.mod", "src/mypkg/mod.py"));
+        // A different module with the same tail segment.
+        assert!(!module_path_names_file("pkg.mod", "src/other/mod.py"));
+        // Dots-only relative imports name a package, not a module.
+        assert!(!module_path_names_file(".", "src/pkg/__init__.py"));
+        // A dot in a directory name is not an extension.
+        assert!(module_path_names_file("pkg.mod", "my.dir/pkg/mod.py"));
+    }
+
     #[test]
     fn ambiguity_cap_six_matches_produces_no_edges() {
         let mut graph = CodeGraph::new(NodeId::directory(""));
@@ -758,6 +1146,9 @@ mod tests {
         let table = SymbolTable::build_from_graph(&graph);
 
         let edges = table.resolve_references(&[call_ref(&caller, "target")], &ImportMap::new());
-        assert!(edges.is_empty(), "6 global matches exceed the cap -> dropped");
+        assert!(
+            edges.is_empty(),
+            "6 global matches exceed the cap -> dropped"
+        );
     }
 }

@@ -147,7 +147,11 @@ fn collect_plain_imports(
     }
 }
 
-/// `from pkg.mod import A, B as C` -> exactly one Import ref for `pkg.mod`.
+/// `from pkg.mod import A, B as C` -> exactly one Import ref for `pkg.mod`
+/// (the contract the import resolver consumes), plus one edge-free
+/// `ImportedSymbol` binding per imported name so the symbol resolver knows
+/// where each local name came from.
+///
 /// Relative imports keep their leading dots (`.`, `.rel`, `..pkg.sub`) because
 /// the resolver needs them to walk up from the importing file's package.
 fn collect_from_import(source: &str, node: &Node, from_id: &NodeId, refs: &mut Vec<RawReference>) {
@@ -165,9 +169,69 @@ fn collect_from_import(source: &str, node: &Node, from_id: &NodeId, refs: &mut V
         RawRefKind::Import {
             module_path: path.clone(),
         },
-        path,
+        path.clone(),
         &module,
     );
+
+    collect_imported_symbol_bindings(source, node, from_id, refs, &path);
+}
+
+/// One `ImportedSymbol` binding per name in `from <module> import <names>`.
+/// `from ... import *` has no `name:` field and therefore binds nothing.
+fn collect_imported_symbol_bindings(
+    source: &str,
+    node: &Node,
+    from_id: &NodeId,
+    refs: &mut Vec<RawReference>,
+    module_path: &str,
+) {
+    let mut cursor = node.walk();
+    for name_node in node.children_by_field_name("name", &mut cursor) {
+        let (original_node, local_node) = match name_node.kind() {
+            "dotted_name" => (name_node, name_node),
+            // `other as o` -> original `other`, local `o`.
+            "aliased_import" => {
+                let Some(original) = name_node.child_by_field_name("name") else {
+                    continue;
+                };
+                let Some(alias) = name_node.child_by_field_name("alias") else {
+                    continue;
+                };
+                (original, alias)
+            }
+            _ => continue,
+        };
+        // `from pkg import a.b` is not legal Python, but a dotted_name still
+        // renders its last segment as the bound name.
+        let Some(original) = last_dotted_segment(&original_node, source) else {
+            continue;
+        };
+        let Some(local) = last_dotted_segment(&local_node, source) else {
+            continue;
+        };
+        push_ref(
+            refs,
+            from_id,
+            RawRefKind::ImportedSymbol {
+                module_path: module_path.to_string(),
+                original,
+                local: local.clone(),
+            },
+            local,
+            &name_node,
+        );
+    }
+}
+
+/// Last segment of a `dotted_name` / `identifier` node.
+fn last_dotted_segment(node: &Node, source: &str) -> Option<String> {
+    let text = node_text(node, source)?;
+    let segment = text.rsplit('.').next().unwrap_or(&text).trim().to_string();
+    if segment.is_empty() {
+        None
+    } else {
+        Some(segment)
+    }
 }
 
 // ---------------------------------------------------------------------------
