@@ -10,12 +10,14 @@
 - Python leading-dot relative import resolution (`.foo`, `..pkg.mod`, `from . import x` / `.`), including package `__init__.py` targets.
 - Python absolute import resolution (`import pkg.sub.mod`, `import pkg`, `import module`) against detected **package roots**, so `src/` layouts, monorepo `packages/*/` layouts, and sibling `tests/` trees all resolve.
 - Python `.pyi` type stubs as resolution targets, always ranked behind the real module they stub.
+- Language-correct resolution in polyglot repos: an extension-less module path (`./util`, `mypkg.util`, `crate::util`) is answered only by files whose extension belongs to the **importing** file's language, so `util.py` / `util.ts` / `util.rs` never shadow each other.
 - Rust use-path resolution (`crate::`, `super::`, `self::`): paths name modules and items rather than files, so the resolver probes progressively shorter prefixes against the source file's crate `src` root (workspace-aware) until a file (`.rs` / `mod.rs`, falling back to `lib.rs`/`main.rs`) matches. External-crate paths (`std::`, dependencies) do not resolve.
 - Merging duplicate edges keeps the highest-confidence resolution.
 - Frontend: dashed/dimmed rendering of ambiguous edges and a toolbar toggle to hide them.
 
 **Not in scope:**
 - Full semantic/type-directed name resolution (no scope analysis, no type inference).
+- Genuine cross-language imports (wasm-bindgen, PyO3, codegen bridges). A known importing language is never allowed to resolve to another language's file; such an import simply produces no edge.
 - Disambiguating ambiguous names beyond the same-file / imported-file tiers.
 - Non-Python relative import syntaxes (TS/JS `./`, `../` are handled by the pre-existing generic branch).
 - Recording the *symbols* named by `from x import Thing, other` (and mapping `as` aliases back to their original symbol). Import refs carry only the module path, so an import edge says "file A imports file B", never "A imports symbol S from B".
@@ -25,8 +27,8 @@
 
 Resolution runs inside `parse_repo` (`crates/cc-tauri/src/commands/parse.rs`) after all files are parsed and their `CodeBlock` nodes added to the graph:
 
-1. **Import resolution first.** `ImportResolver::resolve(graph, refs)` returns `(Vec<CodeEdge>, ImportMap)`:
-   - For each `Import` raw reference it resolves the module path to a target file `NodeId` (extension probing + language-specific rules).
+1. **Import resolution first.** `ImportResolver::resolve(graph, refs)` builds a [`PathIndex`](#the-path-index) over every `File` node, then returns `(Vec<CodeEdge>, ImportMap)`:
+   - For each `Import` raw reference it resolves the module path to a target file `NodeId` (extension probing + language-specific rules), scoped to the importing file's language.
    - Emits a file-to-file `Import` edge with `Resolution::Imported` (import edges are exact by construction — an edge is only emitted when a concrete target file is found).
    - Records `source_file_path -> {imported_file_path,...}` in the `ImportMap`.
    - The import edges are added to the graph; the map is passed to the symbol resolver.
@@ -51,6 +53,54 @@ Resolution runs inside `parse_repo` (`crates/cc-tauri/src/commands/parse.rs`) af
 - `graphStore.hideAmbiguousEdges` (default `false`) + `setHideAmbiguousEdges` bump `layoutVersion` (mirroring `setHideUnconnectedNodes`). The Toolbar exposes a "Hide ambiguous" checkbox next to "Hide unconnected".
 - The flag threads `Canvas.tsx -> PixiRenderer.updateGraph -> layoutGraph(..., hideAmbiguousEdges)`, where both the direct-edge filter (`kindFilteredEdges`) and the aggregated-edge filter (`computeAggregatedEdges`) drop `resolution === "Ambiguous"` edges.
 
+### The path index
+
+`resolver/path_index.rs` owns the only mapping from paths to file `NodeId`s used
+during import resolution. It is built once per `ImportResolver::resolve` call and
+holds **full repository-relative paths only** (`shared/util.ts`). It exposes
+three queries and no raw map:
+
+| Query | Meaning |
+|-------|---------|
+| `PathIndex::exact(path)` | is there a file at exactly this path, extension included? |
+| `PathIndex::probe(base, language)` | extension probing for one language (`probe_path`), nothing else |
+| `PathIndex::resolve(base, language)` | `exact`, then `probe` for `Some(language)` / `probe_path_all` for `None` |
+
+`PathIndex::file_paths()` additionally exposes the raw scanned path list, which
+is what `PythonPackageRoots::from_file_paths` consumes.
+
+Every lookup in `import_resolver.rs` goes through one of those three, so an
+extension-less module path can never be answered without naming the language
+that is asking. That is what makes polyglot resolution correct (below) and it
+keeps *one* definition of "which extension wins", in `extension_probe.rs`.
+
+### Cross-language collisions (polyglot repos)
+
+`shared/util.py`, `shared/util.ts` and `shared/util.rs` all name the module path
+`shared/util`. Nothing about the *target* says which is meant -- only the
+importing file's language does.
+
+The index therefore stores no extension-stripped keys at all. `./util` from a
+TypeScript file is resolved by probing `TS_JS_EXTENSIONS` against full paths and
+lands on `util.ts`; the same import from a Python file probes
+`PYTHON_EXTENSIONS` and lands on `util.py`; `crate::util` probes
+`RUST_EXTENSIONS` and lands on `util.rs`. A known language never falls back to
+another language's extensions, so a TypeScript import of a module that only
+exists as `.py` yields **no edge** rather than a wrong one.
+
+This replaced an earlier scheme in which the path map also held
+extension-stripped keys (`shared/util`) with a `stripped_key_rank` tie-break.
+That key was consulted *before* language-aware probing, so whichever file won
+the collision won every import of that path regardless of language -- and the
+rank (which only demoted `.pyi`) even let `util.ts` beat `util.pyi`. Making the
+rank deterministic made the wrong answer stable, not right. The stripped key was
+a second, language-blind implementation of extension probing; removing it is
+lossless because every language's stripped key is reachable by probing that
+language's own extension list against the full paths.
+
+When the importing file's language is unknown, `probe_path_all` is used: a fixed
+extension order, so the outcome is deterministic without being language-aware.
+
 ### Python relative imports
 
 `ImportResolver::resolve_python_relative` runs (for Python source only) before the generic `starts_with('.')` branch:
@@ -72,15 +122,7 @@ This branch runs for **all** Python absolute imports — dotted (`pkg.sub.mod`) 
 
 ### `.pyi` stubs
 
-`.pyi` maps to `Language::Python` (`model/node.rs`), so stubs are scanned, parsed, and resolvable. Ordering guarantees a real module always beats its stub:
-- `PYTHON_EXTENSIONS` probes `.py`, `/__init__.py`, `.pyi`, `/__init__.pyi` in that order.
-- `path_to_id` also holds extension-stripped keys, and `pkg/mod.py` / `pkg/mod.pyi` collide on `pkg/mod`. `stripped_key_rank` ranks `.pyi` below everything else, so the winner is chosen by rank rather than by `HashMap` iteration order.
-
-### Stripped-key collisions across languages
-
-Rank does not settle every collision: in a polyglot repo `shared/util.py` and `shared/util.ts` also strip to `shared/util` and rank equally. Ties are therefore broken on the full path, making the winner arbitrary but **stable** — otherwise the same scan could resolve the same import differently between runs, since the map is built by iterating a `HashMap`.
-
-Stability is all this guarantees. The stripped key is consulted *before* language-aware extension probing, so a cross-language collision can still resolve to a file in the wrong language. That is a pre-existing limitation, not a Python-specific one; fixing it means reordering exact-match and probe steps in `resolve_import_path`.
+`.pyi` maps to `Language::Python` (`model/node.rs`), so stubs are scanned, parsed, and resolvable. A real module always beats its stub because `PYTHON_EXTENSIONS` probes `.py`, `/__init__.py`, `.pyi`, `/__init__.pyi` **in that order**, and after the path-index change probe order is the only place extension preference is expressed (there is no longer a second, rank-based ordering to keep in sync). A stub is still a valid target when no real module exists: stub-only modules resolve to the `.pyi`.
 
 ## Files
 
@@ -88,7 +130,8 @@ Stability is all this guarantees. The stripped key is consulted *before* languag
 |------|------|------------------------|
 | `crates/cc-core/src/model/edge.rs` | Edge model | `Resolution` enum (ordered worst->best), `CodeEdge { resolution }`, `CodeEdge::new(..)` |
 | `crates/cc-core/src/model/graph.rs` | Graph + merge | `CodeGraph::add_edge` keeps max resolution on merge |
-| `crates/cc-core/src/resolver/import_resolver.rs` | Import resolution | `ImportResolver::resolve -> (Vec<CodeEdge>, ImportMap)`, `ImportMap`, `resolve_python_relative`, `resolve_python_absolute`, `stripped_key_rank` |
+| `crates/cc-core/src/resolver/import_resolver.rs` | Import resolution | `ImportResolver::resolve -> (Vec<CodeEdge>, ImportMap)`, `ImportMap`, `resolve_import_path`, `resolve_python_relative`, `resolve_python_absolute`, `resolve_rust_use_path` |
+| `crates/cc-core/src/resolver/path_index.rs` | Language-aware path lookup | `PathIndex::from_graph`, `exact`, `probe`, `resolve(base, Option<&Language>)`, `file_paths` |
 | `crates/cc-core/src/resolver/python_roots.rs` | Python package-root detection | `PythonPackageRoots::from_file_paths`, `roots`, `ordered_for` |
 | `crates/cc-core/src/resolver/symbol_table.rs` | Precision ladder | `SymbolTable { by_file, node_to_file }`, `resolve_references(refs, imports)`, `resolve_via_ladder`, `MAX_AMBIGUOUS_CANDIDATES` |
 | `crates/cc-core/src/resolver/extension_probe.rs` | Extension probing | `probe_path` (Python probes `.py`, `/__init__.py`, `.pyi`, `/__init__.pyi` in that order) |
@@ -97,6 +140,8 @@ Stability is all this guarantees. The stripped key is consulted *before* languag
 | `crates/cc-core/tests/fixtures/python_src_layout/` | On-disk fixture | src layout + subpackage + `tests/` + `.pyi` stub + `venv/`/`__pycache__/`/`build/` decoys |
 | `crates/cc-core/tests/python_seam_test.rs` | Extraction/resolution seam | Pins the two halves together on aliased, multi-name, star and bare-package imports; fails if either half regresses |
 | `crates/cc-core/tests/python_resolution_test.rs` | End-to-end test | scan -> parse -> `ImportResolver::resolve` over the fixture |
+| `crates/cc-core/tests/polyglot_resolution_test.rs` | Cross-language test | in-memory graphs where the same stem exists as `.py`/`.ts`/`.js`/`.rs`; asserts each language reaches its own file, `.pyi` still loses to `.py`, and single-language repos are unchanged |
+| `crates/cc-core/tests/extension_probe_test.rs` | Probe order test | pins `probe_path` per language, incl. `.py` before `.pyi` |
 | `crates/cc-tauri/src/commands/parse.rs` | Orchestration | imports resolved before symbol references; passes `import_map` |
 | `packages/app/src/api/types.ts` | FE types | `Resolution` union, `CodeEdge.resolution` |
 | `packages/app/src/canvas/layout/elkLayout.ts` | Layout + filter | `LayoutEdge.resolution`, `hideAmbiguousEdges` param |
@@ -121,5 +166,9 @@ Stability is all this guarantees. The stripped key is consulted *before* languag
 - The repo root (`""`) is always a Python package root, so flat layouts keep resolving without any `__init__.py` present.
 - `PythonPackageRoots` ordering must be total and deterministic; resolution takes the **first** root that produces a hit, so ordering is semantics, not an optimisation.
 - Root detection never inspects the filesystem — it is a pure function of the scanned file path set, so it stays correct for graphs built in memory (tests) and for cloned repos alike.
-- A `.pyi` stub must never shadow the module it stubs. Two places enforce this: the `PYTHON_EXTENSIONS` probe order and `stripped_key_rank` in the path map.
+- A `.pyi` stub must never shadow the module it stubs. One place enforces this now: the `PYTHON_EXTENSIONS` probe order in `extension_probe.rs`. Do not add a second ordering elsewhere -- the previous `stripped_key_rank` duplicate is exactly what let `util.ts` beat `util.pyi`.
+- `PathIndex` holds **full paths only**. Never re-introduce extension-stripped keys: a key like `shared/util` cannot say whether it means `util.py`, `util.ts` or `util.rs`, and whichever file wins the collision wins it for every language.
+- Extension preference lives in exactly one place, `extension_probe.rs`. `PathIndex` delegates to `probe_path` / `probe_path_all`; every extension-less lookup in `import_resolver.rs` goes through `PathIndex`.
+- A known importing language never falls back to another language's extensions. `PathIndex::resolve(base, Some(lang))` probes `lang`'s extensions and stops; no edge is preferable to a cross-language edge.
+- An unknown importing language (`None`) uses `probe_path_all`, whose extension order is a fixed constant, so resolution stays deterministic across runs even though the underlying map is a `HashMap`.
 - Scanner ignore rules match **directory names only**. `DirIgnoreRule::Always` names are dropped unconditionally; `DirIgnoreRule::UnlessPythonPackage` names (`build`, `dist`) are dropped only when the directory has no `__init__.py`/`__init__.pyi`, so a genuine package named `build` survives. The scan root itself (depth 0) is never filtered.

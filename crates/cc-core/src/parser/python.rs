@@ -28,6 +28,7 @@ impl LanguageSupport for PythonSupport {
                 Some((BlockKind::Class, name, Some(vis)))
             }
             "assignment" => classify_module_level_assignment(node, source),
+            "type_alias_statement" => classify_type_alias_statement(node, source),
             _ => None,
         }
     }
@@ -147,7 +148,11 @@ fn collect_plain_imports(
     }
 }
 
-/// `from pkg.mod import A, B as C` -> exactly one Import ref for `pkg.mod`.
+/// `from pkg.mod import A, B as C` -> exactly one Import ref for `pkg.mod`
+/// (the contract the import resolver consumes), plus one edge-free
+/// `ImportedSymbol` binding per imported name so the symbol resolver knows
+/// where each local name came from.
+///
 /// Relative imports keep their leading dots (`.`, `.rel`, `..pkg.sub`) because
 /// the resolver needs them to walk up from the importing file's package.
 fn collect_from_import(source: &str, node: &Node, from_id: &NodeId, refs: &mut Vec<RawReference>) {
@@ -165,9 +170,69 @@ fn collect_from_import(source: &str, node: &Node, from_id: &NodeId, refs: &mut V
         RawRefKind::Import {
             module_path: path.clone(),
         },
-        path,
+        path.clone(),
         &module,
     );
+
+    collect_imported_symbol_bindings(source, node, from_id, refs, &path);
+}
+
+/// One `ImportedSymbol` binding per name in `from <module> import <names>`.
+/// `from ... import *` has no `name:` field and therefore binds nothing.
+fn collect_imported_symbol_bindings(
+    source: &str,
+    node: &Node,
+    from_id: &NodeId,
+    refs: &mut Vec<RawReference>,
+    module_path: &str,
+) {
+    let mut cursor = node.walk();
+    for name_node in node.children_by_field_name("name", &mut cursor) {
+        let (original_node, local_node) = match name_node.kind() {
+            "dotted_name" => (name_node, name_node),
+            // `other as o` -> original `other`, local `o`.
+            "aliased_import" => {
+                let Some(original) = name_node.child_by_field_name("name") else {
+                    continue;
+                };
+                let Some(alias) = name_node.child_by_field_name("alias") else {
+                    continue;
+                };
+                (original, alias)
+            }
+            _ => continue,
+        };
+        // `from pkg import a.b` is not legal Python, but a dotted_name still
+        // renders its last segment as the bound name.
+        let Some(original) = last_dotted_segment(&original_node, source) else {
+            continue;
+        };
+        let Some(local) = last_dotted_segment(&local_node, source) else {
+            continue;
+        };
+        push_ref(
+            refs,
+            from_id,
+            RawRefKind::ImportedSymbol {
+                module_path: module_path.to_string(),
+                original,
+                local: local.clone(),
+            },
+            local,
+            &name_node,
+        );
+    }
+}
+
+/// Last segment of a `dotted_name` / `identifier` node.
+fn last_dotted_segment(node: &Node, source: &str) -> Option<String> {
+    let text = node_text(node, source)?;
+    let segment = text.rsplit('.').next().unwrap_or(&text).trim().to_string();
+    if segment.is_empty() {
+        None
+    } else {
+        Some(segment)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -178,13 +243,29 @@ fn collect_call(source: &str, node: &Node, from_id: &NodeId, refs: &mut Vec<RawR
     let Some(func) = node.child_by_field_name("function") else {
         return;
     };
-    let kind = if func.kind() == "attribute" {
-        RawRefKind::MethodCall
-    } else {
+    let kind = if func.kind() != "attribute" {
         RawRefKind::FunctionCall
+    } else if is_self_receiver(&func, source) {
+        RawRefKind::SelfMethodCall
+    } else {
+        RawRefKind::MethodCall
     };
     let name = Extractor::extract_function_name(&func, source);
     push_ref(refs, from_id, kind, name, node);
+}
+
+/// True for `self.name` / `cls.name`, i.e. an `attribute` whose `object:` is
+/// literally the identifier `self` or `cls`. Deliberately strict: in
+/// `self.client.send()` the receiver of `send` is `self.client`, not `self`,
+/// so that call stays a plain `MethodCall`.
+fn is_self_receiver(attribute: &Node, source: &str) -> bool {
+    let Some(object) = attribute.child_by_field_name("object") else {
+        return false;
+    };
+    if object.kind() != "identifier" {
+        return false;
+    }
+    matches!(node_text(&object, source).as_deref(), Some("self" | "cls"))
 }
 
 /// Bare decorators (`@my_decorator`, `@mod.cached`). Call-form decorators
@@ -211,18 +292,28 @@ fn collect_decorator(source: &str, node: &Node, from_id: &NodeId, refs: &mut Vec
 // ---------------------------------------------------------------------------
 
 /// A `type` node wrapping a plain name: `x: MyClass` or `x: mod.MyClass`.
-/// Composite forms (`generic_type`, `binary_operator`, string forward refs)
-/// are handled by their own arms as the walk reaches them, so a nested
-/// annotation contributes each leaf name exactly once.
+/// Composite forms (`generic_type`, `binary_operator`) are handled by their own
+/// arms as the walk reaches them, so a nested annotation contributes each leaf
+/// name exactly once. A `string` child is a PEP 484 forward reference and is
+/// parsed here (its content is text, so the walk cannot reach into it).
 fn collect_type_annotation(
     source: &str,
     node: &Node,
     from_id: &NodeId,
     refs: &mut Vec<RawReference>,
 ) {
+    if is_type_alias_declaration(node) {
+        return;
+    }
     let Some(inner) = node.named_child(0) else {
         return;
     };
+    if inner.kind() == "string" {
+        if !is_string_valued_type_parameter(node, source) {
+            collect_string_forward_reference(source, &inner, from_id, refs);
+        }
+        return;
+    }
     if let Some(name) = leaf_name(&inner, source) {
         emit_type_reference(refs, from_id, name, &inner);
     }
@@ -231,6 +322,9 @@ fn collect_type_annotation(
 /// The base of a generic annotation: `MyGeneric[Inner]` -> `MyGeneric`. The
 /// parameters are `type` nodes visited separately.
 fn collect_generic_base(source: &str, node: &Node, from_id: &NodeId, refs: &mut Vec<RawReference>) {
+    if is_type_alias_declaration(node) {
+        return;
+    }
     let Some(base) = node.named_child(0) else {
         return;
     };
@@ -243,7 +337,7 @@ fn collect_generic_base(source: &str, node: &Node, from_id: &NodeId, refs: &mut 
 /// `type`. Emit only this operator's own leaf operands; nested operators are
 /// visited on their own.
 fn collect_union_type(source: &str, node: &Node, from_id: &NodeId, refs: &mut Vec<RawReference>) {
-    if !is_in_type_position(node) {
+    if !is_in_type_position(node) || is_type_alias_declaration(node) {
         return;
     }
     for field in ["left", "right"] {
@@ -280,6 +374,166 @@ fn emit_type_reference(
         return;
     }
     push_ref(refs, from_id, RawRefKind::TypeReference, name, span_node);
+}
+
+/// True when `node` sits inside the *declaration* side of a PEP 695
+/// `type X[T] = ...` statement. The alias name (and its type-parameter list)
+/// are `type` / `generic_type` nodes in the grammar, so without this guard the
+/// alias would emit a `TypeReference` to itself and to its own parameters.
+/// Walks ancestors only; never the subtree.
+fn is_type_alias_declaration(node: &Node) -> bool {
+    let mut current = *node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "type_alias_statement" {
+            return parent
+                .child_by_field_name("left")
+                .map(|left| left.id() == current.id())
+                .unwrap_or(false);
+        }
+        current = parent;
+    }
+    false
+}
+
+// ---------------------------------------------------------------------------
+// String forward references
+// ---------------------------------------------------------------------------
+
+/// PEP 484 string forward references (`x: "Fwd"`, `List["Fwd"]`,
+/// `def f() -> "Optional[Fwd]"`). Only reached from inside a `type` node, so an
+/// ordinary string (docstring, default value, dict key, call argument) can
+/// never land here.
+///
+/// The content is text, not a parsed subtree, so it is scanned for the same
+/// leaf names a real annotation would emit and passed through the same
+/// builtin/typing filtering. Anything that is not a plain type expression
+/// (quotes, calls, operators other than `|`, non-identifier segments) emits
+/// nothing at all rather than guessing.
+fn collect_string_forward_reference(
+    source: &str,
+    node: &Node,
+    from_id: &NodeId,
+    refs: &mut Vec<RawReference>,
+) {
+    let Some(content) = plain_string_content(source, node) else {
+        return;
+    };
+    let Some(names) = type_expression_leaf_names(&content) else {
+        return;
+    };
+    for name in names {
+        emit_type_reference(refs, from_id, name, node);
+    }
+}
+
+/// True when this `type` node is a parameter of a generic whose strings are
+/// *values*, not forward references: `Literal["a", "b"]` enumerates literal
+/// strings, and `Annotated[T, "note"]` carries arbitrary metadata. Emitting
+/// type references from those is pure noise.
+///
+/// Looks only at the node's own parent chain (`type` -> `type_parameter` ->
+/// `generic_type`), never the subtree.
+fn is_string_valued_type_parameter(node: &Node, source: &str) -> bool {
+    let Some(param_list) = node.parent() else {
+        return false;
+    };
+    if param_list.kind() != "type_parameter" {
+        return false;
+    }
+    let Some(generic) = param_list.parent() else {
+        return false;
+    };
+    if generic.kind() != "generic_type" {
+        return false;
+    }
+    let Some(base) = generic.named_child(0) else {
+        return false;
+    };
+    matches!(
+        leaf_name(&base, source).as_deref(),
+        Some("Literal" | "Annotated")
+    )
+}
+
+/// Content of an unprefixed, non-interpolated string literal. Rejects f-strings,
+/// byte strings and raw strings (their prefix makes them something other than a
+/// forward reference) and concatenated/interpolated forms.
+fn plain_string_content(source: &str, node: &Node) -> Option<String> {
+    let mut content: Option<String> = None;
+    let mut cursor = node.walk();
+    for child in node.children(&mut cursor) {
+        match child.kind() {
+            "string_start" | "string_end" => {
+                let text = node_text(&child, source)?;
+                if !text.chars().all(|c| c == '"' || c == '\'') {
+                    return None; // f"", b"", r"", u"" ...
+                }
+            }
+            "string_content" => {
+                if content.is_some() {
+                    return None; // more than one content chunk
+                }
+                content = Some(node_text(&child, source)?);
+            }
+            // `interpolation`, `escape_sequence`, anything else: not a plain name.
+            _ => return None,
+        }
+    }
+    content
+}
+
+/// Split a textual type expression into the leaf names a parsed annotation
+/// would have produced, or `None` when the text is not a type expression.
+///
+/// `"Optional[Fwd]"` -> `["Optional", "Fwd"]`, `"mod.Deep"` -> `["Deep"]`,
+/// `"A | B"` -> `["A", "B"]`. Filtering of builtins/typing names happens in
+/// [`emit_type_reference`], so `Optional` never reaches the graph.
+fn type_expression_leaf_names(content: &str) -> Option<Vec<String>> {
+    let trimmed = content.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    // Conservative charset: identifiers, dotted paths, subscripts, unions.
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '[' | ']' | ',' | '|' | ' '))
+    {
+        return None;
+    }
+
+    let mut names = Vec::new();
+    for token in trimmed.split(['[', ']', ',', '|', ' ']) {
+        if token.is_empty() {
+            continue;
+        }
+        let mut segments = token.split('.');
+        // Every segment must be a plain identifier; a stray literal (`3`) or an
+        // empty segment (`a..b`) means this is not a name expression.
+        let mut leaf = None;
+        for segment in &mut segments {
+            if !is_python_identifier(segment) {
+                return None;
+            }
+            leaf = Some(segment.to_string());
+        }
+        if let Some(leaf) = leaf {
+            names.push(leaf);
+        }
+    }
+    if names.is_empty() {
+        None
+    } else {
+        Some(names)
+    }
+}
+
+fn is_python_identifier(text: &str) -> bool {
+    let mut chars = text.chars();
+    match chars.next() {
+        Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
+        _ => return false,
+    }
+    chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
 }
 
 // ---------------------------------------------------------------------------
@@ -349,6 +603,29 @@ fn classify_module_level_assignment(
         BlockKind::Constant
     };
     Some((kind, name.clone(), Some(python_visibility(&name))))
+}
+
+/// PEP 695 `type Alias = ...` / `type G[T] = ...`. The `left:` field is a
+/// `type` node wrapping either a bare `identifier` or a `generic_type` whose
+/// base identifier is the alias name. Unlike `NAME = ...` bindings this is
+/// unambiguously a type declaration, so it is classified wherever it appears.
+fn classify_type_alias_statement(
+    node: &Node,
+    source: &str,
+) -> Option<(BlockKind, String, Option<Visibility>)> {
+    let left = node.child_by_field_name("left")?;
+    let inner = left.named_child(0)?;
+    let name_node = match inner.kind() {
+        "identifier" => inner,
+        "generic_type" => inner.named_child(0)?,
+        _ => return None,
+    };
+    let name = node_text(&name_node, source)?;
+    if name.is_empty() {
+        return None;
+    }
+    let vis = python_visibility(&name);
+    Some((BlockKind::TypeAlias, name, Some(vis)))
 }
 
 /// `X: TypeAlias = ...`, `T = TypeVar("T")`, `UserId = NewType(...)`,
