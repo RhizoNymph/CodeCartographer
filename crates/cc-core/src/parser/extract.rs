@@ -1130,6 +1130,56 @@ mod tests {
         assert_eq!(binding.from_node, file_id);
     }
 
+    // -- C2: PEP 695 `type X = Y` statements --
+
+    #[test]
+    fn test_python_pep695_type_alias_block() {
+        let (nodes, _) = extract("type Alias = MyClass", &Language::Python);
+        assert_eq!(block_kind_of(&nodes, "Alias"), BlockKind::TypeAlias);
+        assert_eq!(block_names(&nodes), vec!["Alias"]);
+    }
+
+    #[test]
+    fn test_python_pep695_type_alias_rhs_emits_type_reference() {
+        assert_eq!(
+            python_type_ref_names("type Alias = MyClass"),
+            vec!["MyClass"],
+        );
+    }
+
+    #[test]
+    fn test_python_pep695_type_alias_never_self_references() {
+        // The alias name on the LHS is itself a `type` node in the grammar;
+        // it must not become a TypeReference from the alias block to itself.
+        let (nodes, refs) = extract("type Alias = MyClass", &Language::Python);
+        let alias_id = block_id_of(&nodes, "Alias");
+        assert!(
+            !refs.iter().any(|r| r.name == "Alias"),
+            "the alias name must never appear as a reference, got {:?}",
+            refs.iter().map(|r| (&r.name, &r.kind)).collect::<Vec<_>>()
+        );
+        assert!(
+            refs.iter()
+                .all(|r| r.from_node != alias_id || r.name != "Alias"),
+            "no self-referencing type ref"
+        );
+    }
+
+    #[test]
+    fn test_python_pep695_generic_type_alias_skips_its_parameters() {
+        // `type G[T] = list[T]`: the LHS (`G`, and its `[T]` parameter list) is
+        // a declaration, not a reference. The RHS behaves normally: `list` is a
+        // builtin (dropped), `T` is a genuine leaf reference.
+        let (nodes, _) = extract("type G[T] = list[T]", &Language::Python);
+        assert_eq!(block_kind_of(&nodes, "G"), BlockKind::TypeAlias);
+        assert_eq!(python_type_ref_names("type G[T] = list[T]"), vec!["T"]);
+    }
+
+    #[test]
+    fn test_python_pep695_type_alias_union_rhs() {
+        assert_eq!(python_type_ref_names("type Alias = A | B"), vec!["A", "B"]);
+    }
+
     // -- TypeScript tests --
 
     #[test]

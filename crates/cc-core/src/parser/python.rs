@@ -28,6 +28,7 @@ impl LanguageSupport for PythonSupport {
                 Some((BlockKind::Class, name, Some(vis)))
             }
             "assignment" => classify_module_level_assignment(node, source),
+            "type_alias_statement" => classify_type_alias_statement(node, source),
             _ => None,
         }
     }
@@ -284,6 +285,9 @@ fn collect_type_annotation(
     from_id: &NodeId,
     refs: &mut Vec<RawReference>,
 ) {
+    if is_type_alias_declaration(node) {
+        return;
+    }
     let Some(inner) = node.named_child(0) else {
         return;
     };
@@ -295,6 +299,9 @@ fn collect_type_annotation(
 /// The base of a generic annotation: `MyGeneric[Inner]` -> `MyGeneric`. The
 /// parameters are `type` nodes visited separately.
 fn collect_generic_base(source: &str, node: &Node, from_id: &NodeId, refs: &mut Vec<RawReference>) {
+    if is_type_alias_declaration(node) {
+        return;
+    }
     let Some(base) = node.named_child(0) else {
         return;
     };
@@ -307,7 +314,7 @@ fn collect_generic_base(source: &str, node: &Node, from_id: &NodeId, refs: &mut 
 /// `type`. Emit only this operator's own leaf operands; nested operators are
 /// visited on their own.
 fn collect_union_type(source: &str, node: &Node, from_id: &NodeId, refs: &mut Vec<RawReference>) {
-    if !is_in_type_position(node) {
+    if !is_in_type_position(node) || is_type_alias_declaration(node) {
         return;
     }
     for field in ["left", "right"] {
@@ -344,6 +351,25 @@ fn emit_type_reference(
         return;
     }
     push_ref(refs, from_id, RawRefKind::TypeReference, name, span_node);
+}
+
+/// True when `node` sits inside the *declaration* side of a PEP 695
+/// `type X[T] = ...` statement. The alias name (and its type-parameter list)
+/// are `type` / `generic_type` nodes in the grammar, so without this guard the
+/// alias would emit a `TypeReference` to itself and to its own parameters.
+/// Walks ancestors only; never the subtree.
+fn is_type_alias_declaration(node: &Node) -> bool {
+    let mut current = *node;
+    while let Some(parent) = current.parent() {
+        if parent.kind() == "type_alias_statement" {
+            return parent
+                .child_by_field_name("left")
+                .map(|left| left.id() == current.id())
+                .unwrap_or(false);
+        }
+        current = parent;
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -413,6 +439,29 @@ fn classify_module_level_assignment(
         BlockKind::Constant
     };
     Some((kind, name.clone(), Some(python_visibility(&name))))
+}
+
+/// PEP 695 `type Alias = ...` / `type G[T] = ...`. The `left:` field is a
+/// `type` node wrapping either a bare `identifier` or a `generic_type` whose
+/// base identifier is the alias name. Unlike `NAME = ...` bindings this is
+/// unambiguously a type declaration, so it is classified wherever it appears.
+fn classify_type_alias_statement(
+    node: &Node,
+    source: &str,
+) -> Option<(BlockKind, String, Option<Visibility>)> {
+    let left = node.child_by_field_name("left")?;
+    let inner = left.named_child(0)?;
+    let name_node = match inner.kind() {
+        "identifier" => inner,
+        "generic_type" => inner.named_child(0)?,
+        _ => return None,
+    };
+    let name = node_text(&name_node, source)?;
+    if name.is_empty() {
+        return None;
+    }
+    let vis = python_visibility(&name);
+    Some((BlockKind::TypeAlias, name, Some(vis)))
 }
 
 /// `X: TypeAlias = ...`, `T = TypeVar("T")`, `UserId = NewType(...)`,

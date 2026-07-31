@@ -64,6 +64,12 @@ reference is attributed to exactly one node.
 | `function_definition` | `Function` | |
 | `class_definition` | `Class` | |
 | `assignment` | `Constant` / `TypeAlias` | module-level, single-identifier target only |
+| `type_alias_statement` | `TypeAlias` | PEP 695 `type X = Y` / `type G[T] = ...` |
+
+PEP 695 `type_alias_statement` is unambiguously a type declaration, so unlike
+`NAME = ...` bindings it is classified wherever it appears. The block name comes
+from the `left:` field (its `identifier`, or the base `identifier` of a
+`generic_type` for `type G[T] = ...`).
 
 Module-level bindings are deliberately narrow to keep the graph from exploding:
 the `assignment` must sit directly in the module body (`module > expression_statement >
@@ -139,6 +145,12 @@ Names matching `is_python_builtin_type` or `is_typing_construct` (`Optional`,
 `List`, `Dict`, `Union`, `Any`, `Callable`, `Protocol`, ...) are dropped. Result:
 `list[MyClass]` yields exactly one `TypeReference` named `MyClass`. String forward
 references (`x: "Fwd"`) are not resolved.
+
+The `left:` side of a PEP 695 `type X[T] = ...` statement is skipped
+(`is_type_alias_declaration`, an ancestor walk): in the grammar the alias name
+and its parameter list are themselves `type` / `generic_type` nodes, so without
+the guard the alias block would emit a `TypeReference` to itself and to its own
+type parameters. The `right:` side behaves normally.
 
 **Inheritance** — an `argument_list` whose parent is a `class_definition` emits one
 `Inheritance` ref per base: `identifier` and `attribute` (last segment) directly,
