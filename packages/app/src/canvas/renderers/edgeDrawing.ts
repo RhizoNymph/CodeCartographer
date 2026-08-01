@@ -19,6 +19,12 @@ import {
   type EdgeDatum,
   type NodeDisplayRef,
 } from "./types";
+import {
+  buildEdgeCountChipLayer,
+  polylineArcMidpoint,
+  shouldShowCountChip,
+  type EdgeCountChipSpec,
+} from "./edgeLabels";
 
 // Re-export types for backwards compatibility with existing imports
 export type { EdgeDatum, NodeDisplayRef } from "./types";
@@ -423,6 +429,10 @@ export class EdgeDrawingManager {
   private baseLayer: Graphics | null = null;
   /** Highlight layer: only connected edges at full opacity. Only rebuilt on hover. */
   private highlightLayer: Graphics | null = null;
+  /** "×N" chips for aggregated base-layer edges. Lives and dies with baseLayer. */
+  private baseChipLayer: Container | null = null;
+  /** "×N" chips for aggregated highlighted edges. Lives and dies with highlightLayer. */
+  private highlightChipLayer: Container | null = null;
 
   private edgeRedrawFrame: number | null = null;
 
@@ -522,6 +532,7 @@ export class EdgeDrawingManager {
 
     const gfx = new Graphics();
     const lodOpacityMultiplier = getLODEdgeOpacity(currentLOD);
+    const chipSpecs: EdgeCountChipSpec[] = [];
 
     for (const draw of resolvedDraws) {
       const { edge, points } = draw;
@@ -545,15 +556,38 @@ export class EdgeDrawingManager {
       if (alpha < 0.05) continue;
 
       renderSingleEdge(gfx, points, color, alpha, width, currentLOD !== "minimap", ambiguous);
+
+      if (shouldShowCountChip(edge.count, currentLOD)) {
+        const midpoint = polylineArcMidpoint(points);
+        if (midpoint) {
+          chipSpecs.push({ position: midpoint, count: edge.count, color, alpha });
+        }
+      }
     }
 
     edgeLayer.addChild(gfx);
     this.baseLayer = gfx;
 
+    const chips = buildEdgeCountChipLayer(chipSpecs);
+    if (chips) {
+      edgeLayer.addChild(chips);
+      this.baseChipLayer = chips;
+    }
+
     // If hovered, dim the base layer and draw highlights on top
     if (hoveredNodeId && this.highlightedEdgeIndices.size > 0) {
-      this.baseLayer.alpha = 0.15;
+      this.setBaseLayerAlpha(0.15);
       this.rebuildHighlightLayer();
+    }
+  }
+
+  /** Keep the base edges and their count chips at the same opacity. */
+  private setBaseLayerAlpha(alpha: number): void {
+    if (this.baseLayer) {
+      this.baseLayer.alpha = alpha;
+    }
+    if (this.baseChipLayer) {
+      this.baseChipLayer.alpha = alpha;
     }
   }
 
@@ -576,11 +610,11 @@ export class EdgeDrawingManager {
 
     if (hoveredNodeId && this.highlightedEdgeIndices.size > 0) {
       // Dim base layer and draw highlighted edges
-      this.baseLayer.alpha = 0.15;
+      this.setBaseLayerAlpha(0.15);
       this.rebuildHighlightLayer();
     } else {
       // Restore base layer to full opacity
-      this.baseLayer.alpha = 1.0;
+      this.setBaseLayerAlpha(1.0);
     }
 
     return true;
@@ -603,6 +637,7 @@ export class EdgeDrawingManager {
     const getRef = this._lastGetRef;
     const currentLOD = this._lastLOD;
     const visibleNodes = this._lastVisibleNodes;
+    const chipSpecs: EdgeCountChipSpec[] = [];
 
     for (const idx of this.highlightedEdgeIndices) {
       const edge = this.edgeData[idx];
@@ -623,10 +658,23 @@ export class EdgeDrawingManager {
       const width = style.width + 1;
 
       renderSingleEdge(gfx, points, color, alpha, width, currentLOD !== "minimap", ambiguous);
+
+      if (shouldShowCountChip(edge.count, currentLOD)) {
+        const midpoint = polylineArcMidpoint(points);
+        if (midpoint) {
+          chipSpecs.push({ position: midpoint, count: edge.count, color, alpha });
+        }
+      }
     }
 
     this._lastEdgeLayer.addChild(gfx);
     this.highlightLayer = gfx;
+
+    const chips = buildEdgeCountChipLayer(chipSpecs);
+    if (chips) {
+      this._lastEdgeLayer.addChild(chips);
+      this.highlightChipLayer = chips;
+    }
   }
 
   /**
@@ -673,12 +721,20 @@ export class EdgeDrawingManager {
       this.baseLayer.destroy();
       this.baseLayer = null;
     }
+    if (this.baseChipLayer) {
+      this.baseChipLayer.destroy({ children: true });
+      this.baseChipLayer = null;
+    }
   }
 
   private destroyHighlightLayer(): void {
     if (this.highlightLayer) {
       this.highlightLayer.destroy();
       this.highlightLayer = null;
+    }
+    if (this.highlightChipLayer) {
+      this.highlightChipLayer.destroy({ children: true });
+      this.highlightChipLayer = null;
     }
   }
 
@@ -697,6 +753,16 @@ export class EdgeDrawingManager {
   /** @internal Exposed for testing: the base layer alpha value */
   get _baseLayerAlpha(): number | null {
     return this.baseLayer?.alpha ?? null;
+  }
+
+  /** @internal Exposed for testing: number of "×N" chips on the base layer */
+  get _baseChipCount(): number {
+    return this.baseChipLayer?.children.length ?? 0;
+  }
+
+  /** @internal Exposed for testing: number of "×N" chips on the highlight layer */
+  get _highlightChipCount(): number {
+    return this.highlightChipLayer?.children.length ?? 0;
   }
 }
 
