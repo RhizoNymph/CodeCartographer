@@ -12,6 +12,7 @@ import {
   focusVisibleNodes,
   focusExpandedNodes,
   focusLayoutIds,
+  focusTopFrame,
 } from "../stores/graphViewModel";
 
 export function Canvas() {
@@ -27,7 +28,7 @@ export function Canvas() {
     hideUnconnectedNodes,
     hideAmbiguousEdges,
     viewMode,
-    focusFrame,
+    focusStack,
     focusNeighborhood,
     focusEdgeDetail,
     layoutVersion,
@@ -42,7 +43,7 @@ export function Canvas() {
       hideUnconnectedNodes: s.hideUnconnectedNodes,
       hideAmbiguousEdges: s.hideAmbiguousEdges,
       viewMode: s.viewMode,
-      focusFrame: s.focusFrame,
+      focusStack: s.focusStack,
       focusNeighborhood: s.focusNeighborhood,
       focusEdgeDetail: s.focusEdgeDetail,
       layoutVersion: s.layoutVersion,
@@ -50,11 +51,12 @@ export function Canvas() {
   );
   const [error, setError] = useState<string | null>(null);
 
-  // The ids to lay out while focused: a node frame's neighborhood or an edge
-  // frame's edge detail. Null means "not focused" -- normal derivation applies.
+  // The ids to lay out while focused: the TOP frame's neighborhood (node frame)
+  // or edge detail (edge frame). Null means "not focused" or "payload not here
+  // yet" -- normal derivation applies.
   const focusIds = useMemo(
-    () => focusLayoutIds(focusFrame, focusNeighborhood, focusEdgeDetail),
-    [focusFrame, focusNeighborhood, focusEdgeDetail]
+    () => focusLayoutIds(focusTopFrame(focusStack), focusNeighborhood, focusEdgeDetail),
+    [focusStack, focusNeighborhood, focusEdgeDetail]
   );
   // Effective edge kinds fed to layout: module view forces {Import}; focus uses
   // the enabled kinds (already applied server-side to the fetched focus set).

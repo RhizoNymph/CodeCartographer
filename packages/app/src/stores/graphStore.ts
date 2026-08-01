@@ -2,6 +2,7 @@ import { create } from "zustand";
 import type {
   CodeGraph,
   EdgeKind,
+  FocusDirection,
   ParseEvent,
   ParseResult,
   Neighborhood,
@@ -10,12 +11,18 @@ import type {
 import { saveFolderState, loadFolderState, type ViewMode } from "./persistenceStore";
 import { getNeighborhood, getEdgeDetail } from "../api/commands";
 import {
-  reduceSetViewModeFrame,
-  reduceEnterNodeFocus,
-  reduceEnterEdgeFocus,
-  reduceExitFocusFrame,
+  reduceSetViewMode,
+  reduceEnterFocus,
+  reduceExitFocus,
+  reducePopFocus,
+  reducePopToFrame,
+  reduceSetFocusDepth,
+  reduceSetFocusDirection,
+  focusTopFrame,
+  nodeFrame,
   effectiveEdgeKinds,
   type FocusFrame,
+  type FocusViewState,
 } from "./graphViewModel";
 import { useDebugStore } from "./debugStore";
 
@@ -88,15 +95,13 @@ interface GraphState {
   viewMode: ViewMode;
 
   /**
-   * Focus / drill-down state. `focusFrame` is what the user drilled into (a node
-   * neighborhood or one aggregated edge); the matching payload below holds the
-   * fetched ids + edges, and the layout renders ONLY those ids. Exactly one
-   * payload is non-null at a time, matching the active frame's type.
+   * Focus / drill-down state. `focusStack` is empty when unfocused; its LAST
+   * frame is the one on screen and the payload below is that frame's: a node
+   * frame's `focusNeighborhood` or an edge frame's `focusEdgeDetail` (exactly
+   * one non-null while focused). The layout renders ONLY the payload's ids.
+   * Focusing from inside a focused view pushes a deeper frame.
    */
-  focusFrame: FocusFrame | null;
-  /** Hop depth for node focus: the active node frame's depth, and the default
-   *  the next node focus is entered at. Not meaningful for edge focus. */
-  focusDepth: 1 | 2;
+  focusStack: FocusFrame[];
   focusNeighborhood: Neighborhood | null;
   focusEdgeDetail: EdgeDetail | null;
 
@@ -119,13 +124,111 @@ interface GraphState {
   setHideUnconnectedNodes: (hide: boolean) => void;
   setHideAmbiguousEdges: (hide: boolean) => void;
   setViewMode: (mode: ViewMode) => void;
-  enterFocus: (nodeId: string, depth?: 1 | 2) => Promise<void>;
+  /** Push (or replace, if it is already the top frame) a node focus frame. */
+  enterFocus: (
+    nodeId: string,
+    depth?: 1 | 2,
+    direction?: FocusDirection
+  ) => Promise<void>;
+  /** Push an edge focus frame for one aggregated `source -> target` view edge. */
   enterEdgeFocus: (source: string, target: string) => Promise<void>;
+  /** Push any focus frame; the generic entry point behind the two above. */
+  pushFocusFrame: (frame: FocusFrame) => Promise<void>;
   setFocusDepth: (depth: 1 | 2) => Promise<void>;
+  setFocusDirection: (direction: FocusDirection) => Promise<void>;
+  /** Pop exactly one frame (Esc); focus ends only when the stack empties. */
+  popFocus: () => Promise<void>;
+  /** Pop back to the breadcrumb frame at `index`; `-1` is the root chip. */
+  popToFrame: (index: number) => Promise<void>;
+  /** Clear the whole stack at once (breadcrumb X). */
   exitFocus: () => void;
   getVisibleNodeIds: () => string[];
   requestRelayout: () => void;
   saveCurrentState: () => void;
+}
+
+interface FocusPayload {
+  neighborhood: Neighborhood | null;
+  edgeDetail: EdgeDetail | null;
+}
+
+/**
+ * Fetch the render payload for one focus frame.
+ *
+ * Node frames run the cc-core neighborhood BFS in the frame's own direction and
+ * depth, over the raw enabled kinds. Edge frames resolve the underlying edges
+ * behind one aggregate via `get_edge_detail`, over the EFFECTIVE kinds of the
+ * view the fetch starts from -- so a drill-in from module view expands exactly
+ * the Import aggregate the user double-clicked, while a re-fetch from symbol
+ * view (popping back to an edge frame) honours the toolbar's enabled kinds.
+ */
+async function fetchFramePayload(
+  frame: FocusFrame,
+  state: GraphState
+): Promise<FocusPayload> {
+  if (frame.type === "edge") {
+    const kinds = Array.from(
+      effectiveEdgeKinds(state.enabledEdgeKinds, state.viewMode)
+    );
+    return {
+      neighborhood: null,
+      edgeDetail: await getEdgeDetail(frame.source, frame.target, kinds),
+    };
+  }
+  return {
+    neighborhood: await getNeighborhood(
+      frame.nodeId,
+      frame.depth,
+      Array.from(state.enabledEdgeKinds),
+      frame.direction
+    ),
+    edgeDetail: null,
+  };
+}
+
+/**
+ * Apply a reduced focus state: fetch the new top frame's neighborhood and commit
+ * both together, so `focusNeighborhood` always belongs to the top frame. An
+ * empty stack clears focus without any IPC. A failed fetch leaves the current
+ * state untouched rather than stranding the canvas on a stale neighborhood.
+ */
+async function applyFocusState(
+  set: (partial: Partial<GraphState>) => void,
+  get: () => GraphState,
+  next: FocusViewState
+): Promise<void> {
+  const cur = get();
+  const top = focusTopFrame(next.focusStack);
+
+  if (top === null) {
+    set({
+      viewMode: next.viewMode,
+      focusStack: [],
+      focusNeighborhood: null,
+      focusEdgeDetail: null,
+      layoutVersion: cur.layoutVersion + 1,
+    });
+    return;
+  }
+
+  try {
+    const payload = await fetchFramePayload(top, cur);
+    set({
+      viewMode: next.viewMode,
+      focusStack: next.focusStack,
+      focusNeighborhood: payload.neighborhood,
+      focusEdgeDetail: payload.edgeDetail,
+      // Keep the selection on the frame being entered so the sidebar and chips
+      // agree with the canvas; an edge frame focuses a relation, not a node.
+      selectedNodeId: top.type === "node" ? top.nodeId : null,
+      layoutVersion: get().layoutVersion + 1,
+    });
+  } catch (err) {
+    console.error("focus frame fetch failed:", err);
+    if (import.meta.env.DEV) {
+      useDebugStore.getState().addLog(`focus frame fetch FAILED: ${err}`);
+    }
+  }
 }
 
 const ALL_EDGE_KINDS: EdgeKind[] = [
@@ -152,8 +255,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   hideUnconnectedNodes: false,
   hideAmbiguousEdges: false,
   viewMode: "module",
-  focusFrame: null,
-  focusDepth: 1,
+  focusStack: [],
   focusNeighborhood: null,
   focusEdgeDetail: null,
   needsRelayout: false,
@@ -219,7 +321,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       expandedNodes: expanded,
       visibleNodes: visible,
       viewMode,
-      focusFrame: null,
+      focusStack: [],
       focusNeighborhood: null,
       focusEdgeDetail: null,
       needsRelayout: false,
@@ -366,16 +468,16 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     const cur = get();
     if (cur.viewMode === mode) return;
     // Switching modes is a derived-view change: persist the new mode and bump
-    // layoutVersion so the canvas relayouts. Leaving symbol view also drops any
-    // active focus.
-    const reduced = reduceSetViewModeFrame(
-      { viewMode: cur.viewMode, frame: cur.focusFrame },
+    // layoutVersion so the canvas relayouts. Leaving symbol view also drops the
+    // whole focus stack (and with it both payloads).
+    const reduced = reduceSetViewMode(
+      { viewMode: cur.viewMode, focusStack: cur.focusStack },
       mode
     );
-    const keepPayload = reduced.frame !== null;
+    const keepPayload = reduced.focusStack.length > 0;
     set({
       viewMode: reduced.viewMode,
-      focusFrame: reduced.frame,
+      focusStack: reduced.focusStack,
       focusNeighborhood: keepPayload ? cur.focusNeighborhood : null,
       focusEdgeDetail: keepPayload ? cur.focusEdgeDetail : null,
       layoutVersion: cur.layoutVersion + 1,
@@ -391,94 +493,97 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     }
   },
 
-  enterFocus: async (nodeId, depth = get().focusDepth) => {
+  enterFocus: async (nodeId, depth, direction) => {
     const state = get();
     if (!state.graph || !state.graph.nodes[nodeId]) return;
-    // Entering focus always drills into the symbol view.
-    const kinds = Array.from(state.enabledEdgeKinds);
-    try {
-      const neighborhood = await getNeighborhood(nodeId, depth, kinds);
-      const reduced = reduceEnterNodeFocus(
-        { viewMode: state.viewMode, frame: state.focusFrame },
-        nodeId,
-        depth
-      );
-      set({
-        viewMode: reduced.viewMode,
-        focusFrame: reduced.frame,
-        focusDepth: depth,
-        focusNeighborhood: neighborhood,
-        focusEdgeDetail: null,
-        selectedNodeId: nodeId,
-        layoutVersion: get().layoutVersion + 1,
-      });
-    } catch (err) {
-      console.error("get_neighborhood failed:", err);
-      if (import.meta.env.DEV) {
-        useDebugStore.getState().addLog(`get_neighborhood FAILED: ${err}`);
-      }
-    }
+    // Unspecified depth/direction inherit the current frame's, so drilling
+    // deeper keeps the trace settings the user chose.
+    const top = focusTopFrame(state.focusStack);
+    const inherited =
+      top !== null && top.type === "node"
+        ? { depth: top.depth, direction: top.direction }
+        : { depth: 1 as const, direction: "both" as const };
+    await get().pushFocusFrame(
+      nodeFrame(nodeId, depth ?? inherited.depth, direction ?? inherited.direction)
+    );
+  },
+
+  pushFocusFrame: async (frame) => {
+    const cur = get();
+    const reduced = reduceEnterFocus(
+      { viewMode: cur.viewMode, focusStack: cur.focusStack },
+      frame
+    );
+    await applyFocusState(set, get, reduced);
   },
 
   /**
-   * Drill into one aggregated `source -> target` view edge: fetch the underlying
-   * edges behind it and lay out only their endpoints. Uses the EFFECTIVE edge
-   * kinds for the current view (module view forces {Import}), so the drill-in
-   * expands exactly the aggregate the user double-clicked.
+   * Drill into one aggregated `source -> target` view edge: push an edge frame
+   * whose payload is the underlying edges behind that aggregate (fetched with
+   * the current view's EFFECTIVE kinds -- see `fetchFramePayload`).
    */
   enterEdgeFocus: async (source, target) => {
     const state = get();
     if (!state.graph) return;
     if (!state.graph.nodes[source] || !state.graph.nodes[target]) return;
-    const kinds = Array.from(
-      effectiveEdgeKinds(state.enabledEdgeKinds, state.viewMode)
-    );
-    try {
-      const detail = await getEdgeDetail(source, target, kinds);
-      const reduced = reduceEnterEdgeFocus(
-        { viewMode: state.viewMode, frame: state.focusFrame },
-        source,
-        target
-      );
-      set({
-        viewMode: reduced.viewMode,
-        focusFrame: reduced.frame,
-        focusEdgeDetail: detail,
-        focusNeighborhood: null,
-        selectedNodeId: null,
-        layoutVersion: get().layoutVersion + 1,
-      });
-    } catch (err) {
-      console.error("get_edge_detail failed:", err);
-      if (import.meta.env.DEV) {
-        useDebugStore.getState().addLog(`get_edge_detail FAILED: ${err}`);
-      }
-    }
+    await get().pushFocusFrame({ type: "edge", source, target });
   },
 
   setFocusDepth: async (depth) => {
-    const state = get();
-    const frame = state.focusFrame;
-    // Depth only applies to node focus; otherwise just record the preference
-    // for the next focus.
-    if (!frame || frame.type !== "node") {
-      set({ focusDepth: depth });
-      return;
-    }
-    if (state.focusDepth === depth && state.focusNeighborhood) return;
-    // Re-fetch the neighborhood at the new depth for the current focus node.
-    await get().enterFocus(frame.nodeId, depth);
+    const cur = get();
+    const top = focusTopFrame(cur.focusStack);
+    if (top === null || top.type !== "node") return;
+    if (top.depth === depth && cur.focusNeighborhood) return;
+    const reduced = reduceSetFocusDepth(
+      { viewMode: cur.viewMode, focusStack: cur.focusStack },
+      depth
+    );
+    await applyFocusState(set, get, reduced);
+  },
+
+  setFocusDirection: async (direction) => {
+    const cur = get();
+    const top = focusTopFrame(cur.focusStack);
+    if (top === null || top.type !== "node") return;
+    if (top.direction === direction && cur.focusNeighborhood) return;
+    const reduced = reduceSetFocusDirection(
+      { viewMode: cur.viewMode, focusStack: cur.focusStack },
+      direction
+    );
+    await applyFocusState(set, get, reduced);
+  },
+
+  popFocus: async () => {
+    const cur = get();
+    if (cur.focusStack.length === 0) return;
+    const reduced = reducePopFocus({
+      viewMode: cur.viewMode,
+      focusStack: cur.focusStack,
+    });
+    // The revealed frame needs its own neighborhood re-fetched.
+    await applyFocusState(set, get, reduced);
+  },
+
+  popToFrame: async (index) => {
+    const cur = get();
+    if (cur.focusStack.length === 0) return;
+    const reduced = reducePopToFrame(
+      { viewMode: cur.viewMode, focusStack: cur.focusStack },
+      index
+    );
+    if (reduced.focusStack.length === cur.focusStack.length) return;
+    await applyFocusState(set, get, reduced);
   },
 
   exitFocus: () => {
     const cur = get();
-    if (!cur.focusFrame) return;
-    const reduced = reduceExitFocusFrame({
+    if (cur.focusStack.length === 0) return;
+    const reduced = reduceExitFocus({
       viewMode: cur.viewMode,
-      frame: cur.focusFrame,
+      focusStack: cur.focusStack,
     });
     set({
-      focusFrame: reduced.frame,
+      focusStack: reduced.focusStack,
       focusNeighborhood: null,
       focusEdgeDetail: null,
       layoutVersion: cur.layoutVersion + 1,

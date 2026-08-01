@@ -3,6 +3,7 @@ import type {
   CodeNode,
   EdgeKind,
   EdgeDetail,
+  FocusDirection,
   Neighborhood,
 } from "../api/types";
 
@@ -115,112 +116,79 @@ export function focusExpandedNodes(
   return result;
 }
 
+/* ------------------------------------------------------------------------- *
+ * Focus stack
+ * ------------------------------------------------------------------------- */
+
 /**
- * What the user drilled into. A focus is always one of these frames:
+ * One level of the focus stack. Focusing a node from inside a focused view
+ * PUSHES a frame, so focus mode is real graph exploration rather than a single
+ * pinned neighborhood.
  *
- *   - "node": a bounded neighborhood around a node, `depth` hops out;
- *   - "edge": the underlying edges behind ONE aggregated `source -> target`
- *     view edge -- the answer to "what are these 14 imports?".
- *
- * The frame is the identity of the focus; the fetched payload
- * (`Neighborhood` / `EdgeDetail`) is cached alongside it in the store.
+ * The "edge" variant is fetched by `get_edge_detail` (feat/edge-drill-in); the
+ * stack mechanics, breadcrumb trail and reducers below treat it generically and
+ * never look inside a node frame's depth/direction unless the frame IS a node
+ * frame.
  */
 export type FocusFrame =
-  | { type: "node"; nodeId: string; depth: 1 | 2 }
+  | { type: "node"; nodeId: string; depth: 1 | 2; direction: FocusDirection }
   | { type: "edge"; source: string; target: string };
 
-/**
- * Focus / view reducer state. Kept pure and framework-free so the transition
- * logic is unit-testable without the Tauri/zustand runtime.
- */
-export interface FocusFrameState {
-  viewMode: ViewMode;
-  frame: FocusFrame | null;
-}
-
-/**
- * Switching view mode. Entering module view always drops the focus frame
- * (module view has no symbol-level drill-in); symbol view is left as-is.
- */
-export function reduceSetViewModeFrame(
-  state: FocusFrameState,
-  mode: ViewMode
-): FocusFrameState {
-  if (mode === "module") {
-    return { viewMode: "module", frame: null };
-  }
-  return { ...state, viewMode: "symbol" };
-}
-
-/** Focusing a node always drills into symbol view; replaces any active frame. */
-export function reduceEnterNodeFocus(
-  state: FocusFrameState,
+/** Construct a node frame (default 1 hop, bidirectional). */
+export function nodeFrame(
   nodeId: string,
-  depth: 1 | 2
-): FocusFrameState {
-  void state;
-  return { viewMode: "symbol", frame: { type: "node", nodeId, depth } };
+  depth: 1 | 2 = 1,
+  direction: FocusDirection = "both"
+): FocusFrame {
+  return { type: "node", nodeId, depth, direction };
 }
 
 /**
- * Drilling into an aggregated `source -> target` edge. Like node focus this
- * always lands in symbol view, since the contributing endpoints are symbols.
+ * A frame's identity for dedup/keying: the thing it focuses, NOT how it is
+ * traced. Re-entering the same node at a different depth/direction is a
+ * refinement of the current frame, not a new level.
  */
-export function reduceEnterEdgeFocus(
-  state: FocusFrameState,
-  source: string,
-  target: string
-): FocusFrameState {
-  void state;
-  return { viewMode: "symbol", frame: { type: "edge", source, target } };
+export function focusFrameKey(frame: FocusFrame): string {
+  return frame.type === "node"
+    ? `node:${frame.nodeId}`
+    : `edge:${frame.source}->${frame.target}`;
 }
 
-/** Exiting focus clears the frame but leaves the (symbol) view mode. */
-export function reduceExitFocusFrame(state: FocusFrameState): FocusFrameState {
-  return { ...state, frame: null };
-}
-
-/**
- * The node a focus is centred on, or null for an edge focus (which is centred
- * on a pair, not a node). Drives node-centric UI such as the F-hotkey's
- * "already focused" check and the selection chip.
- */
-export function focusedNodeId(frame: FocusFrame | null): string | null {
-  return frame && frame.type === "node" ? frame.nodeId : null;
+/** The frame currently being rendered (top of stack), or null when unfocused. */
+export function focusTopFrame(stack: readonly FocusFrame[]): FocusFrame | null {
+  return stack.length === 0 ? null : stack[stack.length - 1];
 }
 
 /**
- * Whether hop depth is meaningful for this frame. Edge focus is exact -- it
- * shows the edges that make up one aggregate, not a BFS radius -- so the depth
- * selector is hidden there.
+ * The node id of the top frame, or null when unfocused or when the top frame is
+ * an edge frame (which focuses a relation, not a single node).
  */
-export function focusHasDepth(frame: FocusFrame | null): boolean {
-  return frame !== null && frame.type === "node";
+export function focusTopNodeId(stack: readonly FocusFrame[]): string | null {
+  const top = focusTopFrame(stack);
+  return top !== null && top.type === "node" ? top.nodeId : null;
 }
 
-/** What the focus breadcrumb chip renders, resolved to display names. */
-export type FocusBreadcrumbModel =
-  | { type: "node"; label: string; depth: 1 | 2 }
-  | { type: "edge"; sourceLabel: string; targetLabel: string };
+/** Whether any focus frame is active. */
+export function focusIsActive(stack: readonly FocusFrame[]): boolean {
+  return stack.length > 0;
+}
+
+/** Truncate a breadcrumb label to `max` characters, ellipsising the overflow. */
+export function truncateLabel(label: string, max = 18): string {
+  return label.length <= max ? label : `${label.slice(0, max - 1)}…`;
+}
 
 /**
- * Resolve a frame into breadcrumb labels, falling back to raw ids for nodes no
- * longer in the graph. Null when there is no focus (or no graph yet).
+ * Human-readable label for a breadcrumb chip: the node's name, or "A → B" for
+ * an edge frame. `nameOf` resolves a node id to its display name (falling back
+ * to the id itself for unknown nodes).
  */
-export function focusBreadcrumbModel(
-  graph: CodeGraph | null,
-  frame: FocusFrame | null
-): FocusBreadcrumbModel | null {
-  if (!graph || !frame) return null;
-  const label = (id: string) => graph.nodes[id]?.name ?? id;
-  if (frame.type === "node") {
-    return { type: "node", label: label(frame.nodeId), depth: frame.depth };
-  }
-  return {
-    type: "edge",
-    sourceLabel: label(frame.source),
-    targetLabel: label(frame.target),
-  };
+export function focusFrameLabel(
+  frame: FocusFrame,
+  nameOf: (nodeId: string) => string
+): string {
+  if (frame.type === "node") return nameOf(frame.nodeId);
+  return `${nameOf(frame.source)} → ${nameOf(frame.target)}`;
 }
 
 /**
@@ -240,18 +208,18 @@ export function focusLayoutIds(
 }
 
 /**
- * Pre-frame node-only projection of the focus state, still exercised directly by
- * `focusReducer.test.ts`. New code uses `FocusFrameState` and the frame reducers
- * above, which additionally cover edge focus.
+ * Focus / view reducer state. Kept pure and framework-free so the transition
+ * logic is unit-testable without the Tauri/zustand runtime.
+ *
+ * `focusStack` empty == unfocused; the last element is the frame on screen.
  */
 export interface FocusViewState {
   viewMode: ViewMode;
-  focusNodeId: string | null;
-  focusDepth: 1 | 2;
+  focusStack: FocusFrame[];
 }
 
 /**
- * Switching view mode. Entering module view always drops any active focus
+ * Switching view mode. Entering module view always drops the ENTIRE focus stack
  * (module view has no symbol neighborhood); symbol view is left as-is.
  */
 export function reduceSetViewMode(
@@ -259,24 +227,96 @@ export function reduceSetViewMode(
   mode: ViewMode
 ): FocusViewState {
   if (mode === "module") {
-    return { ...state, viewMode: "module", focusNodeId: null };
+    return { ...state, viewMode: "module", focusStack: [] };
   }
   return { ...state, viewMode: "symbol" };
 }
 
 /**
- * Entering focus on a node always drills into the symbol view and records the
- * focus node + depth.
+ * Entering focus always drills into the symbol view and PUSHES a frame -- with
+ * one exception: focusing the target of the CURRENT top frame replaces that
+ * frame instead, so re-focusing what you are already looking at (or changing its
+ * depth/direction) never stacks a duplicate.
  */
 export function reduceEnterFocus(
   state: FocusViewState,
-  nodeId: string,
-  depth: 1 | 2
+  frame: FocusFrame
 ): FocusViewState {
-  return { viewMode: "symbol", focusNodeId: nodeId, focusDepth: depth };
+  const top = focusTopFrame(state.focusStack);
+  const replacesTop = top !== null && focusFrameKey(top) === focusFrameKey(frame);
+  const base = replacesTop ? state.focusStack.slice(0, -1) : state.focusStack;
+  return { viewMode: "symbol", focusStack: [...base, frame] };
 }
 
-/** Exiting focus clears the focus node but leaves the (symbol) view mode. */
+/**
+ * Exiting focus (the breadcrumb X) clears the whole stack at once but leaves the
+ * (symbol) view mode.
+ */
 export function reduceExitFocus(state: FocusViewState): FocusViewState {
-  return { ...state, focusNodeId: null };
+  return { ...state, focusStack: [] };
+}
+
+/**
+ * Popping ONE frame off the top (Esc). Focus ends only once the stack empties,
+ * so Esc walks back out of a drill-down the way it walked in.
+ */
+export function reducePopFocus(state: FocusViewState): FocusViewState {
+  if (state.focusStack.length === 0) return state;
+  return { ...state, focusStack: state.focusStack.slice(0, -1) };
+}
+
+/**
+ * Popping back to the breadcrumb frame at `index`, dropping every frame above
+ * it. `index < 0` is the root ("All") chip and clears the stack. An index at or
+ * beyond the top is a no-op.
+ */
+export function reducePopToFrame(
+  state: FocusViewState,
+  index: number
+): FocusViewState {
+  if (index < 0) return reduceExitFocus(state);
+  if (index >= state.focusStack.length - 1) return state;
+  return { ...state, focusStack: state.focusStack.slice(0, index + 1) };
+}
+
+/** Replace the top frame with `next`, or return `state` when there is no top. */
+function replaceTopFrame(
+  state: FocusViewState,
+  next: (top: FocusFrame) => FocusFrame | null
+): FocusViewState {
+  const top = focusTopFrame(state.focusStack);
+  if (top === null) return state;
+  const replacement = next(top);
+  if (replacement === null) return state;
+  return {
+    ...state,
+    focusStack: [...state.focusStack.slice(0, -1), replacement],
+  };
+}
+
+/**
+ * Changing the hop depth of the CURRENT frame. Depth is per-frame: parent frames
+ * keep the depth they were opened with. No-op when the top frame is not a node
+ * frame (edge frames have no depth).
+ */
+export function reduceSetFocusDepth(
+  state: FocusViewState,
+  depth: 1 | 2
+): FocusViewState {
+  return replaceTopFrame(state, (top) =>
+    top.type === "node" ? { ...top, depth } : null
+  );
+}
+
+/**
+ * Changing the trace direction of the CURRENT frame (callers / both / callees).
+ * Per-frame, like depth; no-op on an edge frame.
+ */
+export function reduceSetFocusDirection(
+  state: FocusViewState,
+  direction: FocusDirection
+): FocusViewState {
+  return replaceTopFrame(state, (top) =>
+    top.type === "node" ? { ...top, direction } : null
+  );
 }
