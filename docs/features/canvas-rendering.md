@@ -5,16 +5,21 @@
 In scope:
 - Pixi.js-based interactive graph rendering (nodes, edges, minimap)
 - Node creation, styling, and interaction (click, drag, hover, double-click)
-- Edge drawing with LOD-based opacity/width, hover highlighting, and orthogonal routing
+- Edge drawing with LOD-based opacity/width, hover/pinned highlighting, and orthogonal routing
+- Edge pointer interaction: distance-based hit testing for hover, and
+  double-click on an aggregated edge to drill into it (the focus transition
+  itself lives in zoom_views)
 - "×N" count chips on aggregated (collapsed-container) edges
 - Minimap overlay showing node positions and viewport rectangle
 - Drag-and-drop with ancestor chain resizing
 - LOD (Level of Detail) visibility for labels and edges based on zoom level
-- Two-layer edge dirty tracking for efficient hover updates
+- Two-layer edge dirty tracking for efficient highlight updates
 
 Not in scope:
 - Graph layout algorithm (see graph-layout.md)
 - State management (see stores)
+- What drives the highlight (hover vs pinned selection vs induced subgraph) --
+  see selection.md; this feature only applies the resolved result
 - Tauri IPC / backend operations
 
 ## Architecture
@@ -27,18 +32,30 @@ The PixiRenderer (orchestrator) delegates to focused sub-modules:
    - Owns the Pixi Application, Viewport, and layer containers
    - Constructor, init, destroy lifecycle
    - `updateGraph()`, `renderFromLayout()`, `updateVisibility()`
-   - `setHoveredNode()`, `setSelectedNode()`, `zoomToNode()`
-   - Wires up interaction event handlers on node displays
+   - `setHoveredNode()`, `setSelection(nodeIds, primaryId)`, `zoomToNode()`
+   - `applyHighlight()` / `rebuildHighlightedEdgeIndices(source)`: resolve and apply
+     the hover-or-pin highlight (connected vs induced subgraph)
+   - `hitTestEdge(globalPos)`: nearest rendered edge within a screen-space radius
+     (`EDGE_HIT_RADIUS_PX`), via `pointToPolylineDistance` over the routed
+     polylines. Edges are not Pixi interactive objects, so both edge hover and
+     edge double-click resolve through this one hit test.
+   - Wires up interaction event handlers on node displays, plus viewport-level
+     edge interactions: throttled hover, and a `pointertap` pair (two taps on the
+     SAME edge within `DOUBLE_TAP_MS`) that drills into an AGGREGATED edge
+     (`count > 1`) via `enterEdgeFocus` — see docs/features/zoom_views.md. Node
+     hover and active drags short-circuit both, so node interactions win.
    - Delegates to EdgeDrawingManager, MinimapRenderer, DragManager
 
 2. **edgeDrawing.ts** (~425 lines) - Edge rendering with two-layer architecture
    - `EdgeDrawingManager` class: manages edgeData array, nodeToEdgeIndices map, highlightedEdgeIndices
    - **Two-layer rendering:**
      - `baseLayer` (Graphics): all edges at normal LOD-based opacity. Rebuilt on layout/visibility/LOD/drag.
-     - `highlightLayer` (Graphics): only connected edges at full opacity. Rebuilt on hover only.
-   - On hover: dims baseLayer alpha to 0.15, draws only highlighted edges on highlightLayer -- O(connected) not O(total)
-   - On unhover: restores baseLayer alpha to 1.0, clears highlightLayer
-   - `setHoveredNode(nodeId)`: hover-only update returning true if handled (no full redraw needed)
+     - `highlightLayer` (Graphics): only highlighted edges at full opacity. Rebuilt on highlight change only.
+   - On highlight: dims baseLayer alpha to 0.15, draws only highlighted edges on highlightLayer -- O(highlighted) not O(total)
+   - On highlight removal: restores baseLayer alpha to 1.0, clears highlightLayer
+   - `setHighlightActive(active)`: highlight-only update returning true if handled (no full redraw needed).
+     The manager is deliberately ignorant of WHERE the highlight came from -- the caller resolves
+     hover vs pinned selection vs induced subgraph, fills `highlightedEdgeIndices`, and passes a flag.
    - `redrawEdgesWithHighlight(...)`: full base+highlight layer rebuild
    - `buildEdgeData(layout)`: converts LayoutResult edges into EdgeDatum array
    - `scheduleEdgeRedraw()` / `flushEdgeRedraw()`: animation frame throttling
@@ -114,19 +131,33 @@ The PixiRenderer (orchestrator) delegates to focused sub-modules:
    d. Calls `edgeManager.buildEdgeData(layout)` then `triggerEdgeRedraw()` (rebuilds base + highlight layers)
    e. Fits viewport to content bounds
 5. On viewport move, `onViewportChanged()` updates LOD, redraws edges, updates minimap
-6. On hover, `setHoveredNode()` rebuilds highlighted edge indices, then calls `edgeManager.setHoveredNode()` which only rebuilds the highlight layer (not the base layer)
+6. On hover or selection change, `setHoveredNode()` / `setSelection()` both call `applyHighlight()`, which resolves the highlight source (hover > pinned selection > none; induced at 2+ selected), rebuilds the highlighted edge indices, and calls `edgeManager.setHighlightActive()` -- only the highlight layer is rebuilt, not the base layer
 7. On drag, globalpointermove updates node positions, resizes ancestors, schedules edge redraw
 
-### Edge Hover Optimization
+### Edge Highlight Optimization
 
 Before: hover triggered `triggerEdgeRedraw()` which destroyed ALL edge graphics and rebuilt from scratch -- O(totalEdges).
 
-After: hover calls `edgeManager.setHoveredNode(nodeId)` which:
-1. Dims `baseLayer.alpha` to 0.15 (one property set, O(1))
-2. Creates a new `highlightLayer` Graphics with only connected edges -- O(connectedEdges)
-3. On unhover: restores `baseLayer.alpha` to 1.0 and destroys `highlightLayer` -- O(1)
+After: a highlight change calls `edgeManager.setHighlightActive(active)` which:
+1. Dims `baseLayer.alpha` to 0.15 via `setBaseLayerAlpha()` (one property set, O(1))
+2. Creates a new `highlightLayer` Graphics with only the highlighted edges -- O(highlightedEdges)
+3. When the highlight goes away: restores `baseLayer.alpha` to 1.0 and destroys `highlightLayer` -- O(1)
 
-Full base layer rebuilds only happen on layout/visibility/LOD/drag changes.
+Full base layer rebuilds only happen on layout/visibility/LOD/drag changes. Those
+rebuilds re-resolve the highlight source and pass `highlightActive` back in, which
+is what makes a pinned selection survive them.
+
+### Highlight source
+
+`PixiRenderer` never asks "is something hovered?" directly -- it calls
+`resolveHighlightSource(hoveredNodeId, selection)` (see selection.md) and acts on
+the result:
+
+- `connected(nodeId)` -- every edge touching the node's subtree lights up. This is
+  both the hover case and the single-pinned-node case.
+- `induced(nodeIds)` -- each selected id is expanded to its subtree, the subtrees
+  are unioned, and only edges with BOTH endpoints in that union light up.
+- `none` -- no dimming; the base layer renders at full opacity.
 
 ## Files
 
@@ -154,6 +185,7 @@ Full base layer rebuilds only happen on layout/visibility/LOD/drag changes.
 | `packages/app/tests/nodeRenderer.test.ts` | Node labels, colors, blockKindPrefix, selected-node state machine, color constants |
 | `packages/app/tests/edgeGeometry.test.ts` | Edge routing geometry (anchorEdgePolyline, rerouteOrthogonalEdge) |
 | `packages/app/tests/edgeLabels.test.ts` | Arc-length midpoint, count-chip LOD/count predicate, chip alpha clamping, label formatting |
+| `packages/app/tests/selectionModel.test.ts` | Highlight-source precedence (hover > pin > none, induced at 2+), selection reducer, invalidation, Esc precedence (see `docs/features/selection.md`) |
 | `packages/app/tests/palette.test.ts` | Palette invariants: merged edge hues, cross-map hex/near-duplicate collisions, saturation ordering, contrast on the dark canvas (see `docs/features/palette.md`) |
 
 ## Invariants and Constraints
@@ -163,8 +195,10 @@ Full base layer rebuilds only happen on layout/visibility/LOD/drag changes.
 - `dragManager.ts` and `minimapRenderer.ts` receive all needed state as function parameters (no global state access except BLOCK_COLORS constant).
 - `nodeCreation.ts` does NOT attach event handlers -- the orchestrator is responsible for wiring interactions.
 - All `console.log` calls have been replaced with `useDebugStore.getState().addLog()` behind `import.meta.env.DEV` guards. `console.warn` and `console.error` are preserved for genuine warnings/errors.
-- The base edge layer is only rebuilt on layout/visibility/LOD/drag changes. Hover-only updates only touch the highlight layer.
+- The base edge layer is only rebuilt on layout/visibility/LOD/drag changes. Highlight-only updates (hover or selection) only touch the highlight layer.
+- Hover and pin share ONE dim path: both go through `setBaseLayerAlpha()`. No second dimming mechanism exists, so base edges and their count chips can never drift out of lockstep.
+- `EdgeDrawingManager` receives only `highlightActive: boolean` + `highlightedEdgeIndices`; it never learns whether the highlight came from hover, a pin, or an induced subgraph.
 - Count chips are built inside the same pass that strokes the edges, so they are rebuilt exactly when their layer is (including drag redraws) and add no per-frame work. Chips are world-space children of the edge layer, so they scale with zoom.
 - Allocation per rebuild is bounded by the number of `count > 1` edges in view. Aggregated edges only exist for collapsed containers, so this stays small.
 - A chip's alpha equals its edge's alpha (`chipAlphaForEdge`), and `setBaseLayerAlpha()` dims base edges and base chips together, so a chip can never read brighter than the edge it labels.
-- The public API of PixiRenderer (as consumed by Canvas.tsx) is unchanged: constructor, waitForInit, updateGraph, updateVisibility, setSelectedNode, setHoveredNode, refreshEdges, zoomToNode, destroy.
+- The public API of PixiRenderer (as consumed by Canvas.tsx) is: constructor, waitForInit, updateGraph, updateVisibility, setSelection, setHoveredNode, refreshEdges, zoomToNode, destroy. (`setSelectedNode` was replaced by `setSelection(nodeIds, primaryId)` when selection became a set.)

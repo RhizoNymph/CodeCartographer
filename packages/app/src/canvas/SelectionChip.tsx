@@ -20,9 +20,48 @@ const chipStyle: React.CSSProperties = {
   boxShadow: "0 4px 12px rgba(0,0,0,0.35)",
 };
 
+const nameStyle: React.CSSProperties = {
+  fontWeight: 600,
+  overflow: "hidden",
+  textOverflow: "ellipsis",
+  whiteSpace: "nowrap",
+};
+
+const focusButtonStyle: React.CSSProperties = {
+  flexShrink: 0,
+  display: "flex",
+  alignItems: "center",
+  gap: 6,
+  maxWidth: 220,
+  padding: "2px 9px",
+  fontSize: 10,
+  fontWeight: 600,
+  border: "1px solid #3b82f6",
+  borderRadius: 999,
+  cursor: "pointer",
+  background: "#1e3a5f",
+  color: "#93c5fd",
+};
+
+const clearButtonStyle: React.CSSProperties = {
+  flexShrink: 0,
+  padding: "1px 7px",
+  fontSize: 13,
+  lineHeight: 1,
+  border: "none",
+  borderRadius: 999,
+  cursor: "pointer",
+  background: "#334155",
+  color: "#e2e8f0",
+};
+
 /**
- * Overlay chip for the currently selected canvas node, holding the Focus
- * action.
+ * Overlay chip for the current canvas selection.
+ *
+ * One node selected: its kind badge + name, with the Focus action. Two or more:
+ * an "N selected" summary (the canvas is showing the induced subgraph between
+ * them) plus a Clear button. Focus always applies to the PRIMARY node only, so
+ * in multi-select the button carries that node's name to stay unambiguous.
  *
  * Selection is sticky (a node's pointerdown sets it; empty-space pointerdown
  * clears it), unlike hover -- so unlike the tooltip's button, this one stays
@@ -31,63 +70,51 @@ const chipStyle: React.CSSProperties = {
  */
 export function SelectionChip() {
   const graph = useGraphStore((s) => s.graph);
+  const selectedNodeIds = useGraphStore((s) => s.selectedNodeIds);
   const selectedNodeId = useGraphStore((s) => s.selectedNodeId);
-  const focusNodeId = useGraphStore((s) => s.focusNodeId);
+  const focusStack = useGraphStore((s) => s.focusStack);
   const enterFocus = useGraphStore((s) => s.enterFocus);
-  const setSelectedNode = useGraphStore((s) => s.setSelectedNode);
+  const clearSelection = useGraphStore((s) => s.clearSelection);
 
-  if (!graph || !selectedNodeId || focusNodeId) return null;
+  if (!graph || !selectedNodeId || focusStack.length > 0) return null;
 
-  const node = graph.nodes[selectedNodeId];
-  if (!node) return null;
+  const primary = graph.nodes[selectedNodeId];
+  if (!primary) return null;
+
+  const count = selectedNodeIds.size;
+  const isMulti = count > 1;
 
   return (
     <div style={chipStyle}>
-      {node.type === "CodeBlock" && (
-        <span
-          style={{
-            padding: "2px 6px",
-            background: BLOCK_COLORS[node.kind] + "33",
-            color: BLOCK_COLORS[node.kind],
-            borderRadius: 4,
-            fontSize: 10,
-            fontWeight: 600,
-            textTransform: "uppercase",
-          }}
-        >
-          {node.kind}
-        </span>
+      {isMulti ? (
+        <span style={nameStyle}>{count} selected</span>
+      ) : (
+        <>
+          {primary.type === "CodeBlock" && (
+            <span
+              style={{
+                padding: "2px 6px",
+                background: BLOCK_COLORS[primary.kind] + "33",
+                color: BLOCK_COLORS[primary.kind],
+                borderRadius: 4,
+                fontSize: 10,
+                fontWeight: 600,
+                textTransform: "uppercase",
+              }}
+            >
+              {primary.kind}
+            </span>
+          )}
+          <span style={nameStyle}>{primary.name}</span>
+        </>
       )}
-      <span
-        style={{
-          fontWeight: 600,
-          overflow: "hidden",
-          textOverflow: "ellipsis",
-          whiteSpace: "nowrap",
-        }}
-      >
-        {node.name}
-      </span>
 
       <button
         onClick={() => enterFocus(selectedNodeId)}
-        title="Focus on this node's neighborhood (F)"
-        style={{
-          flexShrink: 0,
-          display: "flex",
-          alignItems: "center",
-          gap: 6,
-          padding: "2px 9px",
-          fontSize: 10,
-          fontWeight: 600,
-          border: "1px solid #3b82f6",
-          borderRadius: 999,
-          cursor: "pointer",
-          background: "#1e3a5f",
-          color: "#93c5fd",
-        }}
+        title={`Focus on ${primary.name}'s neighborhood (F)`}
+        style={focusButtonStyle}
       >
-        Focus
+        <span style={nameStyle}>{isMulti ? `Focus ${primary.name}` : "Focus"}</span>
         <kbd
           style={{
             padding: "0 4px",
@@ -103,22 +130,12 @@ export function SelectionChip() {
       </button>
 
       <button
-        onClick={() => setSelectedNode(null)}
-        title="Clear selection"
+        onClick={clearSelection}
+        title="Clear selection (Esc)"
         aria-label="Clear selection"
-        style={{
-          flexShrink: 0,
-          padding: "1px 7px",
-          fontSize: 13,
-          lineHeight: 1,
-          border: "none",
-          borderRadius: 999,
-          cursor: "pointer",
-          background: "#334155",
-          color: "#e2e8f0",
-        }}
+        style={clearButtonStyle}
       >
-        ×
+        {isMulti ? "Clear" : "×"}
       </button>
     </div>
   );

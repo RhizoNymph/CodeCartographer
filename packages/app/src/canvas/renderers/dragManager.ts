@@ -62,7 +62,7 @@ export class DragManager {
     graph: CodeGraph | null,
     nodeDisplays: Map<string, NodeDisplay>,
     currentVisibleNodes: Set<string>,
-    selectedNodeId: string | null,
+    selectedNodeIds: ReadonlySet<string>,
     lastLayout: LayoutResult | null
   ): void {
     let currentId = parentByNodeId.get(nodeId) ?? null;
@@ -73,7 +73,7 @@ export class DragManager {
         graph,
         nodeDisplays,
         currentVisibleNodes,
-        selectedNodeId,
+        selectedNodeIds,
         lastLayout
       );
       currentId = parentByNodeId.get(currentId) ?? null;
@@ -88,7 +88,7 @@ export class DragManager {
     graph: CodeGraph | null,
     nodeDisplays: Map<string, NodeDisplay>,
     currentVisibleNodes: Set<string>,
-    selectedNodeId: string | null,
+    selectedNodeIds: ReadonlySet<string>,
     lastLayout: LayoutResult | null
   ): void {
     const display = nodeDisplays.get(nodeId);
@@ -140,7 +140,7 @@ export class DragManager {
     display.container.y = nextY;
     display.layoutPos.width = nextWidth;
     display.layoutPos.height = nextHeight;
-    redrawNodeBg(display, selectedNodeId === nodeId);
+    redrawNodeBg(display, selectedNodeIds.has(nodeId));
     updateNodeLabelWrap(display);
     syncDisplayBounds(nodeId, display, lastLayout);
   }

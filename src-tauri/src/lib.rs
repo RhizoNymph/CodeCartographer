@@ -20,6 +20,7 @@ pub fn run() {
             commands::parse_repo,
             commands::get_subgraph,
             commands::get_neighborhood,
+            commands::get_edge_detail,
             commands::clone_github_repo,
             check_norestore,
         ])

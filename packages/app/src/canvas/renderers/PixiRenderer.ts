@@ -3,12 +3,22 @@ import { Viewport } from "pixi-viewport";
 import type { CodeGraph, CodeNode, EdgeKind } from "../../api/types";
 import { layoutGraph, type LayoutResult, type LayoutNodePosition } from "../layout/elkLayout";
 import { useGraphStore } from "../../stores/graphStore";
+import {
+  EMPTY_SELECTION,
+  highlightDimsBaseLayer,
+  resolveHighlightSource,
+  selectionFromStore,
+  selectionIds,
+  type HighlightSource,
+  type SelectionState,
+} from "../../stores/selectionModel";
 import { useViewportStore, type LODLevel } from "../../stores/viewportStore";
 import { useDebugStore } from "../../stores/debugStore";
 import { useEdgeLegendStore } from "../../stores/edgeLegendStore";
 import { buildParentMap } from "../utils/graphUtils";
 import { pointToPolylineDistance } from "../layout/edgeGeometry";
 import { EdgeDrawingManager, type NodeDisplayRef } from "./edgeDrawing";
+import type { EdgeDatum } from "./types";
 import { MinimapRenderer } from "./minimapRenderer";
 import { DragManager, redrawNodeBg, syncDisplayBounds } from "./dragManager";
 import {
@@ -16,6 +26,12 @@ import {
   getNodeLayer,
   type NodeDisplay,
 } from "./nodeCreation";
+
+/** Window within which two taps count as a double-click. */
+const DOUBLE_TAP_MS = 350;
+
+/** Pointer hit-test radius for edges, in screen pixels. */
+const EDGE_HIT_RADIUS_PX = 8;
 
 export class PixiRenderer {
   private app: Application;
@@ -30,7 +46,8 @@ export class PixiRenderer {
   private resizeObserver: ResizeObserver;
   private containerEl: HTMLElement;
   private initialized = false;
-  private selectedNodeId: string | null = null;
+  /** Mirror of the store's selection; also the pinned edge highlight. */
+  private selection: SelectionState = EMPTY_SELECTION;
   private currentLOD: LODLevel = "detail";
   private lastLayout: LayoutResult | null = null;
   private currentGraph: CodeGraph | null = null;
@@ -39,6 +56,9 @@ export class PixiRenderer {
   private _viewportRafId: number | null = null;
   private _layoutRequestId = 0;
   private _edgeHoverRafId: number | null = null;
+  /** Identity + time of the last tap that landed on an edge (double-click pairing). */
+  private lastEdgeTapKey: string | null = null;
+  private lastEdgeTapTime = 0;
 
   private pendingUpdate: {
     graph: CodeGraph;
@@ -144,10 +164,10 @@ export class PixiRenderer {
       }
     });
 
-    // Click on empty space to deselect
+    // Click on empty space to deselect (which also drops the pinned highlight)
     this.viewport.on("pointerdown", () => {
       if (!this.dragManager.dragTarget) {
-        useGraphStore.getState().setSelectedNode(null);
+        useGraphStore.getState().clearSelection();
       }
     });
 
@@ -162,18 +182,7 @@ export class PixiRenderer {
           useGraphStore.getState().setHoveredEdge(null);
           return;
         }
-        const worldPos = this.viewport.toLocal(e.global);
-        const hitThreshold = 8 / this.viewport.scale.x;
-        let closestEdge: import("./types").EdgeDatum | null = null;
-        let closestDist = hitThreshold;
-        for (const edge of this.edgeManager.edgeData) {
-          if (edge.originalPoints.length < 2) continue;
-          const dist = pointToPolylineDistance(worldPos, edge.originalPoints);
-          if (dist < closestDist) {
-            closestDist = dist;
-            closestEdge = edge;
-          }
-        }
+        const closestEdge = this.hitTestEdge(e.global);
         if (closestEdge && closestEdge.kind) {
           const sourceNode = this.currentGraph?.nodes[closestEdge.source];
           const targetNode = this.currentGraph?.nodes[closestEdge.target];
@@ -189,6 +198,39 @@ export class PixiRenderer {
           useGraphStore.getState().setHoveredEdge(null);
         }
       });
+    });
+
+    // Double-click an AGGREGATED edge (count > 1) to drill into it: the store
+    // fetches the underlying edges behind that one aggregate and focuses them.
+    // Pixi has no dblclick, so taps are paired manually -- both taps must land on
+    // the same edge within the double-click window, which leaves single-click
+    // (deselect) and hover behavior untouched.
+    this.viewport.on("pointertap", (e) => {
+      if (this.destroyed || !this.initialized) return;
+      // Node interactions win, exactly as they do for edge hover.
+      if (this.hoveredNodeId || this.dragManager.dragTarget) return;
+
+      const edge = this.hitTestEdge(e.global);
+      if (!edge) {
+        this.lastEdgeTapKey = null;
+        return;
+      }
+      const key = `${edge.source}\u0000${edge.target}\u0000${edge.kind ?? ""}`;
+      const now = Date.now();
+      const isSecondTap =
+        this.lastEdgeTapKey === key && now - this.lastEdgeTapTime < DOUBLE_TAP_MS;
+
+      if (isSecondTap) {
+        this.lastEdgeTapKey = null;
+        this.lastEdgeTapTime = 0;
+        if ((edge.count ?? 1) > 1) {
+          // enterEdgeFocus handles its own IPC failures; nothing to await here.
+          void useGraphStore.getState().enterEdgeFocus(edge.source, edge.target);
+        }
+        return;
+      }
+      this.lastEdgeTapKey = key;
+      this.lastEdgeTapTime = now;
     });
 
     this.initialized = true;
@@ -330,9 +372,12 @@ export class PixiRenderer {
       this.addNodeDisplay(nodeId, node, pos, expandedNodes.has(nodeId));
     }
 
-    // Draw edges
+    // Draw edges. Recomputing the highlight here is what re-applies a pinned
+    // selection after a layout/visibility rebuild.
     this.edgeManager.buildEdgeData(layout);
-    this.rebuildHoveredEdgeIndices();
+    this.rebuildHighlightedEdgeIndices(
+      resolveHighlightSource(this.hoveredNodeId, this.selection)
+    );
     this.triggerEdgeRedraw();
 
     // Initial LOD update
@@ -364,6 +409,27 @@ export class PixiRenderer {
   }
 
   /**
+   * The rendered edge closest to a global (screen) pointer position, or null if
+   * none is within the hit radius. Shared by edge hover and edge double-click so
+   * both resolve to the same edge. The radius is in screen pixels, so it stays
+   * constant as the user zooms.
+   */
+  private hitTestEdge(globalPos: { x: number; y: number }): EdgeDatum | null {
+    const worldPos = this.viewport.toLocal(globalPos);
+    let closestEdge: EdgeDatum | null = null;
+    let closestDist = EDGE_HIT_RADIUS_PX / this.viewport.scale.x;
+    for (const edge of this.edgeManager.edgeData) {
+      if (edge.originalPoints.length < 2) continue;
+      const dist = pointToPolylineDistance(worldPos, edge.originalPoints);
+      if (dist < closestDist) {
+        closestDist = dist;
+        closestEdge = edge;
+      }
+    }
+    return closestEdge;
+  }
+
+  /**
    * Create and register a node display, wiring up all interaction handlers.
    */
   private addNodeDisplay(
@@ -372,12 +438,13 @@ export class PixiRenderer {
     pos: LayoutNodePosition,
     _isExpanded: boolean
   ) {
-    const display = createNodeDisplay(nodeId, node, pos, this.selectedNodeId);
+    const display = createNodeDisplay(node, pos, this.isSelected(nodeId));
 
-    // Click handler
+    // Click handler. Ctrl/Cmd-click toggles membership of the selection set
+    // (multi-select); a plain click replaces it.
     display.container.on("pointerdown", (e) => {
       e.stopPropagation();
-      useGraphStore.getState().setSelectedNode(nodeId);
+      useGraphStore.getState().selectNode(nodeId, e.ctrlKey || e.metaKey);
 
       const local = this.viewport.toLocal(e.global);
       const descendants = this.dragManager.collectDescendants(
@@ -422,7 +489,7 @@ export class PixiRenderer {
           this.currentGraph,
           this.nodeDisplays,
           this.currentVisibleNodes,
-          this.selectedNodeId,
+          selectionIds(this.selection),
           this.lastLayout
         );
         this.edgeManager.scheduleEdgeRedraw(() => {
@@ -455,7 +522,7 @@ export class PixiRenderer {
     let lastClickTime = 0;
     display.container.on("pointertap", () => {
       const now = Date.now();
-      if (now - lastClickTime < 350) {
+      if (now - lastClickTime < DOUBLE_TAP_MS) {
         const store = useGraphStore.getState();
         if (store.viewMode === "module" && node.type === "File") {
           store.enterFocus(nodeId);
@@ -484,36 +551,79 @@ export class PixiRenderer {
   /**
    * Set the hovered node and update edge highlighting.
    *
-   * Uses the two-layer optimisation in EdgeDrawingManager: on hover we only
-   * rebuild the lightweight highlight layer instead of destroying and
-   * recreating all edge graphics.
+   * Uses the two-layer optimisation in EdgeDrawingManager: we only rebuild the
+   * lightweight highlight layer instead of destroying and recreating all edge
+   * graphics. Unhovering falls back to the pinned selection's highlight rather
+   * than to full opacity (see `resolveHighlightSource`).
    */
   setHoveredNode(nodeId: string | null) {
     if (this.hoveredNodeId === nodeId) return;
     this.hoveredNodeId = nodeId;
-    this.rebuildHoveredEdgeIndices();
+    this.applyHighlight();
+  }
 
-    // Try a hover-only update (highlight layer only).
+  /**
+   * Recompute which edges are highlighted from the current hover + selection,
+   * then push the result onto the edge layers.
+   */
+  private applyHighlight() {
+    const source = resolveHighlightSource(this.hoveredNodeId, this.selection);
+    this.rebuildHighlightedEdgeIndices(source);
+
+    // Try a highlight-only update (highlight layer only).
     // Falls back to a full redraw if the base layer doesn't exist yet.
-    const handled = this.edgeManager.setHoveredNode(nodeId);
+    const handled = this.edgeManager.setHighlightActive(
+      highlightDimsBaseLayer(source)
+    );
     if (!handled) {
       this.triggerEdgeRedraw();
     }
   }
 
-  private rebuildHoveredEdgeIndices() {
-    this.edgeManager.highlightedEdgeIndices.clear();
+  /**
+   * Fill `highlightedEdgeIndices` for a highlight source.
+   *
+   * `connected` lights every edge touching the node's subtree; `induced` lights
+   * only edges whose BOTH endpoints fall inside the union of the selected
+   * nodes' subtrees (so selecting two collapsed files shows exactly the traffic
+   * between them).
+   */
+  private rebuildHighlightedEdgeIndices(source: HighlightSource) {
+    const indices = this.edgeManager.highlightedEdgeIndices;
+    indices.clear();
 
-    if (!this.hoveredNodeId) {
+    if (source.mode === "none") {
       return;
     }
 
-    for (const id of this.collectNodeSubtreeIds(this.hoveredNodeId)) {
-      const indices = this.edgeManager.nodeToEdgeIndices.get(id);
-      if (!indices) continue;
+    if (source.mode === "connected") {
+      for (const id of this.collectNodeSubtreeIds(source.nodeId)) {
+        const edgeIndices = this.edgeManager.nodeToEdgeIndices.get(id);
+        if (!edgeIndices) continue;
 
-      for (const idx of indices) {
-        this.edgeManager.highlightedEdgeIndices.add(idx);
+        for (const idx of edgeIndices) {
+          indices.add(idx);
+        }
+      }
+      return;
+    }
+
+    const members = new Set<string>();
+    for (const nodeId of source.nodeIds) {
+      for (const id of this.collectNodeSubtreeIds(nodeId)) {
+        members.add(id);
+      }
+    }
+
+    for (const id of members) {
+      const edgeIndices = this.edgeManager.nodeToEdgeIndices.get(id);
+      if (!edgeIndices) continue;
+
+      for (const idx of edgeIndices) {
+        const edge = this.edgeManager.edgeData[idx];
+        if (edge && members.has(edge.source) && members.has(edge.target)) {
+          indices.add(idx);
+        }
       }
     }
   }
@@ -539,23 +649,32 @@ export class PixiRenderer {
     return result;
   }
 
-  setSelectedNode(nodeId: string | null) {
-    const prev = this.selectedNodeId;
-    this.selectedNodeId = nodeId;
+  /**
+   * Apply the store's selection: restyle the nodes whose selected-ness changed
+   * and re-derive the pinned edge highlight.
+   */
+  setSelection(selectedNodeIds: ReadonlySet<string>, selectedNodeId: string | null) {
+    const previous = selectionIds(this.selection);
+    this.selection = selectionFromStore(selectedNodeIds, selectedNodeId);
+    const current = selectionIds(this.selection);
 
-    if (prev) {
-      const display = this.nodeDisplays.get(prev);
-      if (display) {
-        redrawNodeBg(display, false);
-      }
+    for (const id of previous) {
+      if (current.has(id)) continue;
+      const display = this.nodeDisplays.get(id);
+      if (display) redrawNodeBg(display, false);
     }
 
-    if (nodeId) {
-      const display = this.nodeDisplays.get(nodeId);
-      if (display) {
-        redrawNodeBg(display, true);
-      }
+    for (const id of current) {
+      if (previous.has(id)) continue;
+      const display = this.nodeDisplays.get(id);
+      if (display) redrawNodeBg(display, true);
     }
+
+    this.applyHighlight();
+  }
+
+  private isSelected(nodeId: string): boolean {
+    return selectionIds(this.selection).has(nodeId);
   }
 
   /**
@@ -576,7 +695,7 @@ export class PixiRenderer {
       ease: "easeInOutQuad",
     });
 
-    useGraphStore.getState().setSelectedNode(nodeId);
+    useGraphStore.getState().selectNode(nodeId);
   }
 
   /**
@@ -611,7 +730,9 @@ export class PixiRenderer {
 
     this.edgeManager.redrawEdgesWithHighlight(
       this.edgeLayer,
-      this.hoveredNodeId,
+      highlightDimsBaseLayer(
+        resolveHighlightSource(this.hoveredNodeId, this.selection)
+      ),
       this.currentLOD,
       this.currentVisibleNodes,
       getRef

@@ -9,8 +9,9 @@ Overview:
         - cc-core (Rust): Core library containing the graph model (CodeGraph, CodeNode, CodeEdge),
           file scanner, tree-sitter parser/extractor, and symbol resolver. Language-agnostic graph
           operations and data structures.
-        - cc-tauri (Rust): Tauri command layer exposing parse_repo, get_subgraph, and scan_repo
-          commands over IPC. Orchestrates cc-core operations and sends progress events.
+        - cc-tauri (Rust): Tauri command layer exposing scan_repo, parse_repo, get_subgraph,
+          get_neighborhood and get_edge_detail commands over IPC. Orchestrates cc-core operations
+          and sends progress events.
         - packages/app (TypeScript/React): Frontend application with Pixi.js canvas rendering,
           ELK graph layout, Zustand state stores, and toolbar UI.
 
@@ -19,19 +20,36 @@ Overview:
         2. Frontend calls scan_repo (Tauri IPC) -> cc-tauri scans directory tree (respecting .gitignore plus explicit directory ignore rules for virtualenvs/caches/build output, and mapping .py/.pyi to Python) -> stores the graph in server-side GraphState and returns an edge-less ParseResult with Directory/File nodes.
         3. Frontend calls parse_repo (Tauri IPC) -> cc-tauri first strips any prior parse state so re-parsing is idempotent -> parses each file with tree-sitter (parallel via rayon) in a single tree walk that attributes each raw reference to its innermost enclosing block (top-level imports/refs attributed to the File) and populates each block's children hierarchy -> only top-level blocks are appended to File children -> resolves imports first (yielding file-to-file Import edges plus an import map), then resolves references into edges via SymbolTable using a precision ladder (same-file > imported-file > global-unique > ambiguous, dropping references matching more than 5 global symbols) so each edge carries a Resolution confidence -> keeps the full graph (nodes + edges, with adjacency rebuilt) in server-side GraphState and returns an edge-less ParseResult (nodes, root, edge_count, node_edge_kinds connectivity map).
         4. Frontend graphStore converts the ParseResult into a CodeGraph (node tree + nodeEdgeKinds Map, no edges) and computes visibility/expansion state. The hideUnconnectedNodes filter (visibilityFilter) runs synchronously from nodeEdgeKinds.
-        5. Canvas derives the effective layout inputs from the zoom-level viewMode (default "module"): module view forces edge kinds to {Import} and treats files as collapsed (saved state preserved but ignored); symbol view uses the user's edge kinds + expansion; a focus neighborhood, when active, restricts visibility/expansion to the fetched neighborhood ids. Canvas passes the (edge-less) graph + effective state to PixiRenderer.
+        5. Canvas derives the effective layout inputs from the zoom-level viewMode (default "module"): module view forces edge kinds to {Import} and treats files as collapsed (saved state preserved but ignored); symbol view uses the user's edge kinds + expansion; an active focus frame restricts visibility/expansion to the fetched focus ids (a node frame's neighborhood or an edge frame's edge detail). Canvas passes the (edge-less) graph + effective state to PixiRenderer.
         6. PixiRenderer delegates to elkLayout: build the ELK node tree, collect the render set (elkNodeIds), fetch per-view direct + aggregated edges via get_subgraph(render_ids, edge_kinds) computed server-side (direct edges carry a Resolution; ambiguous edges may be hidden client-side), then render nodes and edges on the Pixi.js canvas. Views over 1500 rendered nodes skip ELK edge routing and use straight-line fallback edges.
         7. The layout pass also derives per-kind edge counts for the view from that same SubGraph payload; PixiRenderer publishes them to edgeLegendStore once the layout is known to be current, and the bottom-left EdgeLegend overlay renders one row per edge kind (colour, name, count) which doubles as the edge-kind toggle UI.
-        8. User interactions (hover, select, expand, drag, zoom) update stores and trigger re-renders. Edge tooltips read kind + count from the layout edges (aggregated edges carry a collapsed count). Aggregated edges (count > 1) additionally render a world-space "×N" chip at the arc-length midpoint of their routed polyline, at the "detail" LOD only.
+        8. User interactions (hover, select, expand, drag, zoom) update stores and trigger re-renders. Selection is a node SET (`selectedNodeIds`, with `selectedNodeId` as the derived last-selected primary) and doubles as the pinned edge highlight: hovering previews a node's connections, clicking pins that same dim+highlight treatment so it survives unhover, and ctrl/cmd-clicking a second node switches the highlight to the induced subgraph (only edges with both endpoints selected). The pin is re-applied after every base-layer rebuild and invalidated when its nodes leave the graph. Edge tooltips read kind + count from the layout edges (aggregated edges carry a collapsed count). Aggregated edges (count > 1) additionally render a world-space "×N" chip at the arc-length midpoint of their routed polyline, at the "detail" LOD only.
         9. Selecting a node also drives the right-side details panel: it fetches get_neighborhood(selectedNodeId, 1, ALL kinds) (debounced, with a monotonic stale-request guard), splits those edges into incoming/outgoing around the selected node, groups them per kind, and renders clickable endpoint rows with per-row Focus buttons.
-        10. Focus / drill-down: the user focuses a node (F hotkey on the hovered/selected node, the canvas selection chip, Sidebar row or details-panel Focus buttons, or a module-view File double-click) -> get_neighborhood(node_id, depth, edge_kinds) runs a bidirectional BFS in cc-core and returns the neighborhood node ids (incl. container chain) + direct edges -> the store switches to symbol view and the canvas lays out ONLY that neighborhood. A breadcrumb chip (depth selector + X) and Esc exit focus.
+        10. Focus / drill-down. Focus is a STACK of FocusFrames, each held next to its fetched payload; focusing again from inside a focused view pushes a deeper frame, and the canvas lays out ONLY the top frame's ids:
+           - Node focus: the user focuses a node (F hotkey on the hovered/selected node, the canvas selection chip, Sidebar row or details-panel Focus buttons, or a module-view File double-click) -> get_neighborhood(node_id, depth, edge_kinds, direction) runs a depth-bounded BFS in cc-core (both directions, callers only, or callees only -- direction applied at every hop) and returns the neighborhood node ids (incl. container chain) + direct edges. Depth and direction are per-frame.
+           - Edge focus: the user double-clicks an AGGREGATED edge (count > 1) -> get_edge_detail(source_id, target_id, edge_kinds) runs cc-core's edge_detail, re-expanding that one aggregate into the underlying edges running from the source subtree into the target subtree (that direction only), plus their endpoints and container chain. Edge frames have no depth/direction.
+           Either way the store switches to symbol view. A breadcrumb trail (root "All" chip + one chip per frame -- node name or "source -> target" -- with the current frame carrying the 1/2-hop depth selector and callers|both|callees toggle for node frames) navigates back: clicking a chip pops to that frame, X clears the stack, Esc pops exactly one frame -- and Esc only reaches the focus layer once the node selection is empty (see selection.md).
 
 Features Index:
     canvas-rendering:
-        description: Interactive Pixi.js canvas with node rendering, edge drawing, minimap, drag, and LOD-based visibility. Aggregated (collapsed-container) edges carry "xN" count chips drawn at the arc-length midpoint of their routed polyline, shown at the "detail" LOD only and dimmed in step with the edge they label.
+        description: Interactive Pixi.js canvas with node rendering, edge drawing, minimap, drag, and LOD-based visibility. Edges are hit-tested by distance to their routed polyline, which drives both hover and double-click-to-drill-in on aggregated edges. Aggregated (collapsed-container) edges carry "xN" count chips drawn at the arc-length midpoint of their routed polyline, shown at the "detail" LOD only and dimmed in step with the edge they label.
         entry_points: [packages/app/src/canvas/renderers/PixiRenderer.ts, packages/app/src/canvas/Canvas.tsx, packages/app/src/canvas/renderers/edgeLabels.ts]
         depends_on: [graph-layout, palette]
         doc: docs/features/canvas-rendering.md
+
+    selection:
+        description: >
+            The selected node set is the source of truth for both selection and the pinned edge
+            highlight (they are the same concept -- there is no separate "pinned node" field).
+            Plain click replaces, ctrl/cmd-click toggles, empty-canvas click / chip Clear / Esc
+            clears. Highlight precedence is hover > pinned selection > none; 2+ selected nodes
+            highlight the INDUCED subgraph (both endpoints selected) instead of all connections.
+            Esc is consumed by the selection layer first (capture-phase listener) and only falls
+            through to focus handling when nothing is selected. All decisions live in the
+            dependency-free pure module selectionModel.ts.
+        entry_points: [packages/app/src/stores/selectionModel.ts, packages/app/src/stores/graphStore.ts, packages/app/src/canvas/useSelectionEscape.ts, packages/app/src/canvas/SelectionChip.tsx]
+        depends_on: [state-management, canvas-rendering]
+        doc: docs/features/selection.md
 
     palette:
         description: >
@@ -53,7 +71,7 @@ Features Index:
         doc: docs/features/graph-layout.md
 
     graph-model:
-        description: Rust data model for code graphs including nodes (Directory, File, CodeBlock), edges with kinds, adjacency indexes, EdgeIndex for O(1) dedup, ParseResult (edge-less IPC payload with per-node connectivity map), SubGraph extraction that computes direct + aggregated (collapsed-container) view edges server-side, and a bidirectional Neighborhood BFS query (callers + callees, depth-bounded, with container chain) backing focus mode.
+        description: Rust data model for code graphs including nodes (Directory, File, CodeBlock), edges with kinds, adjacency indexes, EdgeIndex for O(1) dedup, ParseResult (edge-less IPC payload with per-node connectivity map), SubGraph extraction that computes direct + aggregated (collapsed-container) view edges server-side, a directional Neighborhood BFS query (FocusDirection both/upstream/downstream applied at every hop, depth-bounded, with container chain) backing node focus, and an EdgeDetail query that inverts aggregation -- re-expanding one aggregated source->target edge into the underlying subtree-to-subtree edges -- backing edge drill-in.
         entry_points: [crates/cc-core/src/model/graph.rs, crates/cc-core/src/model/edge.rs, crates/cc-core/src/model/edge_index.rs]
         depends_on: []
         doc: docs/features/server_side_graph_state.md
@@ -76,14 +94,14 @@ Features Index:
         depends_on: [graph-model]
 
     zoom-views:
-        description: Two zoom-level views selected by a toolbar segmented control. Module view (default on load) is the trustworthy zoomed-out import graph -- files render collapsed and only Import edges show, as DERIVED constraints over the user's saved state (never mutating it). Symbol view is the detailed expandable view with all enabled edge kinds. Focus mode drills into a bounded neighborhood of a node (cc-core Neighborhood BFS via get_neighborhood) so the full symbol graph is never laid out; entered via the F hotkey (hovered node, falling back to the selected one), the canvas selection chip, the Sidebar row or details-panel Focus buttons (the panel also focuses any listed edge endpoint), or a module-view File double-click, exited via a breadcrumb chip (name + 1/2-hop depth + X) or Esc. Focus actions are never placed in the hover tooltip, which unmounts on pointerout before it can be clicked. viewMode persists per folder.
-        entry_points: [packages/app/src/stores/graphViewModel.ts, packages/app/src/stores/graphStore.ts, packages/app/src/canvas/Canvas.tsx, packages/app/src/canvas/FocusBreadcrumb.tsx, packages/app/src/canvas/SelectionChip.tsx, packages/app/src/canvas/focusHotkey.ts, crates/cc-core/src/model/graph.rs, crates/cc-tauri/src/commands/parse.rs]
+        description: Two zoom-level views selected by a toolbar segmented control. Module view (default on load) is the trustworthy zoomed-out import graph -- files render collapsed and only Import edges show, as DERIVED constraints over the user's saved state (never mutating it). Symbol view is the detailed expandable view with all enabled edge kinds. Focus mode is a stack of FocusFrames, each laying out ONLY its fetched ids so the full symbol graph is never laid out. Node frames drill into a bounded neighborhood (cc-core Neighborhood BFS via get_neighborhood, per-frame 1/2-hop depth + both/upstream/downstream trace direction), entered via the F hotkey (hovered node, falling back to the selected one), the canvas selection chip, the Sidebar row or details-panel Focus buttons (the panel also focuses any listed edge endpoint), or a module-view File double-click. Edge frames drill into ONE aggregated edge (cc-core edge_detail via get_edge_detail), showing exactly the symbol pairs behind it, entered by double-clicking an aggregated edge (count > 1) on the canvas; they have no depth/direction. Focusing from inside focus pushes deeper; the breadcrumb trail pops back, X clears the stack, Esc pops exactly one frame. Focus actions are never placed in the hover tooltip, which unmounts on pointerout before it can be clicked. viewMode persists per folder; the focus stack is transient and cleared by module view.
+        entry_points: [packages/app/src/stores/graphViewModel.ts, packages/app/src/stores/graphStore.ts, packages/app/src/canvas/Canvas.tsx, packages/app/src/canvas/FocusBreadcrumb.tsx, packages/app/src/canvas/SelectionChip.tsx, packages/app/src/canvas/focusHotkey.ts, packages/app/src/canvas/useEscapeKey.ts, packages/app/src/canvas/renderers/PixiRenderer.ts, crates/cc-core/src/model/graph.rs, crates/cc-tauri/src/commands/parse.rs]
         depends_on: [state-management, graph-layout, graph-model, resolution_precision]
         doc: docs/features/zoom_views.md
 
     state-management:
-        description: Zustand stores for graph state (incl. viewMode and focus neighborhood state), viewport state, per-view edge-kind counts published by the layout pass (edgeLegendStore), debug logging, and per-folder persistence (expanded/visible/viewMode). Pure view derivation + focus reducers live in graphViewModel.ts.
-        entry_points: [packages/app/src/stores/graphStore.ts, packages/app/src/stores/graphViewModel.ts, packages/app/src/stores/viewportStore.ts, packages/app/src/stores/edgeLegendStore.ts, packages/app/src/stores/debugStore.ts]
+        description: Zustand stores for graph state (incl. viewMode, the focus stack and the top frame's neighborhood/edge-detail payload, and the selected node set + derived primary), viewport state, per-view edge-kind counts published by the layout pass (edgeLegendStore), debug logging, and per-folder persistence (expanded/visible/viewMode). Pure view derivation + focus reducers live in graphViewModel.ts; pure selection logic in selectionModel.ts.
+        entry_points: [packages/app/src/stores/graphStore.ts, packages/app/src/stores/graphViewModel.ts, packages/app/src/stores/selectionModel.ts, packages/app/src/stores/viewportStore.ts, packages/app/src/stores/edgeLegendStore.ts, packages/app/src/stores/debugStore.ts]
         depends_on: []
 
     sidebar:

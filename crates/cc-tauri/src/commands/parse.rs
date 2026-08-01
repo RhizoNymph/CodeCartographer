@@ -2,7 +2,9 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use cc_core::model::{
-    CodeGraph, CodeNode, EdgeKind, Language, Neighborhood, NodeId, ParseResult, SubGraph,
+    CodeGraph, CodeNode, EdgeDetail, EdgeKind, FocusDirection, Language, Neighborhood, NodeId,
+    ParseResult,
+    SubGraph,
 };
 use cc_core::parser::{Extractor, ParseEvent};
 use cc_core::resolver::{ImportResolver, SymbolTable};
@@ -254,15 +256,17 @@ fn parse_edge_kinds(edge_kinds: Vec<String>) -> Result<HashSet<EdgeKind>, String
 }
 
 /// Compute the local neighborhood around `node_id` for focus / drill-down. BFS
-/// over both forward and reverse adjacency, bounded by `depth` (clamped to
-/// 1..=2) and filtered to `edge_kinds`. Returns the neighborhood node ids
-/// (including the container chain up to the root) and the direct edges among
-/// them (carrying resolution). Errors if the node is unknown.
+/// over forward and/or reverse adjacency per `direction` ("both" | "upstream" |
+/// "downstream"), bounded by `depth` (clamped to 1..=2) and filtered to
+/// `edge_kinds`. Returns the neighborhood node ids (including the container
+/// chain up to the root) and the direct edges among them (carrying resolution).
+/// Errors if the node is unknown.
 #[command]
 pub async fn get_neighborhood(
     node_id: String,
     depth: u8,
     edge_kinds: Vec<String>,
+    direction: FocusDirection,
     state: tauri::State<'_, GraphState>,
 ) -> Result<Neighborhood, String> {
     let guard = state
@@ -277,8 +281,38 @@ pub async fn get_neighborhood(
     let focus = NodeId(node_id);
 
     graph
-        .neighborhood(&focus, depth, &kinds)
+        .neighborhood(&focus, depth, &kinds, direction)
         .ok_or_else(|| format!("Unknown node: {}", focus))
+}
+
+/// Expand one aggregated `source_id -> target_id` view edge into the underlying
+/// graph edges behind it: every edge of an enabled kind running from the source
+/// subtree into the target subtree (that direction only). Returns those edges
+/// plus their endpoint ids including the container chain up to the root, so the
+/// frontend can lay out exactly the contributing symbol pairs. Errors if either
+/// endpoint is unknown.
+#[command]
+pub async fn get_edge_detail(
+    source_id: String,
+    target_id: String,
+    edge_kinds: Vec<String>,
+    state: tauri::State<'_, GraphState>,
+) -> Result<EdgeDetail, String> {
+    let guard = state
+        .0
+        .lock()
+        .map_err(|e| format!("Lock poisoned: {}", e))?;
+    let graph = guard
+        .as_ref()
+        .ok_or_else(|| "No graph in state. Run scan_repo first.".to_string())?;
+
+    let kinds = parse_edge_kinds(edge_kinds)?;
+    let source = NodeId(source_id);
+    let target = NodeId(target_id);
+
+    graph
+        .edge_detail(&source, &target, &kinds)
+        .ok_or_else(|| format!("Unknown edge endpoints: {} -> {}", source, target))
 }
 
 #[cfg(test)]
