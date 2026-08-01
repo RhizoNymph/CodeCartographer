@@ -6,6 +6,7 @@ In scope:
 - Pixi.js-based interactive graph rendering (nodes, edges, minimap)
 - Node creation, styling, and interaction (click, drag, hover, double-click)
 - Edge drawing with LOD-based opacity/width, hover highlighting, and orthogonal routing
+- "×N" count chips on aggregated (collapsed-container) edges
 - Minimap overlay showing node positions and viewport rectangle
 - Drag-and-drop with ancestor chain resizing
 - LOD (Level of Detail) visibility for labels and edges based on zoom level
@@ -43,6 +44,26 @@ The PixiRenderer (orchestrator) delegates to focused sub-modules:
    - `scheduleEdgeRedraw()` / `flushEdgeRedraw()`: animation frame throttling
    - LOD helper functions: `getLODEdgeOpacity`, `shouldHideEdgeKindAtLOD`, `getLODEdgeWidthMultiplier`
    - Private drawing primitives: `drawEdgePath`, `drawEdgeStartCap`, `drawEdgeArrowhead`
+   - Delegates aggregated-edge count chips to `edgeLabels.ts` (see below); owns
+     `baseChipLayer` / `highlightChipLayer` alongside the two Graphics layers and
+     `setBaseLayerAlpha()` so base edges and their chips dim together on hover
+
+2b. **edgeLabels.ts** (~190 lines) - "×N" count chips for aggregated edges
+   - `polylineArcMidpoint(points)`: point at half the **total arc length** of the
+     routed polyline (deliberately not the middle vertex, which on orthogonal
+     routes usually sits in a corner). Returns `null` only for an empty
+     polyline; a zero-length (fully coincident) polyline resolves to its first point.
+   - `shouldShowCountChip(count, lod)`: chips only for `count > 1` and only at
+     the "detail" LOD -- "overview" and "minimap" are too dense for per-edge text.
+   - `chipAlphaForEdge(edgeAlpha)`: clamps to [0,1]; a chip never renders brighter
+     than the edge it annotates, so ambiguous-dimmed and LOD-faded edges get
+     proportionally faded chips.
+   - `formatEdgeCount(count)`, `createEdgeCountChip(spec)`,
+     `buildEdgeCountChipLayer(specs)`: rounded dark plate (`#1e293b`) outlined in
+     the edge colour with the edge-tinted "×N" label centred on it.
+   - The shared `TextStyle` is created lazily (per-chip colour comes from
+     `Text.tint`, not a cloned style) so importing the module outside a DOM
+     never touches Pixi's text machinery.
 
 3. **types.ts** (~70 lines) - Shared type definitions
    - `NodeDisplayRef`: lightweight position snapshot for edge routing
@@ -113,6 +134,7 @@ Full base layer rebuilds only happen on layout/visibility/LOD/drag changes.
 |------|------|-------------|
 | `packages/app/src/canvas/renderers/PixiRenderer.ts` | Orchestrator | `PixiRenderer` class |
 | `packages/app/src/canvas/renderers/edgeDrawing.ts` | Edge rendering (two-layer) | `EdgeDrawingManager`, `getLODEdgeOpacity`, etc. |
+| `packages/app/src/canvas/renderers/edgeLabels.ts` | Aggregated-edge "×N" count chips | `polylineArcMidpoint`, `shouldShowCountChip`, `chipAlphaForEdge`, `buildEdgeCountChipLayer` |
 | `packages/app/src/canvas/renderers/types.ts` | Shared types | `EdgeDatum`, `NodeDisplayRef`, `EDGE_STYLES`, `NodePadding` |
 | `packages/app/src/canvas/renderers/minimapRenderer.ts` | Minimap | `MinimapRenderer` |
 | `packages/app/src/canvas/renderers/dragManager.ts` | Drag + resize | `DragManager`, `redrawNodeBg`, `syncDisplayBounds` |
@@ -131,6 +153,7 @@ Full base layer rebuilds only happen on layout/visibility/LOD/drag changes.
 | `packages/app/tests/edgeRenderer.test.ts` | Edge index building, highlight collection, two-layer invariants, EDGE_STYLES |
 | `packages/app/tests/nodeRenderer.test.ts` | Node labels, colors, blockKindPrefix, selected-node state machine, color constants |
 | `packages/app/tests/edgeGeometry.test.ts` | Edge routing geometry (anchorEdgePolyline, rerouteOrthogonalEdge) |
+| `packages/app/tests/edgeLabels.test.ts` | Arc-length midpoint, count-chip LOD/count predicate, chip alpha clamping, label formatting |
 | `packages/app/tests/palette.test.ts` | Palette invariants: merged edge hues, cross-map hex/near-duplicate collisions, saturation ordering, contrast on the dark canvas (see `docs/features/palette.md`) |
 
 ## Invariants and Constraints
@@ -141,4 +164,7 @@ Full base layer rebuilds only happen on layout/visibility/LOD/drag changes.
 - `nodeCreation.ts` does NOT attach event handlers -- the orchestrator is responsible for wiring interactions.
 - All `console.log` calls have been replaced with `useDebugStore.getState().addLog()` behind `import.meta.env.DEV` guards. `console.warn` and `console.error` are preserved for genuine warnings/errors.
 - The base edge layer is only rebuilt on layout/visibility/LOD/drag changes. Hover-only updates only touch the highlight layer.
+- Count chips are built inside the same pass that strokes the edges, so they are rebuilt exactly when their layer is (including drag redraws) and add no per-frame work. Chips are world-space children of the edge layer, so they scale with zoom.
+- Allocation per rebuild is bounded by the number of `count > 1` edges in view. Aggregated edges only exist for collapsed containers, so this stays small.
+- A chip's alpha equals its edge's alpha (`chipAlphaForEdge`), and `setBaseLayerAlpha()` dims base edges and base chips together, so a chip can never read brighter than the edge it labels.
 - The public API of PixiRenderer (as consumed by Canvas.tsx) is unchanged: constructor, waitForInit, updateGraph, updateVisibility, setSelectedNode, setHoveredNode, refreshEdges, zoomToNode, destroy.
