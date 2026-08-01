@@ -114,10 +114,13 @@ interface SubGraph   { edges; aggregated_edges }
    and errors rather than racing.
 3. The graph in state is the authoritative owner of edges; `ParseResult` and
    `SubGraph` are derived views. No full-graph clone is made for the response.
-4. `SubGraph::from_graph` aggregation is a faithful port of the former client
-   `computeAggregatedEdges`: skip unresolvable, self-loop, and ancestor-
-   containment cases; dedup by (source, target) keeping the first kind and
-   accumulating `count`.
+4. `SubGraph::from_graph` aggregation ports the former client
+   `computeAggregatedEdges` with one deliberate deviation: skip unresolvable,
+   self-loop, and ancestor-containment cases; dedup by (source, target, kind)
+   accumulating `count`, so each aggregated edge's kind (and colour) is exact
+   and collapsed containers mixing kinds yield parallel per-kind aggregates.
+   Direct-pair suppression is also per-kind: a direct edge suppresses only
+   same-kind aggregates between the same pair.
 5. `node_edge_kinds` records, per endpoint node, the distinct edge kinds
    touching it (sorted by `EdgeKind::discriminant` for determinism). Nodes with
    no edges are absent from the map.

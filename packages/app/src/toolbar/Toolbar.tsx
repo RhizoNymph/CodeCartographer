@@ -3,27 +3,14 @@ import { open } from "@tauri-apps/plugin-dialog";
 import { scanRepo, parseRepo, cloneGithubRepo } from "../api/commands";
 import { useGraphStore } from "../stores/graphStore";
 import { useViewportStore } from "../stores/viewportStore";
-import type { EdgeKind } from "../api/types";
 import { saveLastFolder, getLastFolder, clearLastFolder } from "../stores/persistenceStore";
 import { checkNorestore } from "../api/commands";
-import { EdgeToggleButton } from "./EdgeToggleButton";
 import { LODSettingsPanel } from "./LODSettingsPanel";
-
-const ALL_EDGE_KINDS: EdgeKind[] = [
-  "Import",
-  "FunctionCall",
-  "MethodCall",
-  "TypeReference",
-  "Inheritance",
-  "TraitImpl",
-  "VariableUsage",
-];
 
 export function Toolbar() {
   const repoPath = useGraphStore((s) => s.repoPath);
   const graph = useGraphStore((s) => s.graph);
   const isParsing = useGraphStore((s) => s.isParsing);
-  const enabledEdgeKinds = useGraphStore((s) => s.enabledEdgeKinds);
   const hideUnconnectedNodes = useGraphStore((s) => s.hideUnconnectedNodes);
   const hideAmbiguousEdges = useGraphStore((s) => s.hideAmbiguousEdges);
   const viewMode = useGraphStore((s) => s.viewMode);
@@ -31,7 +18,6 @@ export function Toolbar() {
   const setGraph = useGraphStore((s) => s.setGraph);
   const setIsParsing = useGraphStore((s) => s.setIsParsing);
   const handleParseEvent = useGraphStore((s) => s.handleParseEvent);
-  const toggleEdgeKind = useGraphStore((s) => s.toggleEdgeKind);
   const setHideUnconnectedNodes = useGraphStore((s) => s.setHideUnconnectedNodes);
   const setHideAmbiguousEdges = useGraphStore((s) => s.setHideAmbiguousEdges);
   const setViewMode = useGraphStore((s) => s.setViewMode);
@@ -372,20 +358,8 @@ export function Toolbar() {
             Hide ambiguous
           </label>
 
-          <span
-            style={{ fontSize: 10, color: "#64748b", marginRight: 2 }}
-          >
-            Edges:
-          </span>
-          {ALL_EDGE_KINDS.map((kind) => (
-            <EdgeToggleButton
-              key={kind}
-              kind={kind}
-              enabled={enabledEdgeKinds.has(kind)}
-              label={shortEdgeLabel(kind)}
-              onToggle={toggleEdgeKind}
-            />
-          ))}
+          {/* Edge kind toggles live in the canvas EdgeLegend overlay, where each
+              kind is shown with its colour and its edge count for the view. */}
 
           {/* LOD Settings button */}
           <div ref={lodSettingsRef} style={{ position: "relative", marginLeft: 8 }}>
@@ -432,16 +406,4 @@ function buttonStyle(disabled: boolean): React.CSSProperties {
     opacity: disabled ? 0.6 : 1,
     whiteSpace: "nowrap",
   };
-}
-
-function shortEdgeLabel(kind: EdgeKind): string {
-  switch (kind) {
-    case "Import": return "Imp";
-    case "FunctionCall": return "Call";
-    case "MethodCall": return "Meth";
-    case "TypeReference": return "Type";
-    case "Inheritance": return "Ext";
-    case "TraitImpl": return "Impl";
-    case "VariableUsage": return "Var";
-  }
 }

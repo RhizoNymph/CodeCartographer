@@ -50,6 +50,8 @@ Canvas derives the layout inputs each render (graphViewModel.ts):
 PixiRenderer.updateGraph(graph, layoutExpanded, displayVisible,
                          layoutEdgeKinds, layoutHideAmbig)
   -> elkLayout.layoutGraph(...) -> getSubgraph(renderIds, layoutEdgeKinds)
+       -> also derives LayoutResult.edgeKindCounts, which PixiRenderer publishes
+          to edgeLegendStore for the EdgeLegend overlay
 
 Switching mode -> graphStore.setViewMode -> reduceSetViewMode + bump
 layoutVersion + persist. Entering module view drops any active focus.
@@ -137,7 +139,10 @@ only -- it unmounts on pointerout, so a button there is unreachable.
 - `packages/app/src/canvas/FocusBreadcrumb.tsx` — the exit chip (name + depth
   selector + X + Esc).
 - `packages/app/src/toolbar/Toolbar.tsx` — Module|Symbol segmented control;
-  edge-kind toggles + ambiguous checkbox hidden in module view.
+  hide-unconnected + ambiguous checkboxes hidden in module view.
+- `packages/app/src/canvas/legend/EdgeLegend.tsx` — the edge-kind toggle UI
+  (canvas overlay). Collapses to a single non-interactive Import row in module
+  view; shows every kind with its per-view count in symbol/focus view.
 - `packages/app/src/canvas/focusHotkey.ts` — PURE `resolveFocusHotkey(event,
   context) -> FocusHotkeyResult` (`{kind:"focus"}` | `{kind:"ignore", reason}`);
   no DOM or store imports.
@@ -146,7 +151,8 @@ only -- it unmounts on pointerout, so a button there is unreachable.
 - `packages/app/src/canvas/SelectionChip.tsx` — top-centre chip for the selected
   node with the "Focus (F)" button; hidden while focus mode is active (the
   breadcrumb owns that slot).
-- `packages/app/src/App.tsx` — mounts `useFocusHotkey()` and `<SelectionChip />`.
+- `packages/app/src/App.tsx` — mounts `useFocusHotkey()`, `<SelectionChip />`,
+  and `<EdgeLegend />`.
 - `packages/app/src/sidebar/Sidebar.tsx` — "Focus" button on the selected row.
 - `packages/app/src/canvas/Tooltip.tsx` — hover tooltip; carries an
   "F focus" hint (no button — see the unreachability invariant).
@@ -173,8 +179,9 @@ only -- it unmounts on pointerout, so a button there is unreachable.
   are never mutated when entering module view; the effective values are computed
   at layout time. Returning to symbol view restores the user's exact state.
 - **Module view is import-only.** Effective edge kinds are always `{Import}` and
-  the ambiguous filter is a no-op (imports are exact), regardless of toolbar
-  toggles (which are hidden in module view).
+  the ambiguous filter is a no-op (imports are exact), regardless of the user's
+  saved edge-kind toggles. The `EdgeLegend` overlay reflects this by showing a
+  single, non-interactive Import row in module view.
 - **Default view is module** on load and for any saved state lacking `viewMode`.
 - **Focus renders only the neighborhood.** The full symbol graph is never laid
   out; visibility/expansion are restricted to `neighborhood.node_ids`, which

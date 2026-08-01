@@ -4,6 +4,7 @@ import { Sidebar } from "./sidebar/Sidebar";
 import { Canvas } from "./canvas/Canvas";
 import { Tooltip } from "./canvas/Tooltip";
 import { FocusBreadcrumb } from "./canvas/FocusBreadcrumb";
+import { EdgeLegend } from "./canvas/legend/EdgeLegend";
 import { SelectionChip } from "./canvas/SelectionChip";
 import { useFocusHotkey } from "./canvas/useFocusHotkey";
 import { ErrorBoundary } from "./components/ErrorBoundary";
@@ -44,9 +45,19 @@ export function App() {
             <Sidebar />
           </ErrorBoundary>
         )}
-        <ErrorBoundary fallbackMessage="Canvas failed to render">
-          <Canvas />
-        </ErrorBoundary>
+        {/* Canvas plus the overlays that belong to the canvas area rather than
+            the whole workspace, so the legend anchors to the canvas's
+            bottom-left corner and never sits over the sidebar. */}
+        <div style={{ display: "flex", flex: 1, position: "relative", overflow: "hidden" }}>
+          <ErrorBoundary fallbackMessage="Canvas failed to render">
+            <Canvas />
+          </ErrorBoundary>
+          {isLoaded && (
+            <ErrorBoundary fallbackMessage="Edge legend error">
+              <EdgeLegend />
+            </ErrorBoundary>
+          )}
+        </div>
         <Tooltip />
         <SelectionChip />
         <FocusBreadcrumb />

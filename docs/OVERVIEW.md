@@ -21,8 +21,9 @@ Overview:
         4. Frontend graphStore converts the ParseResult into a CodeGraph (node tree + nodeEdgeKinds Map, no edges) and computes visibility/expansion state. The hideUnconnectedNodes filter (visibilityFilter) runs synchronously from nodeEdgeKinds.
         5. Canvas derives the effective layout inputs from the zoom-level viewMode (default "module"): module view forces edge kinds to {Import} and treats files as collapsed (saved state preserved but ignored); symbol view uses the user's edge kinds + expansion; a focus neighborhood, when active, restricts visibility/expansion to the fetched neighborhood ids. Canvas passes the (edge-less) graph + effective state to PixiRenderer.
         6. PixiRenderer delegates to elkLayout: build the ELK node tree, collect the render set (elkNodeIds), fetch per-view direct + aggregated edges via get_subgraph(render_ids, edge_kinds) computed server-side (direct edges carry a Resolution; ambiguous edges may be hidden client-side), then render nodes and edges on the Pixi.js canvas. Views over 1500 rendered nodes skip ELK edge routing and use straight-line fallback edges.
-        7. User interactions (hover, select, expand, drag, zoom) update stores and trigger re-renders. Edge tooltips read kind + count from the layout edges (aggregated edges carry a collapsed count). Aggregated edges (count > 1) additionally render a world-space "×N" chip at the arc-length midpoint of their routed polyline, at the "detail" LOD only.
-        8. Focus / drill-down: the user focuses a node (F hotkey on the hovered/selected node, the canvas selection chip or Sidebar row Focus button, or a module-view File double-click) -> get_neighborhood(node_id, depth, edge_kinds) runs a bidirectional BFS in cc-core and returns the neighborhood node ids (incl. container chain) + direct edges -> the store switches to symbol view and the canvas lays out ONLY that neighborhood. A breadcrumb chip (depth selector + X) and Esc exit focus.
+        7. The layout pass also derives per-kind edge counts for the view from that same SubGraph payload; PixiRenderer publishes them to edgeLegendStore once the layout is known to be current, and the bottom-left EdgeLegend overlay renders one row per edge kind (colour, name, count) which doubles as the edge-kind toggle UI.
+        8. User interactions (hover, select, expand, drag, zoom) update stores and trigger re-renders. Edge tooltips read kind + count from the layout edges (aggregated edges carry a collapsed count). Aggregated edges (count > 1) additionally render a world-space "×N" chip at the arc-length midpoint of their routed polyline, at the "detail" LOD only.
+        9. Focus / drill-down: the user focuses a node (F hotkey on the hovered/selected node, the canvas selection chip or Sidebar row Focus button, or a module-view File double-click) -> get_neighborhood(node_id, depth, edge_kinds) runs a bidirectional BFS in cc-core and returns the neighborhood node ids (incl. container chain) + direct edges -> the store switches to symbol view and the canvas lays out ONLY that neighborhood. A breadcrumb chip (depth selector + X) and Esc exit focus.
 
 Features Index:
     canvas-rendering:
@@ -80,8 +81,8 @@ Features Index:
         doc: docs/features/zoom_views.md
 
     state-management:
-        description: Zustand stores for graph state (incl. viewMode and focus neighborhood state), viewport state, debug logging, and per-folder persistence (expanded/visible/viewMode). Pure view derivation + focus reducers live in graphViewModel.ts.
-        entry_points: [packages/app/src/stores/graphStore.ts, packages/app/src/stores/graphViewModel.ts, packages/app/src/stores/viewportStore.ts, packages/app/src/stores/debugStore.ts]
+        description: Zustand stores for graph state (incl. viewMode and focus neighborhood state), viewport state, per-view edge-kind counts published by the layout pass (edgeLegendStore), debug logging, and per-folder persistence (expanded/visible/viewMode). Pure view derivation + focus reducers live in graphViewModel.ts.
+        entry_points: [packages/app/src/stores/graphStore.ts, packages/app/src/stores/graphViewModel.ts, packages/app/src/stores/viewportStore.ts, packages/app/src/stores/edgeLegendStore.ts, packages/app/src/stores/debugStore.ts]
         depends_on: []
 
     sidebar:
@@ -91,10 +92,16 @@ Features Index:
         doc: docs/features/sidebar.md
 
     toolbar:
-        description: Top toolbar with folder open, GitHub clone, a Module|Symbol view-mode segmented control (edge-kind toggles hidden in module view), edge kind toggles, and LOD settings panel.
-        entry_points: [packages/app/src/toolbar/Toolbar.tsx, packages/app/src/toolbar/EdgeToggleButton.tsx, packages/app/src/toolbar/LODSettingsPanel.tsx]
+        description: Top toolbar with folder open, GitHub clone, a Module|Symbol view-mode segmented control, the hide-unconnected/hide-ambiguous checkboxes, and the LOD settings panel (all but the view-mode control hidden in module view). Edge-kind toggling has moved to the canvas edge-legend overlay.
+        entry_points: [packages/app/src/toolbar/Toolbar.tsx, packages/app/src/toolbar/LODSettingsPanel.tsx]
         depends_on: [state-management]
         doc: docs/features/toolbar.md
+
+    edge-legend:
+        description: Bottom-left canvas overlay that is also the edge-kind toggle UI. One row per edge kind available in the view (colour swatch, human-readable name, and the count of underlying edges of that kind IN THE CURRENT VIEW -- direct edges count 1, aggregated edges contribute their collapsed count). Counts are derived from the SubGraph the layout pass already fetched and published to edgeLegendStore after the renderer's stale-layout check. Clicking a row toggles the kind; toggled-off rows are dimmed/struck but stay clickable, enabled kinds with zero edges are dimmed and inert, and module view shows only a non-interactive Import row.
+        entry_points: [packages/app/src/canvas/legend/EdgeLegend.tsx, packages/app/src/canvas/legend/edgeLegendModel.ts, packages/app/src/stores/edgeLegendStore.ts]
+        depends_on: [graph-layout, state-management, zoom-views]
+        doc: docs/features/edge-legend.md
 
     error-handling:
         description: React ErrorBoundary components wrapping major UI sections for graceful error recovery.

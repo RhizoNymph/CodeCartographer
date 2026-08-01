@@ -170,9 +170,10 @@ impl SubGraph {
     ///   `render_ids`, lift each endpoint to its nearest ancestor in the set;
     ///   skip when unresolvable, when both lift to the same node (self-loop),
     ///   when one lifted endpoint is an ancestor of the other, or when the
-    ///   lifted pair is already connected by a direct edge. Deduped by
-    ///   (source, target) keeping the first kind seen; `count` accumulates the
-    ///   number of underlying edges collapsed into each aggregated edge.
+    ///   lifted pair is already connected by a direct edge of the same kind.
+    ///   Deduped by (source, target, kind) -- one aggregated edge per kind and
+    ///   pair, so an edge's kind (and therefore its colour) is always exact;
+    ///   `count` accumulates the underlying edges collapsed into each one.
     pub fn from_graph(
         graph: &CodeGraph,
         render_ids: &[NodeId],
@@ -183,14 +184,16 @@ impl SubGraph {
 
         let mut edges: Vec<CodeEdge> = Vec::new();
         // Preserve insertion order of aggregated edges for stable output.
-        let mut agg_order: Vec<(NodeId, NodeId)> = Vec::new();
-        let mut agg_map: HashMap<(NodeId, NodeId), AggregatedEdge> = HashMap::new();
+        let mut agg_order: Vec<(NodeId, NodeId, EdgeKind)> = Vec::new();
+        let mut agg_map: HashMap<(NodeId, NodeId, EdgeKind), AggregatedEdge> = HashMap::new();
 
-        // Pairs already connected by a direct edge. Aggregation must not
-        // duplicate them: e.g. a file->file Import edge plus a file->block
-        // Import edge whose block endpoint is hidden would otherwise render as
-        // two parallel edges between the same pair of nodes.
-        let direct_pairs: HashSet<(&NodeId, &NodeId)> = graph
+        // (pair, kind) triples already connected by a direct edge. Aggregation
+        // must not duplicate them: e.g. a file->file Import edge plus a
+        // file->block Import edge whose block endpoint is hidden would
+        // otherwise render as two parallel Import edges between the same pair.
+        // Keyed by kind so a direct edge of one kind does not suppress an
+        // aggregate of a different kind between the same pair.
+        let direct_pairs: HashSet<(&NodeId, &NodeId, &EdgeKind)> = graph
             .edges
             .iter()
             .filter(|e| {
@@ -198,7 +201,7 @@ impl SubGraph {
                     && render_set.contains(&e.source)
                     && render_set.contains(&e.target)
             })
-            .map(|e| (&e.source, &e.target))
+            .map(|e| (&e.source, &e.target, &e.kind))
             .collect();
 
         for edge in graph.edges.iter() {
@@ -240,12 +243,12 @@ impl SubGraph {
                 continue;
             }
 
-            // Skip pairs already connected by a direct edge.
-            if direct_pairs.contains(&(lifted_source, lifted_target)) {
+            // Skip pairs already connected by a direct edge of this kind.
+            if direct_pairs.contains(&(lifted_source, lifted_target, &edge.kind)) {
                 continue;
             }
 
-            let key = (lifted_source.clone(), lifted_target.clone());
+            let key = (lifted_source.clone(), lifted_target.clone(), edge.kind.clone());
             match agg_map.get_mut(&key) {
                 Some(agg) => {
                     agg.count = agg.count.saturating_add(1);
@@ -909,11 +912,12 @@ mod tests {
     }
 
     #[test]
-    fn subgraph_dedups_aggregated_edges_and_counts() {
+    fn subgraph_dedups_aggregated_edges_of_same_kind_and_counts() {
         let mut g = sample_graph();
-        // Two distinct block-level edges both lifting to fileA -> fileB.
+        // Two distinct block-level edges of the SAME kind both lifting to
+        // fileA -> fileB collapse into one aggregate with count 2.
         g.add_edge(edge("fnA1", "fnB1", EdgeKind::FunctionCall));
-        g.add_edge(edge("fnA2", "fnB1", EdgeKind::Import));
+        g.add_edge(edge("fnA2", "fnB1", EdgeKind::FunctionCall));
 
         let render: Vec<NodeId> = ["fileA", "fileB"].iter().map(|s| NodeId(s.to_string())).collect();
         let sub = SubGraph::from_graph(&g, &render, &all_kinds());
@@ -923,8 +927,67 @@ mod tests {
         assert_eq!(agg.source, NodeId("fileA".into()));
         assert_eq!(agg.target, NodeId("fileB".into()));
         assert_eq!(agg.count, 2);
-        // First kind seen (FunctionCall) is retained.
         assert_eq!(agg.kind, EdgeKind::FunctionCall);
+    }
+
+    #[test]
+    fn subgraph_splits_aggregated_edges_by_kind() {
+        let mut g = sample_graph();
+        // Block-level edges of DIFFERENT kinds lifting to the same pair must
+        // stay separate aggregates -- an edge's kind (and colour) is exact,
+        // never a "first kind seen" mixture.
+        g.add_edge(edge("fnA1", "fnB1", EdgeKind::FunctionCall));
+        g.add_edge(edge("fnA2", "fnB1", EdgeKind::FunctionCall));
+        g.add_edge(edge("fnA2", "fnB1", EdgeKind::TypeReference));
+
+        let render: Vec<NodeId> = ["fileA", "fileB"].iter().map(|s| NodeId(s.to_string())).collect();
+        let sub = SubGraph::from_graph(&g, &render, &all_kinds());
+
+        assert_eq!(sub.edges.len(), 0);
+        assert_eq!(sub.aggregated_edges.len(), 2, "one aggregate per kind");
+
+        let calls = sub
+            .aggregated_edges
+            .iter()
+            .find(|a| a.kind == EdgeKind::FunctionCall)
+            .expect("FunctionCall aggregate");
+        assert_eq!(calls.count, 2);
+
+        let type_refs = sub
+            .aggregated_edges
+            .iter()
+            .find(|a| a.kind == EdgeKind::TypeReference)
+            .expect("TypeReference aggregate");
+        assert_eq!(type_refs.count, 1);
+
+        for agg in &sub.aggregated_edges {
+            assert_eq!(agg.source, NodeId("fileA".into()));
+            assert_eq!(agg.target, NodeId("fileB".into()));
+        }
+    }
+
+    #[test]
+    fn subgraph_direct_edge_suppresses_only_same_kind_aggregates() {
+        let mut g = sample_graph();
+        // Direct file->file Import edge, plus a hidden block-level FunctionCall
+        // lifting to the same pair: the Import direct edge must suppress only
+        // Import aggregates, not the FunctionCall one.
+        g.add_edge(edge("fileA", "fileB", EdgeKind::Import));
+        g.add_edge(edge("fileA", "fnB1", EdgeKind::Import));
+        g.add_edge(edge("fnA1", "fnB1", EdgeKind::FunctionCall));
+
+        let render: Vec<NodeId> = ["fileA", "fileB"].iter().map(|s| NodeId(s.to_string())).collect();
+        let sub = SubGraph::from_graph(&g, &render, &all_kinds());
+
+        assert_eq!(sub.edges.len(), 1, "one direct Import edge");
+        assert_eq!(sub.edges[0].kind, EdgeKind::Import);
+        assert_eq!(
+            sub.aggregated_edges.len(),
+            1,
+            "lifted Import suppressed by the direct pair; FunctionCall survives"
+        );
+        assert_eq!(sub.aggregated_edges[0].kind, EdgeKind::FunctionCall);
+        assert_eq!(sub.aggregated_edges[0].count, 1);
     }
 
     #[test]
