@@ -46,7 +46,8 @@ export function DetailsPanel() {
 
   const graph = useGraphStore((s) => s.graph);
   const enterFocus = useGraphStore((s) => s.enterFocus);
-  const setSelectedNode = useGraphStore((s) => s.setSelectedNode);
+  const selectNode = useGraphStore((s) => s.selectNode);
+  const clearSelection = useGraphStore((s) => s.clearSelection);
 
   const [collapsed, setCollapsed] = useState(false);
   const [neighborhood, setNeighborhood] = useState<Neighborhood | null>(null);
@@ -69,7 +70,7 @@ export function DetailsPanel() {
 
     setPending(true);
     const timer = setTimeout(() => {
-      getNeighborhood(selectedNodeId, DETAIL_DEPTH, [...DETAILS_EDGE_KINDS])
+      getNeighborhood(selectedNodeId, DETAIL_DEPTH, [...DETAILS_EDGE_KINDS], "both")
         .then((result) => {
           if (requestId !== requestIdRef.current) return; // stale -- discard
           setNeighborhood(result);
@@ -155,7 +156,7 @@ export function DetailsPanel() {
       <Header
         summary={summary}
         onCollapse={() => setCollapsed(true)}
-        onClear={() => setSelectedNode(null)}
+        onClear={() => clearSelection()}
       />
 
       <div style={{ overflowY: "auto", padding: "10px 12px 16px" }}>
@@ -220,7 +221,7 @@ export function DetailsPanel() {
               title="Incoming"
               subtitle="callers / referrers"
               pending={pending}
-              onSelect={setSelectedNode}
+              onSelect={(id) => selectNode(id)}
               onFocus={enterFocus}
             />
             <EdgeSection
@@ -228,7 +229,7 @@ export function DetailsPanel() {
               title="Outgoing"
               subtitle="callees / references"
               pending={pending}
-              onSelect={setSelectedNode}
+              onSelect={(id) => selectNode(id)}
               onFocus={enterFocus}
             />
           </>
