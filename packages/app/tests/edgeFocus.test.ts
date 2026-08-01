@@ -3,18 +3,17 @@ import assert from "node:assert/strict";
 
 import type { CodeGraph, EdgeKind, EdgeDetail, Neighborhood } from "../src/api/types.ts";
 import {
-  reduceSetViewModeFrame,
-  reduceEnterNodeFocus,
-  reduceEnterEdgeFocus,
-  reduceExitFocusFrame,
-  focusedNodeId,
-  focusHasDepth,
-  focusBreadcrumbModel,
+  reduceSetViewMode,
+  reduceEnterFocus,
+  reduceExitFocus,
+  focusTopFrame,
+  focusTopNodeId,
+  focusFrameLabel,
   focusLayoutIds,
   focusVisibleNodes,
   focusExpandedNodes,
   type FocusFrame,
-  type FocusFrameState,
+  type FocusViewState,
 } from "../src/stores/graphViewModel.ts";
 
 // root -> [fileA, fileB]; fileA -> [fnA1, fnA2]; fileB -> [fnB1]
@@ -76,9 +75,9 @@ const graph: CodeGraph = {
   },
 };
 
-const unfocused: FocusFrameState = { viewMode: "module", frame: null };
+const unfocused: FocusViewState = { viewMode: "module", focusStack: [] };
 
-const nodeFrame: FocusFrame = { type: "node", nodeId: "fileA", depth: 2 };
+const nodeFrame: FocusFrame = { type: "node", nodeId: "fileA", depth: 2, direction: "both" };
 const edgeFrame: FocusFrame = { type: "edge", source: "fileA", target: "fileB" };
 
 /** What `get_edge_detail` returns for the fileA -> fileB aggregate. */
@@ -95,108 +94,80 @@ const edgeDetail: EdgeDetail = {
 const neighborhood: Neighborhood = {
   focus: "fileA",
   depth: 1,
+  direction: "both",
   node_ids: ["fileA", "fnA1", "root"],
   edges: [],
 };
 
-describe("focus frame reducers", () => {
-  it("entering an edge focus forces symbol view and records the pair", () => {
-    const next = reduceEnterEdgeFocus(unfocused, "fileA", "fileB");
+describe("edge frames on the focus stack", () => {
+  it("entering an edge focus forces symbol view and pushes the pair", () => {
+    const next = reduceEnterFocus(unfocused, edgeFrame);
     assert.equal(next.viewMode, "symbol");
-    assert.deepEqual(next.frame, { type: "edge", source: "fileA", target: "fileB" });
+    assert.deepEqual(next.focusStack, [edgeFrame]);
   });
 
-  it("entering a node focus forces symbol view and records node + depth", () => {
-    const next = reduceEnterNodeFocus(unfocused, "fileA", 2);
-    assert.equal(next.viewMode, "symbol");
-    assert.deepEqual(next.frame, { type: "node", nodeId: "fileA", depth: 2 });
+  it("an edge focus from inside a node focus pushes a deeper frame", () => {
+    const next = reduceEnterFocus({ viewMode: "symbol", focusStack: [nodeFrame] }, edgeFrame);
+    assert.deepEqual(next.focusStack, [nodeFrame, edgeFrame]);
   });
 
-  it("an edge focus replaces an active node focus (and vice versa)", () => {
-    const fromNode = reduceEnterEdgeFocus({ viewMode: "symbol", frame: nodeFrame }, "fileA", "fileB");
-    assert.deepEqual(fromNode.frame, edgeFrame);
-
-    const fromEdge = reduceEnterNodeFocus({ viewMode: "symbol", frame: edgeFrame }, "fnB1", 1);
-    assert.deepEqual(fromEdge.frame, { type: "node", nodeId: "fnB1", depth: 1 });
+  it("re-entering the same edge pair replaces the top frame, not stacking a duplicate", () => {
+    const focused: FocusViewState = { viewMode: "symbol", focusStack: [nodeFrame, edgeFrame] };
+    const next = reduceEnterFocus(focused, { type: "edge", source: "fileA", target: "fileB" });
+    assert.equal(next.focusStack.length, 2);
+    assert.deepEqual(focusTopFrame(next.focusStack), edgeFrame);
   });
 
-  it("switching to module view drops any focus frame", () => {
-    for (const frame of [nodeFrame, edgeFrame]) {
-      const next = reduceSetViewModeFrame({ viewMode: "symbol", frame }, "module");
-      assert.equal(next.viewMode, "module");
-      assert.equal(next.frame, null);
-    }
+  it("switching to module view drops the whole stack, edge frames included", () => {
+    const next = reduceSetViewMode(
+      { viewMode: "symbol", focusStack: [nodeFrame, edgeFrame] },
+      "module"
+    );
+    assert.equal(next.viewMode, "module");
+    assert.deepEqual(next.focusStack, []);
   });
 
-  it("switching to symbol view preserves the focus frame", () => {
-    const next = reduceSetViewModeFrame({ viewMode: "symbol", frame: edgeFrame }, "symbol");
-    assert.equal(next.viewMode, "symbol");
-    assert.deepEqual(next.frame, edgeFrame);
+  it("switching to symbol view preserves the stack", () => {
+    const next = reduceSetViewMode({ viewMode: "symbol", focusStack: [edgeFrame] }, "symbol");
+    assert.deepEqual(next.focusStack, [edgeFrame]);
   });
 
-  it("exiting focus clears the frame but keeps symbol view", () => {
-    const next = reduceExitFocusFrame({ viewMode: "symbol", frame: edgeFrame });
-    assert.equal(next.frame, null);
+  it("exiting focus clears the stack but keeps symbol view", () => {
+    const next = reduceExitFocus({ viewMode: "symbol", focusStack: [nodeFrame, edgeFrame] });
+    assert.deepEqual(next.focusStack, []);
     assert.equal(next.viewMode, "symbol");
   });
 
-  it("frame reducers are pure (do not mutate their input)", () => {
-    const input: FocusFrameState = { viewMode: "symbol", frame: nodeFrame };
-    reduceSetViewModeFrame(input, "module");
-    reduceExitFocusFrame(input);
-    reduceEnterEdgeFocus(input, "fileA", "fileB");
+  it("reducers are pure (do not mutate their input)", () => {
+    const input: FocusViewState = { viewMode: "symbol", focusStack: [nodeFrame] };
+    reduceSetViewMode(input, "module");
+    reduceExitFocus(input);
+    reduceEnterFocus(input, edgeFrame);
     assert.equal(input.viewMode, "symbol");
-    assert.deepEqual(input.frame, { type: "node", nodeId: "fileA", depth: 2 });
+    assert.deepEqual(input.focusStack, [nodeFrame]);
   });
 });
 
-describe("focus frame accessors", () => {
-  it("only a node frame has a focused node id", () => {
-    assert.equal(focusedNodeId(nodeFrame), "fileA");
-    assert.equal(focusedNodeId(edgeFrame), null);
-    assert.equal(focusedNodeId(null), null);
+describe("edge frame accessors", () => {
+  it("only a node top frame has a focused node id", () => {
+    assert.equal(focusTopNodeId([nodeFrame]), "fileA");
+    assert.equal(focusTopNodeId([edgeFrame]), null);
+    assert.equal(focusTopNodeId([edgeFrame, nodeFrame]), "fileA");
+    assert.equal(focusTopNodeId([]), null);
   });
 
-  it("depth applies to node focus only, so the selector hides on edge focus", () => {
-    assert.equal(focusHasDepth(nodeFrame), true);
-    assert.equal(focusHasDepth(edgeFrame), false);
-    assert.equal(focusHasDepth(null), false);
-  });
-});
-
-describe("focus breadcrumb model", () => {
-  it("a node frame reads as the node's name plus its depth", () => {
-    assert.deepEqual(focusBreadcrumbModel(graph, nodeFrame), {
-      type: "node",
-      label: "fileA.py",
-      depth: 2,
-    });
+  it("an edge frame labels as source -> target names", () => {
+    const nameOf = (id: string) => graph.nodes[id]?.name ?? id;
+    assert.equal(focusFrameLabel(edgeFrame, nameOf), "fileA.py → fileB.py");
+    assert.equal(focusFrameLabel(nodeFrame, nameOf), "fileA.py");
   });
 
-  it("an edge frame reads as source -> target names", () => {
-    assert.deepEqual(focusBreadcrumbModel(graph, edgeFrame), {
-      type: "edge",
-      sourceLabel: "fileA.py",
-      targetLabel: "fileB.py",
-    });
-  });
-
-  it("falls back to raw ids for nodes missing from the graph", () => {
-    assert.deepEqual(focusBreadcrumbModel(graph, { type: "edge", source: "ghost", target: "fileB" }), {
-      type: "edge",
-      sourceLabel: "ghost",
-      targetLabel: "fileB.py",
-    });
-    assert.deepEqual(focusBreadcrumbModel(graph, { type: "node", nodeId: "ghost", depth: 1 }), {
-      type: "node",
-      label: "ghost",
-      depth: 1,
-    });
-  });
-
-  it("is null with no frame or no graph", () => {
-    assert.equal(focusBreadcrumbModel(graph, null), null);
-    assert.equal(focusBreadcrumbModel(null, edgeFrame), null);
+  it("labels fall back to raw ids for nodes missing from the graph", () => {
+    const nameOf = (id: string) => graph.nodes[id]?.name ?? id;
+    assert.equal(
+      focusFrameLabel({ type: "edge", source: "ghost", target: "fileB" }, nameOf),
+      "ghost → fileB.py"
+    );
   });
 });
 
