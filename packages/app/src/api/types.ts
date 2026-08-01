@@ -144,29 +144,58 @@ export type ParseEvent =
   | { type: "Error"; path: string; message: string }
   | { type: "Complete"; total_files: number; total_blocks: number };
 
-// Edge kind colors matching Rust
+/**
+ * The palette is built around one rule: a colour identifies exactly one
+ * category. Edges own the saturated end of the spectrum and blocks/nodes own
+ * the muted end, so an edge hue never reads as a node fill and vice versa.
+ *
+ * Edges get five hues -- as many as a user can reliably hold in working memory.
+ * Kinds that answer the same question share a hue: FunctionCall and MethodCall
+ * are both "a call", Inheritance and TraitImpl are both "a subtype relation".
+ * The kinds stay distinct everywhere else (model, tooltips, toggles, styles);
+ * only the colour merges.
+ */
+export const EDGE_HUES = {
+  /** Module-view flagship edge. Indigo -- reserved, never reused by a block. */
+  import: "#818cf8",
+  /** FunctionCall + MethodCall. */
+  calls: "#4ade80",
+  typeReference: "#fbbf24",
+  /** Inheritance + TraitImpl. */
+  subtype: "#f472b6",
+  /** Deliberately neutral: the noisiest, least informative edge kind. */
+  variableUsage: "#94a3b8",
+} as const;
+
+// Edge kind colors. Distinct hues: 5 (see EDGE_HUES).
 export const EDGE_COLORS: Record<EdgeKind, string> = {
-  Import: "#6366f1",
-  FunctionCall: "#22c55e",
-  MethodCall: "#14b8a6",
-  TypeReference: "#f59e0b",
-  Inheritance: "#ef4444",
-  TraitImpl: "#a855f7",
-  VariableUsage: "#64748b",
+  Import: EDGE_HUES.import,
+  FunctionCall: EDGE_HUES.calls,
+  MethodCall: EDGE_HUES.calls,
+  TypeReference: EDGE_HUES.typeReference,
+  Inheritance: EDGE_HUES.subtype,
+  TraitImpl: EDGE_HUES.subtype,
+  VariableUsage: EDGE_HUES.variableUsage,
 };
 
-// Block kind colors
+/**
+ * Block kind colors: one muted family (HSL saturation 42%, lightness 62%) so
+ * node fills recede into the background and edges pop against them. Hues avoid
+ * the indigo/slate band owned by the Import and VariableUsage edges -- which is
+ * why Impl (was indigo, collided with Import) and Module (was slate, collided
+ * with VariableUsage) moved to lime and clay.
+ */
 export const BLOCK_COLORS: Record<BlockKind, string> = {
-  Function: "#3b82f6",
-  Class: "#8b5cf6",
-  Struct: "#f59e0b",
-  Enum: "#10b981",
-  Trait: "#ec4899",
-  Interface: "#06b6d4",
-  Impl: "#6366f1",
-  Module: "#64748b",
-  Constant: "#f97316",
-  TypeAlias: "#14b8a6",
+  Function: "#758fc7", // blue
+  Class: "#bb75c7", // purple
+  Struct: "#c7b775", // sand
+  Enum: "#75c787", // green
+  Trait: "#c7759e", // rose
+  Interface: "#75bdc7", // cyan
+  Impl: "#a9c775", // lime
+  Module: "#c77b75", // clay
+  Constant: "#c79975", // tan
+  TypeAlias: "#75c7ad", // teal
 };
 
 // Node type colors

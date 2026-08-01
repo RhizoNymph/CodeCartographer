@@ -1,11 +1,10 @@
-use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::model::{CodeEdge, CodeGraph, CodeNode, EdgeKind, Language, NodeId, Resolution};
 use crate::parser::{RawRefKind, RawReference};
 
-use super::extension_probe::{probe_path, probe_path_all};
+use super::path_index::PathIndex;
 use super::python_roots::PythonPackageRoots;
 
 /// Map of `source file path -> set of file paths it imports`.
@@ -28,45 +27,15 @@ impl ImportResolver {
         let mut edges = Vec::new();
         let mut import_map: ImportMap = HashMap::new();
 
-        // Build a map of file paths to NodeIds for fast lookup
-        let mut path_to_id: HashMap<String, NodeId> = HashMap::new();
-        let mut file_paths: Vec<String> = Vec::new();
-        for (id, node) in &graph.nodes {
-            if let CodeNode::File { path, .. } = node {
-                file_paths.push(path.clone());
-
-                // Store with and without extension
-                path_to_id.insert(path.clone(), id.clone());
-
-                // Also store without extension for import resolution. Several
-                // files can strip to the same key (`mod.py` vs `mod.pyi`), so
-                // the winner is chosen by rank rather than by (unordered)
-                // iteration order.
-                if let Some(stem) = Path::new(path).file_stem() {
-                    let parent = Path::new(path).parent().unwrap_or(Path::new(""));
-                    let without_ext = parent.join(stem).to_string_lossy().to_string();
-                    match path_to_id.entry(without_ext) {
-                        Entry::Vacant(slot) => {
-                            slot.insert(id.clone());
-                        }
-                        Entry::Occupied(mut slot) => {
-                            let replace = {
-                                let incumbent = slot.get().0.as_str();
-                                (stripped_key_rank(path), path.as_str())
-                                    > (stripped_key_rank(incumbent), incumbent)
-                            };
-                            if replace {
-                                slot.insert(id.clone());
-                            }
-                        }
-                    }
-                }
-            }
-        }
+        // Index every scanned file by its full path. Extension-less module
+        // paths are answered by language-aware probing through the index, never
+        // by a pre-computed extension-stripped key (which cannot distinguish
+        // `shared/util.py` from `shared/util.ts`).
+        let index = PathIndex::from_graph(graph);
 
         // Candidate roots for Python absolute imports, derived from the scanned
         // file set (repo root, `src/` dirs, package-chain parents).
-        let package_roots = PythonPackageRoots::from_file_paths(&file_paths);
+        let package_roots = PythonPackageRoots::from_file_paths(index.file_paths());
 
         for raw_ref in refs {
             if let RawRefKind::Import { module_path } = &raw_ref.kind {
@@ -78,7 +47,7 @@ impl ImportResolver {
                     module_path,
                     &from_file,
                     from_language.as_ref(),
-                    &path_to_id,
+                    &index,
                     &package_roots,
                 ) {
                     // Import edge from file to file
@@ -133,7 +102,7 @@ impl ImportResolver {
         module_path: &str,
         from_file: &str,
         language: Option<&Language>,
-        path_map: &HashMap<String, NodeId>,
+        index: &PathIndex,
         package_roots: &PythonPackageRoots,
     ) -> Option<NodeId> {
         // Handle Python-style leading-dot relative imports (`.foo`, `..pkg.mod`,
@@ -142,7 +111,7 @@ impl ImportResolver {
         // the leading dots. Must be checked BEFORE the generic `starts_with('.')`
         // branch below (which only understands `./`-style paths).
         if matches!(language, Some(Language::Python)) && module_path.starts_with('.') {
-            if let Some(id) = Self::resolve_python_relative(module_path, from_file, path_map) {
+            if let Some(id) = Self::resolve_python_relative(module_path, from_file, index) {
                 return Some(id);
             }
             // Fall through to the generic handling below if the Python-specific
@@ -156,45 +125,35 @@ impl ImportResolver {
             let resolved = from_dir.join(module_path);
             let normalized = Self::normalize_path(&resolved);
 
-            // Try exact match first
-            if let Some(id) = path_map.get(&normalized) {
-                return Some(id.clone());
-            }
-
-            // Use extension probing based on language
-            if let Some(lang) = language {
-                return probe_path(&normalized, lang.clone(), path_map);
-            }
-            return probe_path_all(&normalized, path_map);
+            // Exact path first, then extension probing restricted to the
+            // importing file's language (all extensions when it is unknown).
+            return index.resolve(&normalized, language);
         }
 
         // Python absolute imports (`pkg.sub.mod`, `pkg`, `module`) are resolved
         // against every candidate package root, nearest the importing file
         // first, so `src/` layouts and monorepo `packages/*/` layouts work.
         if matches!(language, Some(Language::Python)) {
-            return Self::resolve_python_absolute(module_path, from_file, path_map, package_roots);
+            return Self::resolve_python_absolute(module_path, from_file, index, package_roots);
         }
 
-        // Handle Python dotted imports (foo.bar.baz -> foo/bar/baz.py)
+        // Dotted module paths in a non-Python file (`a.b.c` with no slash).
+        // Probing stays in the importing file's language rather than assuming
+        // Python, so a TS specifier can never land on a `.py` file.
         if module_path.contains('.') && !module_path.contains('/') {
             let as_path = module_path.replace('.', "/");
-            if let Some(id) = path_map.get(&as_path) {
-                return Some(id.clone());
-            }
-            return probe_path(&as_path, Language::Python, path_map);
+            return index.resolve(&as_path, language);
         }
 
         // Handle Rust use paths (crate::foo::Bar, super::sibling, self::sub).
         if module_path.contains("::") {
-            return Self::resolve_rust_use_path(module_path, from_file, path_map);
+            return Self::resolve_rust_use_path(module_path, from_file, index);
         }
 
-        // Bare module name lookup
-        if let Some(id) = path_map.get(module_path) {
-            return Some(id.clone());
-        }
-
-        None
+        // Bare module name lookup (`import util`). Still language-scoped: the
+        // name may be an npm/crate dependency that merely shares a stem with a
+        // repo file written in another language.
+        index.resolve(module_path, language)
     }
 
     /// Resolve a Rust use path (`crate::a::b::Item`, `super::sibling::Item`,
@@ -209,7 +168,7 @@ impl ImportResolver {
     fn resolve_rust_use_path(
         module_path: &str,
         from_file: &str,
-        path_map: &HashMap<String, NodeId>,
+        index: &PathIndex,
     ) -> Option<NodeId> {
         let mut segments: Vec<&str> = module_path.split("::").collect();
         if segments.is_empty() {
@@ -252,7 +211,7 @@ impl ImportResolver {
         // (function/type) inside a module file rather than the file itself.
         for take in (1..=segments.len()).rev() {
             let candidate = join_base(&segments[..take].join("/"));
-            if let Some(id) = probe_path(&candidate, Language::Rust, path_map) {
+            if let Some(id) = index.probe(&candidate, Language::Rust) {
                 return Some(id);
             }
         }
@@ -260,11 +219,11 @@ impl ImportResolver {
         // All segments consumed (e.g. `use crate::Item;` or bare `super::Item`
         // fully probed): the target is the crate root file or the base module.
         for root in ["lib", "main"] {
-            if let Some(id) = probe_path(&join_base(root), Language::Rust, path_map) {
+            if let Some(id) = index.probe(&join_base(root), Language::Rust) {
                 return Some(id);
             }
         }
-        probe_path(&base_str, Language::Rust, path_map)
+        index.probe(&base_str, Language::Rust)
     }
 
     /// The directory a Rust file's module owns: `src/model/mod.rs` (and
@@ -306,7 +265,7 @@ impl ImportResolver {
     fn resolve_python_absolute(
         module_path: &str,
         from_file: &str,
-        path_map: &HashMap<String, NodeId>,
+        index: &PathIndex,
         package_roots: &PythonPackageRoots,
     ) -> Option<NodeId> {
         if module_path.is_empty() {
@@ -321,13 +280,9 @@ impl ImportResolver {
                 format!("{}/{}", root, relative)
             };
 
-            // Exact match first (the path map also holds extension-stripped
-            // keys), then language-specific probing (`.py`, `/__init__.py`,
+            // Exact path first, then Python probing (`.py`, `/__init__.py`,
             // then the `.pyi` stub forms).
-            if let Some(id) = path_map.get(&candidate) {
-                return Some(id.clone());
-            }
-            if let Some(id) = probe_path(&candidate, Language::Python, path_map) {
+            if let Some(id) = index.resolve(&candidate, Some(&Language::Python)) {
                 return Some(id);
             }
         }
@@ -346,7 +301,7 @@ impl ImportResolver {
     fn resolve_python_relative(
         module_path: &str,
         from_file: &str,
-        path_map: &HashMap<String, NodeId>,
+        index: &PathIndex,
     ) -> Option<NodeId> {
         let dot_count = module_path.chars().take_while(|&c| c == '.').count();
         if dot_count == 0 {
@@ -373,7 +328,7 @@ impl ImportResolver {
             } else {
                 format!("{}/__init__.py", base_str)
             };
-            return path_map.get(&init).cloned();
+            return index.exact(&init);
         }
 
         // Convert the dotted remainder to a path segment and join onto the base.
@@ -385,11 +340,8 @@ impl ImportResolver {
         };
         let normalized = Self::normalize_path(Path::new(&joined));
 
-        // Exact match, then probe module file / package __init__.py.
-        if let Some(id) = path_map.get(&normalized) {
-            return Some(id.clone());
-        }
-        probe_path(&normalized, Language::Python, path_map)
+        // Exact path, then probe module file / package __init__.py.
+        index.resolve(&normalized, Some(&Language::Python))
     }
 
     fn normalize_path(path: &Path) -> String {
@@ -407,27 +359,6 @@ impl ImportResolver {
             }
         }
         parts.join("/")
-    }
-}
-
-/// Rank of a file path competing for an extension-stripped path-map key.
-///
-/// Several files can strip to the same key (`pkg/mod.py` and `pkg/mod.pyi` both
-/// strip to `pkg/mod`). A `.pyi` stub only carries signatures, so the real
-/// module must always win; higher rank wins.
-///
-/// Rank alone does not settle every collision: in a polyglot repo `foo.py` and
-/// `foo.ts` also strip to `foo` and rank equally. The caller therefore breaks
-/// ties on the full path, which is arbitrary but *stable* -- without it the
-/// winner would depend on `HashMap` iteration order and resolution could differ
-/// between runs of the same scan. Picking the language-correct file in that case
-/// is a separate concern (the stripped key is consulted before language-aware
-/// extension probing); see `probe_path`.
-fn stripped_key_rank(path: &str) -> u8 {
-    if path.ends_with(".pyi") {
-        0
-    } else {
-        1
     }
 }
 
@@ -688,12 +619,12 @@ mod tests {
     }
 
     #[test]
-    fn polyglot_stripped_key_collision_resolves_deterministically() {
-        // `shared/util.py` and `shared/util.ts` both strip to `shared/util` and
-        // rank equally, so the path-map winner used to depend on `HashMap`
-        // iteration order -- the same scan could resolve `./util` differently
-        // between runs. The tie is now broken on the full path, so whatever the
-        // outcome is, it must be the same every time.
+    fn polyglot_stripped_key_collision_resolves_to_the_importing_language() {
+        // `shared/util.py` and `shared/util.ts` both name the module path
+        // `shared/util`. The path index holds no extension-stripped key, so
+        // `./util` from a TypeScript file is answered by TypeScript extension
+        // probing: it must land on `util.ts` on every run, not merely land on
+        // the same arbitrary file on every run.
         let mut seen: Option<NodeId> = None;
 
         for run in 0..16 {
@@ -718,6 +649,11 @@ mod tests {
             let (edges, _map) = ImportResolver::resolve(&graph, &refs);
 
             assert_eq!(edges.len(), 1, "expected one import edge on run {run}");
+            assert_eq!(
+                edges[0].target,
+                NodeId::file("shared/util.ts"),
+                "a TypeScript import must resolve to the TypeScript file on run {run}"
+            );
             match &seen {
                 None => seen = Some(edges[0].target.clone()),
                 Some(first) => assert_eq!(

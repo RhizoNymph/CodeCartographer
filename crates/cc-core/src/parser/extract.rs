@@ -16,9 +16,43 @@ pub struct RawReference {
 
 #[derive(Debug, Clone)]
 pub enum RawRefKind {
-    Import { module_path: String },
+    Import {
+        module_path: String,
+    },
+    /// A `from <module> import <original> [as <local>]` name binding.
+    ///
+    /// **This variant deliberately produces no edge.** It is resolution
+    /// *context*, not a reference: the file already emits one
+    /// [`RawRefKind::Import`] for the module (which is what draws the Import
+    /// edge), and turning every imported name into its own edge would multiply
+    /// symbol-edge volume without adding information. What it does instead is
+    /// tell [`crate::resolver::SymbolTable`] that, inside this file, the local
+    /// name `local` denotes the symbol `original` defined in `module_path`. That
+    /// lets a later use of `local` resolve to the right symbol in the right
+    /// file — including through an `as` rename, which is otherwise unresolvable.
+    ///
+    /// [`crate::resolver::ImportResolver`] matches only `Import { .. }`, so this
+    /// variant never produces a duplicate file-to-file Import edge either.
+    ///
+    /// `RawReference::name` carries `local` (the name a use site would write).
+    ImportedSymbol {
+        /// Module path exactly as written, same shape as `Import::module_path`
+        /// (leading dots preserved for relative imports).
+        module_path: String,
+        /// The name as defined in the imported module.
+        original: String,
+        /// The name bound in the importing file (equals `original` when there
+        /// is no `as` clause).
+        local: String,
+    },
     FunctionCall,
     MethodCall,
+    /// A method call whose receiver is the enclosing instance itself
+    /// (`self.helper()`, `cls.build()`). Resolves exactly like
+    /// [`RawRefKind::MethodCall`] (same [`crate::model::EdgeKind`]) but the
+    /// resolver can first look for the method on the enclosing class instead of
+    /// matching any same-named method in the file. Only Python emits it.
+    SelfMethodCall,
     TypeReference,
     Inheritance,
     TraitImpl,
@@ -1009,6 +1043,363 @@ mod tests {
             block_visibility_of(&nodes, "_Internal"),
             Some(Visibility::Private)
         );
+    }
+
+    // -- C1: imported-symbol bindings --
+
+    /// Collect `(module_path, original, local)` for every ImportedSymbol ref,
+    /// in source order.
+    fn python_symbol_bindings(source: &str) -> Vec<(String, String, String)> {
+        let (_, refs) = extract(source, &Language::Python);
+        refs.iter()
+            .filter_map(|r| match &r.kind {
+                RawRefKind::ImportedSymbol {
+                    module_path,
+                    original,
+                    local,
+                } => Some((module_path.clone(), original.clone(), local.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn test_python_from_import_emits_one_binding_per_name() {
+        assert_eq!(
+            python_symbol_bindings("from mypkg.mod import Thing, other"),
+            vec![
+                ("mypkg.mod".into(), "Thing".into(), "Thing".into()),
+                ("mypkg.mod".into(), "other".into(), "other".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_python_from_import_alias_binding_keeps_original_and_local() {
+        assert_eq!(
+            python_symbol_bindings("from mypkg.mod import Thing as T"),
+            vec![("mypkg.mod".into(), "Thing".into(), "T".into())]
+        );
+    }
+
+    #[test]
+    fn test_python_relative_from_import_binding_keeps_leading_dots() {
+        assert_eq!(
+            python_symbol_bindings("from ..pkg.sub import y"),
+            vec![("..pkg.sub".into(), "y".into(), "y".into())]
+        );
+        assert_eq!(
+            python_symbol_bindings("from . import x"),
+            vec![(".".into(), "x".into(), "x".into())]
+        );
+    }
+
+    #[test]
+    fn test_python_binding_ref_name_is_the_local_name() {
+        let (_, refs) = extract("from m import Thing as T", &Language::Python);
+        let binding = refs
+            .iter()
+            .find(|r| matches!(r.kind, RawRefKind::ImportedSymbol { .. }))
+            .expect("expected an ImportedSymbol ref");
+        assert_eq!(binding.name, "T");
+    }
+
+    #[test]
+    fn test_python_wildcard_and_plain_imports_emit_no_bindings() {
+        // `from pkg import *` binds nothing nameable.
+        assert!(python_symbol_bindings("from pkg.mod import *").is_empty());
+        // `import x` / `import x as y` bind a *module*, not a symbol.
+        assert!(python_symbol_bindings("import numpy as np").is_empty());
+        assert!(python_symbol_bindings("import os, sys").is_empty());
+        // `from __future__ import annotations` is not a real module import.
+        assert!(python_symbol_bindings("from __future__ import annotations").is_empty());
+    }
+
+    #[test]
+    fn test_python_bindings_do_not_disturb_the_import_module_path_contract() {
+        // The module-path contract the import resolver consumes is unchanged:
+        // still exactly one Import ref per imported module.
+        assert_eq!(
+            python_import_paths("from mypkg.mod import Thing, other as o"),
+            vec!["mypkg.mod"]
+        );
+    }
+
+    #[test]
+    fn test_python_binding_attributed_to_enclosing_scope() {
+        let (_, refs) = extract("from m import Thing", &Language::Python);
+        let file_id = NodeId::file("test.file");
+        let binding = refs
+            .iter()
+            .find(|r| matches!(r.kind, RawRefKind::ImportedSymbol { .. }))
+            .expect("expected an ImportedSymbol ref");
+        assert_eq!(binding.from_node, file_id);
+    }
+
+    // -- C4: self-receiver method calls --
+
+    /// Collect names of SelfMethodCall refs, sorted.
+    fn python_self_call_names(source: &str) -> Vec<String> {
+        let (_, refs) = extract(source, &Language::Python);
+        let mut names: Vec<String> = refs
+            .iter()
+            .filter(|r| matches!(r.kind, RawRefKind::SelfMethodCall))
+            .map(|r| r.name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn test_python_self_call_is_marked_distinctly() {
+        let source = "class C:\n    def m(self):\n        self.helper()\n        other.helper()";
+        assert_eq!(python_self_call_names(source), vec!["helper"]);
+
+        // `other.helper()` stays a plain MethodCall, and the self call is not
+        // double-counted as one.
+        let (_, refs) = extract(source, &Language::Python);
+        let method_calls: Vec<&RawReference> = refs
+            .iter()
+            .filter(|r| matches!(r.kind, RawRefKind::MethodCall))
+            .collect();
+        assert_eq!(
+            method_calls.len(),
+            1,
+            "only `other.helper()` is a plain MethodCall, got {:?}",
+            method_calls
+                .iter()
+                .map(|r| (&r.name, &r.kind))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn test_python_cls_call_is_a_self_call() {
+        let source = "class C:\n    @classmethod\n    def make(cls):\n        return cls._build()";
+        assert_eq!(python_self_call_names(source), vec!["_build"]);
+    }
+
+    #[test]
+    fn test_python_self_attribute_call_is_not_a_self_call() {
+        // `self.client.send()` calls a method on an *attribute*, not on self.
+        let source = "class C:\n    def m(self):\n        self.client.send()";
+        assert!(
+            python_self_call_names(source).is_empty(),
+            "only a direct `self.<name>()` receiver counts, got {:?}",
+            python_self_call_names(source)
+        );
+        let (_, refs) = extract(source, &Language::Python);
+        assert!(
+            refs.iter()
+                .any(|r| matches!(r.kind, RawRefKind::MethodCall) && r.name == "send"),
+            "it is still a plain MethodCall"
+        );
+    }
+
+    #[test]
+    fn test_non_python_self_calls_are_unchanged() {
+        // TS/Rust extraction is untouched: no language emits SelfMethodCall
+        // except Python.
+        for (source, lang) in [
+            ("class C { m() { this.helper(); } }", Language::TypeScript),
+            ("fn m(&self) { self.helper(); }", Language::Rust),
+        ] {
+            let (_, refs) = extract(source, &lang);
+            assert!(
+                !refs
+                    .iter()
+                    .any(|r| matches!(r.kind, RawRefKind::SelfMethodCall)),
+                "{lang:?} must not emit SelfMethodCall"
+            );
+            assert!(
+                refs.iter()
+                    .any(|r| matches!(r.kind, RawRefKind::MethodCall) && r.name == "helper"),
+                "{lang:?} still emits a MethodCall for `helper`"
+            );
+        }
+    }
+
+    // -- C2: PEP 695 `type X = Y` statements --
+
+    #[test]
+    fn test_python_pep695_type_alias_block() {
+        let (nodes, _) = extract("type Alias = MyClass", &Language::Python);
+        assert_eq!(block_kind_of(&nodes, "Alias"), BlockKind::TypeAlias);
+        assert_eq!(block_names(&nodes), vec!["Alias"]);
+    }
+
+    #[test]
+    fn test_python_pep695_type_alias_rhs_emits_type_reference() {
+        assert_eq!(
+            python_type_ref_names("type Alias = MyClass"),
+            vec!["MyClass"],
+        );
+    }
+
+    #[test]
+    fn test_python_pep695_type_alias_never_self_references() {
+        // The alias name on the LHS is itself a `type` node in the grammar;
+        // it must not become a TypeReference from the alias block to itself.
+        let (nodes, refs) = extract("type Alias = MyClass", &Language::Python);
+        let alias_id = block_id_of(&nodes, "Alias");
+        assert!(
+            !refs.iter().any(|r| r.name == "Alias"),
+            "the alias name must never appear as a reference, got {:?}",
+            refs.iter().map(|r| (&r.name, &r.kind)).collect::<Vec<_>>()
+        );
+        assert!(
+            refs.iter()
+                .all(|r| r.from_node != alias_id || r.name != "Alias"),
+            "no self-referencing type ref"
+        );
+    }
+
+    #[test]
+    fn test_python_pep695_generic_type_alias_skips_its_parameters() {
+        // `type G[T] = list[T]`: the LHS (`G`, and its `[T]` parameter list) is
+        // a declaration, not a reference. The RHS behaves normally: `list` is a
+        // builtin (dropped), `T` is a genuine leaf reference.
+        let (nodes, _) = extract("type G[T] = list[T]", &Language::Python);
+        assert_eq!(block_kind_of(&nodes, "G"), BlockKind::TypeAlias);
+        assert_eq!(python_type_ref_names("type G[T] = list[T]"), vec!["T"]);
+    }
+
+    #[test]
+    fn test_python_pep695_type_alias_union_rhs() {
+        assert_eq!(python_type_ref_names("type Alias = A | B"), vec!["A", "B"]);
+    }
+
+    // -- C3: string forward references in annotations --
+
+    #[test]
+    fn test_python_string_forward_reference() {
+        assert_eq!(
+            python_type_ref_names("def f(x: \"Fwd\") -> \"Ret\":\n    pass"),
+            vec!["Fwd", "Ret"]
+        );
+    }
+
+    #[test]
+    fn test_python_string_forward_reference_inside_generic() {
+        assert_eq!(
+            python_type_ref_names("def f(x: List[\"Fwd\"]):\n    pass"),
+            vec!["Fwd"]
+        );
+    }
+
+    #[test]
+    fn test_python_string_forward_reference_with_subscript_content() {
+        assert_eq!(
+            python_type_ref_names("def f(x: \"Optional[Fwd]\"):\n    pass"),
+            vec!["Fwd"]
+        );
+        assert_eq!(
+            python_type_ref_names("def f(x: \"dict[str, MyClass]\"):\n    pass"),
+            vec!["MyClass"]
+        );
+        assert_eq!(
+            python_type_ref_names("def f(x: \"A | B\"):\n    pass"),
+            vec!["A", "B"]
+        );
+    }
+
+    #[test]
+    fn test_python_string_forward_reference_dotted_uses_leaf() {
+        assert_eq!(
+            python_type_ref_names("def f(x: \"mod.Deep\"):\n    pass"),
+            vec!["Deep"]
+        );
+    }
+
+    #[test]
+    fn test_python_string_forward_reference_filters_builtins_and_typing() {
+        assert!(python_type_ref_names("def f(x: \"int\") -> \"None\":\n    pass").is_empty());
+        assert!(python_type_ref_names("def f(x: \"Any\"):\n    pass").is_empty());
+        assert!(python_type_ref_names("def f(x: \"Callable[[int], str]\"):\n    pass").is_empty());
+    }
+
+    #[test]
+    fn test_python_string_forward_reference_on_variable_annotation() {
+        assert_eq!(
+            python_type_ref_names("def f():\n    x: \"Fwd\" = make()"),
+            vec!["Fwd"]
+        );
+    }
+
+    #[test]
+    fn test_python_docstring_is_never_a_type_reference() {
+        let source = "def f(x: int):\n    \"\"\"MyClass does the thing.\"\"\"\n    return x";
+        assert!(
+            python_type_ref_names(source).is_empty(),
+            "docstrings must not produce type references, got {:?}",
+            python_type_ref_names(source)
+        );
+        let class_doc = "class C:\n    \"\"\"Wraps MyClass.\"\"\"\n    pass";
+        assert!(python_type_ref_names(class_doc).is_empty());
+        let module_doc = "\"\"\"Module docs mentioning MyClass.\"\"\"\n";
+        assert!(python_type_ref_names(module_doc).is_empty());
+    }
+
+    #[test]
+    fn test_python_ordinary_string_values_are_never_type_references() {
+        // Default value, plain assignment, call argument, dict value, and an
+        // annotated assignment whose *value* (not annotation) is a string.
+        for source in [
+            "def f(x: str = \"MyClass\"):\n    pass",
+            "NAME = \"MyClass\"",
+            "def f():\n    call(\"MyClass\")",
+            "def f():\n    d = {\"MyClass\": 1}",
+            "NAME: str = \"MyClass\"",
+            "def f():\n    return \"MyClass\"",
+        ] {
+            assert!(
+                python_type_ref_names(source).is_empty(),
+                "string value must not become a type reference in: {source:?} (got {:?})",
+                python_type_ref_names(source)
+            );
+        }
+    }
+
+    #[test]
+    fn test_python_literal_and_annotated_strings_are_values_not_type_references() {
+        // `Literal["a"]` enumerates string *values*; `Annotated[T, "note"]`
+        // carries metadata. Neither is a forward reference.
+        for source in [
+            "def f(x: Literal[\"MyClass\"]):\n    pass",
+            "def f(x: list[Literal[\"MyClass\", \"Other\"]]):\n    pass",
+            "NAMES: list[Literal[\"MyClass\"]] = []",
+            "def f(x: Annotated[int, \"MyClass\"]):\n    pass",
+        ] {
+            assert!(
+                python_type_ref_names(source).is_empty(),
+                "Literal/Annotated strings must not become type references in: {source:?} (got {:?})",
+                python_type_ref_names(source)
+            );
+        }
+        // A genuine forward reference in a normal generic still works.
+        assert_eq!(
+            python_type_ref_names("def f(x: list[\"MyClass\"]):\n    pass"),
+            vec!["MyClass"]
+        );
+    }
+
+    #[test]
+    fn test_python_unparseable_string_annotation_emits_nothing() {
+        for source in [
+            "def f(x: \"not a real type!\"):\n    pass",
+            "def f(x: \"lambda: 3\"):\n    pass",
+            "def f(x: \"\"):\n    pass",
+            "def f(x: \"1234\"):\n    pass",
+            "def f(x: \"Literal['a']\"):\n    pass",
+            "def f(x: f\"Fwd\"):\n    pass",
+            "def f(x: b\"Fwd\"):\n    pass",
+        ] {
+            assert!(
+                python_type_ref_names(source).is_empty(),
+                "non-name string annotation must emit nothing in: {source:?} (got {:?})",
+                python_type_ref_names(source)
+            );
+        }
     }
 
     // -- TypeScript tests --

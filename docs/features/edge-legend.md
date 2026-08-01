@@ -84,6 +84,24 @@ inert, because otherwise there would be no way to turn the kind back on. Only an
 - `packages/app/tests/edgeLegend.test.ts` — count derivation, row logic,
   module-view filtering.
 
+## Palette interaction (shared hues)
+
+`EDGE_COLORS` is built from five `EDGE_HUES` covering seven kinds
+(see docs/features/palette.md): `FunctionCall` + `MethodCall` share the *calls*
+hue, and `Inheritance` + `TraitImpl` share the *subtype* hue. The legend keeps
+one row per KIND — matching palette rule 2, which merges only the colour and
+keeps the kinds distinct in the toggles — and each swatch shows that kind's real
+`EDGE_COLORS` value. Two pairs of rows therefore render identical swatches, and
+those rows sit adjacent in `LEGEND_EDGE_KINDS` order.
+
+This is deliberate. The legend's job is to let a user map an edge colour seen on
+the canvas back to a meaning; giving the paired kinds distinct swatch treatments
+would imply a visual distinction the canvas does not draw and would break that
+mapping. Two green rows correctly say "green means a call, either function or
+method", and the row labels plus per-row counts carry the rest. Because the
+swatch reads `EDGE_COLORS[row.kind]` at render time, the legend tracks any future
+palette change automatically.
+
 ## Invariants and Constraints
 
 - **Counts are per-view, never whole-graph.** They are derived from the

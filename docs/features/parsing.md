@@ -16,10 +16,11 @@
 - Type inference
 - Cross-file reference resolution (handled by resolver subsystem)
 - Language-specific formatting or pretty-printing
-- Recording the imported *symbol* names of `from x import Thing` (only the module
-  path is captured) and mapping `import x as y` aliases back to the original symbol
-- Resolving `self.helper()` to the enclosing class rather than by bare method name
-- Python string forward references in annotations (`x: "Fwd"`)
+- Mapping a *module* alias back to its module (`import numpy as np`; a later
+  `np.array()` still resolves by the bare name `array`). Only `from x import y as z`
+  *symbol* bindings are recorded.
+- Resolving an *inherited* `self.helper()` to the base class that declares it
+  (only methods the enclosing class declares itself are matched precisely)
 
 ## Data/Control Flow
 
@@ -63,6 +64,12 @@ reference is attributed to exactly one node.
 | `function_definition` | `Function` | |
 | `class_definition` | `Class` | |
 | `assignment` | `Constant` / `TypeAlias` | module-level, single-identifier target only |
+| `type_alias_statement` | `TypeAlias` | PEP 695 `type X = Y` / `type G[T] = ...` |
+
+PEP 695 `type_alias_statement` is unambiguously a type declaration, so unlike
+`NAME = ...` bindings it is classified wherever it appears. The block name comes
+from the `left:` field (its `identifier`, or the base `identifier` of a
+`generic_type` for `type G[T] = ...`).
 
 Module-level bindings are deliberately narrow to keep the graph from exploding:
 the `assignment` must sit directly in the module body (`module > expression_statement >
@@ -100,6 +107,30 @@ reads only `module_name:`, whose text is already correct for both `dotted_name` 
 `relative_import` (leading dots preserved). `future_import_statement`
 (`from __future__ import ...`) emits nothing.
 
+**Imported-symbol bindings** — `import_from_statement` *additionally* emits one
+`RawRefKind::ImportedSymbol { module_path, original, local }` per imported name.
+`module_path` is identical to the statement's `Import` ref; `original` is the
+name as defined in the imported module and `local` is the name bound in this
+file (they differ only under an `as` rename). `RawReference::name` carries
+`local`.
+
+| Source | bindings |
+|---|---|
+| `from mypkg.mod import Thing, other` | `(mypkg.mod, Thing, Thing)`, `(mypkg.mod, other, other)` |
+| `from mypkg.mod import Thing as T` | `(mypkg.mod, Thing, T)` |
+| `from . import x` | `(., x, x)` |
+| `from pkg.mod import *` | none (`wildcard_import` has no `name:` field) |
+| `import numpy as np` | none (binds a *module*, not a symbol) |
+| `from __future__ import annotations` | none |
+
+**This variant deliberately produces no edge.** It is resolution context, not a
+reference: the module already has its own `Import` ref (and therefore its own
+Import edge), so turning every imported name into an edge would multiply
+symbol-edge volume without adding information. `ImportResolver::resolve` matches
+only `Import { .. }` and ignores it; `SymbolTable::resolve_references` folds the
+bindings into a per-file `local -> (module_path, original)` map and uses it as a
+precision tier (see `docs/features/resolution_precision.md`).
+
 **Type annotations** — only leaf names are emitted; the raw text of a composite
 annotation is never used. Each annotation node kind contributes its own leaf and
 lets the walk reach the rest:
@@ -112,8 +143,40 @@ lets the walk reach the rest:
 
 Names matching `is_python_builtin_type` or `is_typing_construct` (`Optional`,
 `List`, `Dict`, `Union`, `Any`, `Callable`, `Protocol`, ...) are dropped. Result:
-`list[MyClass]` yields exactly one `TypeReference` named `MyClass`. String forward
-references (`x: "Fwd"`) are not resolved.
+`list[MyClass]` yields exactly one `TypeReference` named `MyClass`.
+
+The `left:` side of a PEP 695 `type X[T] = ...` statement is skipped
+(`is_type_alias_declaration`, an ancestor walk): in the grammar the alias name
+and its parameter list are themselves `type` / `generic_type` nodes, so without
+the guard the alias block would emit a `TypeReference` to itself and to its own
+type parameters. The `right:` side behaves normally.
+
+**String forward references** — a `type` node whose child is a `string` is a
+PEP 484 forward reference (`x: "Fwd"`, `List["Fwd"]`, `def f() -> "Optional[Fwd]"`).
+Its content is text rather than a parsed subtree, so it is scanned textually and
+then passed through the *same* `emit_type_reference` filtering as a real
+annotation. Rules:
+- only unprefixed, non-interpolated string literals qualify (`f""`, `b""`, `r""`
+  and escapes are rejected);
+- the content must consist solely of identifiers, `.`, `[`, `]`, `,`, `|` and
+  spaces, and every dotted segment must be a valid identifier — otherwise
+  **nothing** is emitted rather than a guess;
+- each dotted name contributes its last segment (`"mod.Deep"` -> `Deep`), and
+  builtins/typing constructs are filtered as usual (`"Optional[Fwd]"` -> `Fwd`);
+- strings that are *values* rather than types are excluded: a `type` node whose
+  parent chain is `type_parameter` -> `generic_type` based on `Literal` or
+  `Annotated` emits nothing (`Literal["a", "b"]`, `Annotated[int, "note"]`).
+
+Because the rule fires only inside a `type` node, ordinary strings — docstrings,
+default values, dict keys, call arguments, plain assignments — can never reach it.
+
+**Calls** — a `call` whose `function:` is an `attribute` is a `MethodCall`,
+anything else a `FunctionCall`. A method call whose receiver is *literally* the
+identifier `self` or `cls` is instead a `SelfMethodCall`, which carries the same
+`EdgeKind::MethodCall` but lets the resolver look the name up on the enclosing
+class first (see `resolution_precision.md`). The check is deliberately strict:
+in `self.client.send()` the receiver of `send` is `self.client`, not `self`, so
+that call stays a plain `MethodCall`. No other language emits `SelfMethodCall`.
 
 **Inheritance** — an `argument_list` whose parent is a `class_definition` emits one
 `Inheritance` ref per base: `identifier` and `attribute` (last segment) directly,
@@ -164,6 +227,16 @@ Consolidates extension probing logic used by the import resolver:
 - Python `RawRefKind::Import { module_path }` is always a clean dotted path as
   written in source (no alias clause, no imported symbol names), one ref per
   module. The import resolver depends on this exact shape.
+- `RawRefKind::ImportedSymbol` never yields an edge, in any resolver. Its
+  `module_path` has exactly the same shape as `Import { module_path }`. Adding
+  bindings must never change symbol-edge *volume*, only edge *targets*.
+- A string in type position is only treated as a forward reference when it
+  parses as a plain type expression; anything else emits nothing. Strings that
+  are not inside a `type` node are never inspected at all.
+- `RawRefKind::SelfMethodCall` always maps to `EdgeKind::MethodCall`. It can
+  only ever *narrow* a resolution: when the enclosing class declares no such
+  member the reference falls through to the ordinary ladder, so behaviour is
+  never worse than a plain `MethodCall`.
 - Python module-level bindings only become blocks when the assignment is a direct
   child of the module body and binds a single identifier; nothing inside a class
   body or function body is ever classified.

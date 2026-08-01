@@ -230,27 +230,42 @@ type BlockKind =
 
 ## Color Scheme
 
+One rule governs the palette: a colour identifies exactly one category. Edges
+own the saturated end of the spectrum, blocks and nodes own the muted end, and
+no hex is shared between the three maps. Full rationale and invariants live in
+`docs/features/palette.md`.
+
+**Edge Hues** (`EDGE_HUES` / `EDGE_COLORS`) — 5 hues for 7 kinds:
+```
+Import                       #818cf8 (indigo)  flagship module-view edge
+FunctionCall + MethodCall    #4ade80 (green)   "a call"
+TypeReference                #fbbf24 (amber)
+Inheritance + TraitImpl      #f472b6 (pink)    "a subtype relation"
+VariableUsage                #94a3b8 (slate)   neutral / de-emphasized
+```
+Merged kinds stay distinct in the model, tooltips, toggles and `EDGE_STYLES`;
+only the colour merges. `MethodCall` is dimmed below `FunctionCall`
+(baseAlpha 0.65 vs 0.8) so the shared hue is still separable.
+
+**BlockKind Colors** — one muted family (HSL sat 42%, lightness 62%) so node
+fills recede and edges pop:
+```
+Function:  #758fc7 (blue)     Interface: #75bdc7 (cyan)
+Class:     #bb75c7 (purple)   Impl:      #a9c775 (lime)
+Struct:    #c7b775 (sand)     Module:    #c77b75 (clay)
+Enum:      #75c787 (green)    Constant:  #c79975 (tan)
+Trait:     #c7759e (rose)     TypeAlias: #75c7ad (teal)
+```
+Block hues avoid the indigo/slate band owned by the Import and VariableUsage
+edges — which is why `Impl` (was indigo `#6366f1`, the Import hex) and `Module`
+(was slate `#64748b`, the VariableUsage hex) moved to lime and clay.
+
 **Node Types:**
 ```
 Directory: #1e293b (dark slate)
 File: #1e3a5f (dark blue)
 ```
-
-**BlockKind Colors:**
-```
-Function:  #3b82f6 (blue)
-Class:     #8b5cf6 (purple)
-Struct:    #f59e0b (amber)
-Enum:      #10b981 (emerald)
-Trait:     #ec4899 (pink)
-Interface: #06b6d4 (cyan)
-Impl:      #6366f1 (indigo)
-Module:    #64748b (slate)
-Constant:  #f97316 (orange)
-TypeAlias: #14b8a6 (teal)
-```
-
-**Edge Colors:** (see cc-core.md EdgeKind table)
+Node fills darken their palette colour by `BLOCK_FILL_DARKEN` (0.25).
 
 ## Data Flow
 

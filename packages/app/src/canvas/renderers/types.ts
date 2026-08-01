@@ -56,13 +56,20 @@ export interface EdgeStyleConfig {
   baseAlpha: number;
 }
 
-/** Edge styling configuration by type. */
+/**
+ * Edge styling configuration by type.
+ *
+ * Kinds that share a hue (see EDGE_HUES) keep a small alpha separation so the
+ * pair stays tellable apart: Inheritance/TraitImpl already differed, and
+ * MethodCall is now dimmed below FunctionCall since colour no longer separates
+ * them (method calls are also the noisier of the two).
+ */
 export const EDGE_STYLES: Record<EdgeKind, EdgeStyleConfig> = {
   Import: { width: 2.5, baseAlpha: 0.9 },
   Inheritance: { width: 2.5, baseAlpha: 0.9 },
   TraitImpl: { width: 2.5, baseAlpha: 0.85 },
   FunctionCall: { width: 2, baseAlpha: 0.8 },
-  MethodCall: { width: 2, baseAlpha: 0.8 },
+  MethodCall: { width: 2, baseAlpha: 0.65 },
   TypeReference: { width: 2, baseAlpha: 0.75 },
   VariableUsage: { width: 1.5, baseAlpha: 0.5 },
 };
