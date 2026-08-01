@@ -409,15 +409,21 @@ function renderSingleEdge(
  * - **baseLayer**: contains ALL edges drawn at normal LOD-based opacity.
  *   Rebuilt on layout change, visibility change, LOD change, or drag.
  *
- * - **highlightLayer**: contains ONLY the highlighted (connected-to-hovered-node)
- *   edges at full opacity. Rebuilt on hover change only.
+ * - **highlightLayer**: contains ONLY the highlighted edges at full opacity.
+ *   Rebuilt whenever the highlight changes (hover or pinned selection).
  *
- * On hover, instead of destroying and recreating all edge graphics (O(n)):
+ * On a highlight change, instead of destroying and recreating all edge
+ * graphics (O(n)):
  *   1. Dim the base layer by setting its alpha to 0.15
  *   2. Draw only highlighted edges onto the highlightLayer
- *   3. On unhover: restore baseLayer alpha, clear highlightLayer
+ *   3. When the highlight goes away: restore baseLayer alpha, clear highlightLayer
  *
- * This reduces hover cost from O(totalEdges) to O(connectedEdges).
+ * This reduces the cost from O(totalEdges) to O(highlightedEdges).
+ *
+ * The manager is deliberately ignorant of WHERE the highlight comes from: the
+ * caller decides (hover, a pinned node, or an induced subgraph -- see
+ * `resolveHighlightSource`), fills `highlightedEdgeIndices`, and passes a plain
+ * `highlightActive` flag.
  */
 export class EdgeDrawingManager {
   edgeData: EdgeDatum[] = [];
@@ -441,7 +447,8 @@ export class EdgeDrawingManager {
   private _lastLOD: LODLevel = "detail";
   private _lastVisibleNodes: Set<string> = new Set();
   private _lastGetRef: ((nodeId: string) => NodeDisplayRef | null) | null = null;
-  private _hoveredNodeId: string | null = null;
+  /** Whether a highlight source (hover or pin) is currently driving the layers. */
+  private _highlightActive = false;
   private resolvedPointsByEdgeIndex = new Map<number, Point[]>();
 
   /**
@@ -476,11 +483,12 @@ export class EdgeDrawingManager {
 
   /**
    * Full redraw of the base layer. Called on layout, visibility, LOD, or drag changes.
-   * If a node is currently hovered, also rebuilds the highlight layer.
+   * If a highlight is active, also rebuilds the highlight layer -- which is what
+   * makes a pinned selection survive base-layer rebuilds.
    */
   redrawEdgesWithHighlight(
     edgeLayer: Container,
-    hoveredNodeId: string | null,
+    highlightActive: boolean,
     currentLOD: LODLevel,
     currentVisibleNodes: Set<string>,
     getNodeDisplayRef: (nodeId: string) => NodeDisplayRef | null
@@ -490,7 +498,7 @@ export class EdgeDrawingManager {
     this._lastLOD = currentLOD;
     this._lastVisibleNodes = currentVisibleNodes;
     this._lastGetRef = getNodeDisplayRef;
-    this._hoveredNodeId = hoveredNodeId;
+    this._highlightActive = highlightActive;
 
     // Destroy old layers
     this.destroyBaseLayer();
@@ -574,8 +582,8 @@ export class EdgeDrawingManager {
       this.baseChipLayer = chips;
     }
 
-    // If hovered, dim the base layer and draw highlights on top
-    if (hoveredNodeId && this.highlightedEdgeIndices.size > 0) {
+    // If a highlight is active, dim the base layer and draw highlights on top
+    if (highlightActive && this.highlightedEdgeIndices.size > 0) {
       this.setBaseLayerAlpha(0.15);
       this.rebuildHighlightLayer();
     }
@@ -592,13 +600,15 @@ export class EdgeDrawingManager {
   }
 
   /**
-   * Update hover state. Only rebuilds the highlight layer if the base layer
-   * already exists -- avoids the expensive full base-layer rebuild.
+   * Apply a new highlight (the caller has already refilled
+   * `highlightedEdgeIndices`). Only rebuilds the highlight layer if the base
+   * layer already exists -- avoids the expensive full base-layer rebuild.
    *
-   * Returns true if a hover-only update was performed (no full redraw needed).
+   * Returns true if a highlight-only update was performed (no full redraw
+   * needed).
    */
-  setHoveredNode(hoveredNodeId: string | null): boolean {
-    this._hoveredNodeId = hoveredNodeId;
+  setHighlightActive(highlightActive: boolean): boolean {
+    this._highlightActive = highlightActive;
 
     if (!this.baseLayer || !this._lastEdgeLayer) {
       // No base layer yet -- caller should trigger a full redraw
@@ -608,7 +618,7 @@ export class EdgeDrawingManager {
     // Destroy old highlight layer
     this.destroyHighlightLayer();
 
-    if (hoveredNodeId && this.highlightedEdgeIndices.size > 0) {
+    if (highlightActive && this.highlightedEdgeIndices.size > 0) {
       // Dim base layer and draw highlighted edges
       this.setBaseLayerAlpha(0.15);
       this.rebuildHighlightLayer();
@@ -748,6 +758,11 @@ export class EdgeDrawingManager {
   /** @internal Exposed for testing: whether the highlight layer exists */
   get _hasHighlightLayer(): boolean {
     return this.highlightLayer !== null;
+  }
+
+  /** @internal Exposed for testing: whether a highlight source is driving the layers */
+  get _highlightIsActive(): boolean {
+    return this._highlightActive;
   }
 
   /** @internal Exposed for testing: the base layer alpha value */

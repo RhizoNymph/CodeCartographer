@@ -14,10 +14,10 @@ const TreeItem = memo(function TreeItem({ nodeId, depth, searchQuery, matchingNo
   const graph = useGraphStore((s) => s.graph);
   const expandedNodes = useGraphStore((s) => s.expandedNodes);
   const visibleNodes = useGraphStore((s) => s.visibleNodes);
-  const selectedNodeId = useGraphStore((s) => s.selectedNodeId);
+  const selectedNodeIds = useGraphStore((s) => s.selectedNodeIds);
   const toggleExpanded = useGraphStore((s) => s.toggleExpanded);
   const toggleVisible = useGraphStore((s) => s.toggleVisible);
-  const setSelectedNode = useGraphStore((s) => s.setSelectedNode);
+  const selectNode = useGraphStore((s) => s.selectNode);
   const enterFocus = useGraphStore((s) => s.enterFocus);
 
   if (!graph) return null;
@@ -29,7 +29,7 @@ const TreeItem = memo(function TreeItem({ nodeId, depth, searchQuery, matchingNo
 
   const isExpanded = expandedNodes.has(nodeId);
   const isVisible = visibleNodes.has(nodeId);
-  const isSelected = selectedNodeId === nodeId;
+  const isSelected = selectedNodeIds.has(nodeId);
   const hasChildren = node.children.length > 0;
 
   const icon = getIcon(node);
@@ -38,7 +38,7 @@ const TreeItem = memo(function TreeItem({ nodeId, depth, searchQuery, matchingNo
   return (
     <div>
       <div
-        onClick={() => setSelectedNode(nodeId)}
+        onClick={(e) => selectNode(nodeId, e.ctrlKey || e.metaKey)}
         style={{
           display: "flex",
           alignItems: "center",

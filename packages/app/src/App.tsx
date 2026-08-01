@@ -8,6 +8,7 @@ import { EdgeLegend } from "./canvas/legend/EdgeLegend";
 import { SelectionChip } from "./canvas/SelectionChip";
 import { useFocusHotkey } from "./canvas/useFocusHotkey";
 import { useEscapeKey } from "./canvas/useEscapeKey";
+import { useSelectionEscape } from "./canvas/useSelectionEscape";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { useGraphStore } from "./stores/graphStore";
 
@@ -20,6 +21,10 @@ export function App() {
   useFocusHotkey();
   // Esc backs out one focus frame at a time (see the precedence chain there).
   useEscapeKey();
+
+  // Esc clears the selection first; only an empty selection lets Esc through to
+  // the focus layer.
+  useSelectionEscape();
 
   // Save state when the app closes
   useEffect(() => {

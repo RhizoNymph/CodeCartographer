@@ -25,6 +25,15 @@ import {
   type FocusViewState,
 } from "./graphViewModel";
 import { useDebugStore } from "./debugStore";
+import {
+  EMPTY_SELECTION,
+  invalidateSelection,
+  reduceSelection,
+  resolveSelectionClick,
+  selectionFromStore,
+  selectionToStore,
+  type SelectionAction,
+} from "./selectionModel";
 
 /**
  * Convert the edge-less `ParseResult` IPC payload into the frontend `CodeGraph`,
@@ -75,6 +84,19 @@ interface GraphState {
    *  Controls both sidebar checkbox state and canvas node rendering.
    *  Independent from expandedNodes -- a node can be visible but collapsed. */
   visibleNodes: Set<string>;
+  /**
+   * The selected node set -- the source of truth for selection AND for the
+   * pinned edge highlight (selection and pin are the same concept). A plain
+   * click replaces it with one node, ctrl/cmd-click toggles membership, and an
+   * empty-canvas click or Esc clears it. Never mutated in place.
+   */
+  selectedNodeIds: ReadonlySet<string>;
+  /**
+   * The primary (last-selected) node, derived from `selectedNodeIds`.
+   * Invariant: null iff `selectedNodeIds` is empty, otherwise a member of it.
+   * This is what single-node consumers (SelectionChip, the F hotkey, the
+   * sidebar's active row) read.
+   */
   selectedNodeId: string | null;
   hoveredNodeId: string | null;
 
@@ -117,7 +139,15 @@ interface GraphState {
   toggleExpanded: (nodeId: string) => void;
   setExpanded: (nodeId: string, expanded: boolean) => void;
   toggleVisible: (nodeId: string) => void;
-  setSelectedNode: (nodeId: string | null) => void;
+  /**
+   * Select a node from a click. `additive` (ctrl/cmd held) toggles membership;
+   * otherwise the selection is replaced with just this node.
+   */
+  selectNode: (nodeId: string, additive?: boolean) => void;
+  /** Apply a selection action directly (used by the Esc handler and tests). */
+  applySelectionAction: (action: SelectionAction) => void;
+  /** Clear the selection (empty-canvas click, chip Clear button, Esc). */
+  clearSelection: () => void;
   setHoveredNode: (nodeId: string | null) => void;
   setHoveredEdge: (info: HoveredEdgeInfo | null) => void;
   toggleEdgeKind: (kind: EdgeKind) => void;
@@ -218,9 +248,15 @@ async function applyFocusState(
       focusStack: next.focusStack,
       focusNeighborhood: payload.neighborhood,
       focusEdgeDetail: payload.edgeDetail,
-      // Keep the selection on the frame being entered so the sidebar and chips
-      // agree with the canvas; an edge frame focuses a relation, not a node.
-      selectedNodeId: top.type === "node" ? top.nodeId : null,
+      // Keep the selection (and therefore the pin) on the frame being entered so
+      // the sidebar and chips agree with the canvas; an edge frame focuses a
+      // relation, not a node, so it clears the selection. Always written via
+      // selectionToStore so selectedNodeIds/selectedNodeId stay consistent.
+      ...selectionToStore(
+        top.type === "node"
+          ? reduceSelection(EMPTY_SELECTION, { kind: "replace", nodeId: top.nodeId })
+          : EMPTY_SELECTION
+      ),
       layoutVersion: get().layoutVersion + 1,
     });
   } catch (err) {
@@ -248,7 +284,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   parseProgress: null,
   expandedNodes: new Set<string>(),
   visibleNodes: new Set<string>(),
-  selectedNodeId: null,
+  ...selectionToStore(EMPTY_SELECTION),
   hoveredNodeId: null,
   hoveredEdgeInfo: null,
   enabledEdgeKinds: new Set<EdgeKind>(ALL_EDGE_KINDS),
@@ -314,6 +350,14 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       }
     }
 
+    // Selection is pinned across relayouts but not across graphs: ids that no
+    // longer exist are dropped (usually all of them on a fresh parse).
+    const cur = get();
+    const selection = invalidateSelection(
+      selectionFromStore(cur.selectedNodeIds, cur.selectedNodeId),
+      (id) => graph.nodes[id] !== undefined
+    );
+
     // Increment layoutVersion to trigger relayout. A fresh graph clears any
     // active focus.
     set({
@@ -322,6 +366,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       visibleNodes: visible,
       viewMode,
       focusStack: [],
+      ...selectionToStore(selection),
       focusNeighborhood: null,
       focusEdgeDetail: null,
       needsRelayout: false,
@@ -430,7 +475,22 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     set({ visibleNodes: visible, needsRelayout: true });
   },
 
-  setSelectedNode: (nodeId) => set({ selectedNodeId: nodeId }),
+  selectNode: (nodeId, additive = false) =>
+    get().applySelectionAction(
+      resolveSelectionClick(nodeId, { ctrlKey: additive, metaKey: false })
+    ),
+
+  applySelectionAction: (action) => {
+    const cur = get();
+    const next = reduceSelection(
+      selectionFromStore(cur.selectedNodeIds, cur.selectedNodeId),
+      action
+    );
+    set(selectionToStore(next));
+  },
+
+  clearSelection: () => get().applySelectionAction({ kind: "clear" }),
+
   setHoveredNode: (nodeId) => set({ hoveredNodeId: nodeId }),
   setHoveredEdge: (info) => set({ hoveredEdgeInfo: info }),
 

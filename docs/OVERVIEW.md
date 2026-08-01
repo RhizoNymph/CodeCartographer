@@ -23,11 +23,11 @@ Overview:
         5. Canvas derives the effective layout inputs from the zoom-level viewMode (default "module"): module view forces edge kinds to {Import} and treats files as collapsed (saved state preserved but ignored); symbol view uses the user's edge kinds + expansion; an active focus frame restricts visibility/expansion to the fetched focus ids (a node frame's neighborhood or an edge frame's edge detail). Canvas passes the (edge-less) graph + effective state to PixiRenderer.
         6. PixiRenderer delegates to elkLayout: build the ELK node tree, collect the render set (elkNodeIds), fetch per-view direct + aggregated edges via get_subgraph(render_ids, edge_kinds) computed server-side (direct edges carry a Resolution; ambiguous edges may be hidden client-side), then render nodes and edges on the Pixi.js canvas. Views over 1500 rendered nodes skip ELK edge routing and use straight-line fallback edges.
         7. The layout pass also derives per-kind edge counts for the view from that same SubGraph payload; PixiRenderer publishes them to edgeLegendStore once the layout is known to be current, and the bottom-left EdgeLegend overlay renders one row per edge kind (colour, name, count) which doubles as the edge-kind toggle UI.
-        8. User interactions (hover, select, expand, drag, zoom) update stores and trigger re-renders. Edge tooltips read kind + count from the layout edges (aggregated edges carry a collapsed count). Aggregated edges (count > 1) additionally render a world-space "×N" chip at the arc-length midpoint of their routed polyline, at the "detail" LOD only.
+        8. User interactions (hover, select, expand, drag, zoom) update stores and trigger re-renders. Selection is a node SET (`selectedNodeIds`, with `selectedNodeId` as the derived last-selected primary) and doubles as the pinned edge highlight: hovering previews a node's connections, clicking pins that same dim+highlight treatment so it survives unhover, and ctrl/cmd-clicking a second node switches the highlight to the induced subgraph (only edges with both endpoints selected). The pin is re-applied after every base-layer rebuild and invalidated when its nodes leave the graph. Edge tooltips read kind + count from the layout edges (aggregated edges carry a collapsed count). Aggregated edges (count > 1) additionally render a world-space "×N" chip at the arc-length midpoint of their routed polyline, at the "detail" LOD only.
         9. Focus / drill-down. Focus is a STACK of FocusFrames, each held next to its fetched payload; focusing again from inside a focused view pushes a deeper frame, and the canvas lays out ONLY the top frame's ids:
            - Node focus: the user focuses a node (F hotkey on the hovered/selected node, the canvas selection chip or Sidebar row Focus button, or a module-view File double-click) -> get_neighborhood(node_id, depth, edge_kinds, direction) runs a depth-bounded BFS in cc-core (both directions, callers only, or callees only -- direction applied at every hop) and returns the neighborhood node ids (incl. container chain) + direct edges. Depth and direction are per-frame.
            - Edge focus: the user double-clicks an AGGREGATED edge (count > 1) -> get_edge_detail(source_id, target_id, edge_kinds) runs cc-core's edge_detail, re-expanding that one aggregate into the underlying edges running from the source subtree into the target subtree (that direction only), plus their endpoints and container chain. Edge frames have no depth/direction.
-           Either way the store switches to symbol view. A breadcrumb trail (root "All" chip + one chip per frame -- node name or "source -> target" -- with the current frame carrying the 1/2-hop depth selector and callers|both|callees toggle for node frames) navigates back: clicking a chip pops to that frame, X clears the stack, Esc pops exactly one frame.
+           Either way the store switches to symbol view. A breadcrumb trail (root "All" chip + one chip per frame -- node name or "source -> target" -- with the current frame carrying the 1/2-hop depth selector and callers|both|callees toggle for node frames) navigates back: clicking a chip pops to that frame, X clears the stack, Esc pops exactly one frame -- and Esc only reaches the focus layer once the node selection is empty (see selection.md).
 
 Features Index:
     canvas-rendering:
@@ -35,6 +35,20 @@ Features Index:
         entry_points: [packages/app/src/canvas/renderers/PixiRenderer.ts, packages/app/src/canvas/Canvas.tsx, packages/app/src/canvas/renderers/edgeLabels.ts]
         depends_on: [graph-layout, palette]
         doc: docs/features/canvas-rendering.md
+
+    selection:
+        description: >
+            The selected node set is the source of truth for both selection and the pinned edge
+            highlight (they are the same concept -- there is no separate "pinned node" field).
+            Plain click replaces, ctrl/cmd-click toggles, empty-canvas click / chip Clear / Esc
+            clears. Highlight precedence is hover > pinned selection > none; 2+ selected nodes
+            highlight the INDUCED subgraph (both endpoints selected) instead of all connections.
+            Esc is consumed by the selection layer first (capture-phase listener) and only falls
+            through to focus handling when nothing is selected. All decisions live in the
+            dependency-free pure module selectionModel.ts.
+        entry_points: [packages/app/src/stores/selectionModel.ts, packages/app/src/stores/graphStore.ts, packages/app/src/canvas/useSelectionEscape.ts, packages/app/src/canvas/SelectionChip.tsx]
+        depends_on: [state-management, canvas-rendering]
+        doc: docs/features/selection.md
 
     palette:
         description: >
@@ -85,8 +99,8 @@ Features Index:
         doc: docs/features/zoom_views.md
 
     state-management:
-        description: Zustand stores for graph state (incl. viewMode, the focus stack and the top frame's neighborhood/edge-detail payload), viewport state, per-view edge-kind counts published by the layout pass (edgeLegendStore), debug logging, and per-folder persistence (expanded/visible/viewMode). Pure view derivation + focus reducers live in graphViewModel.ts.
-        entry_points: [packages/app/src/stores/graphStore.ts, packages/app/src/stores/graphViewModel.ts, packages/app/src/stores/viewportStore.ts, packages/app/src/stores/edgeLegendStore.ts, packages/app/src/stores/debugStore.ts]
+        description: Zustand stores for graph state (incl. viewMode, the focus stack and the top frame's neighborhood/edge-detail payload, and the selected node set + derived primary), viewport state, per-view edge-kind counts published by the layout pass (edgeLegendStore), debug logging, and per-folder persistence (expanded/visible/viewMode). Pure view derivation + focus reducers live in graphViewModel.ts; pure selection logic in selectionModel.ts.
+        entry_points: [packages/app/src/stores/graphStore.ts, packages/app/src/stores/graphViewModel.ts, packages/app/src/stores/selectionModel.ts, packages/app/src/stores/viewportStore.ts, packages/app/src/stores/edgeLegendStore.ts, packages/app/src/stores/debugStore.ts]
         depends_on: []
 
     sidebar:
