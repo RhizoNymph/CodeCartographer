@@ -22,14 +22,27 @@ Overview:
         5. Canvas derives the effective layout inputs from the zoom-level viewMode (default "module"): module view forces edge kinds to {Import} and treats files as collapsed (saved state preserved but ignored); symbol view uses the user's edge kinds + expansion; a focus neighborhood, when active, restricts visibility/expansion to the fetched neighborhood ids. Canvas passes the (edge-less) graph + effective state to PixiRenderer.
         6. PixiRenderer delegates to elkLayout: build the ELK node tree, collect the render set (elkNodeIds), fetch per-view direct + aggregated edges via get_subgraph(render_ids, edge_kinds) computed server-side (direct edges carry a Resolution; ambiguous edges may be hidden client-side), then render nodes and edges on the Pixi.js canvas. Views over 1500 rendered nodes skip ELK edge routing and use straight-line fallback edges.
         7. User interactions (hover, select, expand, drag, zoom) update stores and trigger re-renders. Edge tooltips read kind + count from the layout edges (aggregated edges carry a collapsed count). Aggregated edges (count > 1) additionally render a world-space "×N" chip at the arc-length midpoint of their routed polyline, at the "detail" LOD only.
-        8. Focus / drill-down: the user focuses a node (Sidebar/Tooltip Focus button, or a module-view File double-click) -> get_neighborhood(node_id, depth, edge_kinds) runs a bidirectional BFS in cc-core and returns the neighborhood node ids (incl. container chain) + direct edges -> the store switches to symbol view and the canvas lays out ONLY that neighborhood. A breadcrumb chip (depth selector + X) and Esc exit focus.
+        8. Focus / drill-down: the user focuses a node (F hotkey on the hovered/selected node, the canvas selection chip or Sidebar row Focus button, or a module-view File double-click) -> get_neighborhood(node_id, depth, edge_kinds) runs a bidirectional BFS in cc-core and returns the neighborhood node ids (incl. container chain) + direct edges -> the store switches to symbol view and the canvas lays out ONLY that neighborhood. A breadcrumb chip (depth selector + X) and Esc exit focus.
 
 Features Index:
     canvas-rendering:
         description: Interactive Pixi.js canvas with node rendering, edge drawing, minimap, drag, and LOD-based visibility. Aggregated (collapsed-container) edges carry "xN" count chips drawn at the arc-length midpoint of their routed polyline, shown at the "detail" LOD only and dimmed in step with the edge they label.
         entry_points: [packages/app/src/canvas/renderers/PixiRenderer.ts, packages/app/src/canvas/Canvas.tsx, packages/app/src/canvas/renderers/edgeLabels.ts]
-        depends_on: [graph-layout]
+        depends_on: [graph-layout, palette]
         doc: docs/features/canvas-rendering.md
+
+    palette:
+        description: >
+            The graph's colour vocabulary, built so a colour identifies exactly one category.
+            Five edge hues cover seven edge kinds -- FunctionCall/MethodCall share one "calls" hue and
+            Inheritance/TraitImpl share one "subtype relation" hue, while the kinds stay distinct in the
+            model, tooltips, toggles and EDGE_STYLES. Edges own the saturated end of the spectrum and
+            blocks/nodes the muted end; no hex (and no near-duplicate hex) is shared across EDGE_COLORS,
+            BLOCK_COLORS and NODE_COLORS, and every edge hue clears WCAG 3:1 against the dark canvas and
+            every node fill it can cross. Colour is frontend-only -- cc-core's EdgeKind carries none.
+        entry_points: [packages/app/src/api/types.ts, packages/app/src/canvas/renderers/types.ts]
+        depends_on: []
+        doc: docs/features/palette.md
 
     graph-layout:
         description: ELK-based hierarchical graph layout running in a web worker (elk-api + elk-worker.min.js?worker) so layout does not block the UI thread. Fetches per-view direct + aggregated edges from the backend (get_subgraph) rather than filtering client-side, feeds them to ELK for routing, and falls back to straight-line edges (also used as the layout guard for views over 1500 rendered nodes).
@@ -44,14 +57,14 @@ Features Index:
         doc: docs/features/server_side_graph_state.md
 
     parsing:
-        description: Tree-sitter based source code parsing using a trait-based LanguageSupport system. Extracts code blocks and raw references from Python, TypeScript, JavaScript, and Rust files. Includes extension probing for import resolution. Python extraction additionally emits clean dotted Import module paths (multi-name and aliased imports handled, alias clauses and imported symbol names excluded), module-level Constant/TypeAlias blocks (module body + single-identifier target only, so class fields and function locals never become nodes), leaf-only type annotation refs (builtins and typing constructs filtered), attribute/subscript/keyword-argument class bases, bare decorator refs, and dunder-aware visibility.
+        description: Tree-sitter based source code parsing using a trait-based LanguageSupport system. Extracts code blocks and raw references from Python, TypeScript, JavaScript, and Rust files. Includes extension probing for import resolution. Python extraction additionally emits clean dotted Import module paths (multi-name and aliased imports handled, alias clauses and imported symbol names excluded), edge-free ImportedSymbol bindings recording what each `from x import y as z` name denotes, module-level Constant/TypeAlias blocks (module body + single-identifier target only, so class fields and function locals never become nodes) plus PEP 695 `type X = Y` TypeAlias blocks (their declaration side never self-references), leaf-only type annotation refs including PEP 484 string forward references (builtins and typing constructs filtered; Literal/Annotated string *values* excluded), attribute/subscript/keyword-argument class bases, bare decorator refs, distinct SelfMethodCall refs for `self.x()`/`cls.x()` receivers, and dunder-aware visibility.
         entry_points: [crates/cc-core/src/parser/extract.rs, crates/cc-core/src/parser/language.rs, crates/cc-tauri/src/commands/parse.rs]
         depends_on: [graph-model]
         doc: docs/features/parsing.md
 
     resolution_precision:
-        description: Precision ladder that resolves each raw reference to the highest-confidence target (same-file > imported-file > single global match > up to 5 ambiguous candidates; more than 5 dropped). Every edge carries a Resolution; ambiguous edges are rendered dashed/dimmed and can be hidden via a toolbar toggle. Import resolution covers Python relative imports, Python absolute imports resolved against detected package roots (repo root, src/ dirs, package-chain parents -- nearest the importing file first, so src layouts and monorepo packages/*/ layouts work), Rust use paths, and TS/JS relative paths. Python .pyi stubs resolve as targets but always rank behind the real module.
-        entry_points: [crates/cc-core/src/resolver/symbol_table.rs, crates/cc-core/src/resolver/import_resolver.rs, crates/cc-core/src/resolver/python_roots.rs, crates/cc-tauri/src/commands/parse.rs]
+        description: Precision ladder that resolves each raw reference to the highest-confidence target (a `self.x()` member of the enclosing class > same-file > the module named by an explicit `from x import y` binding > any imported file > single global match > up to 5 ambiguous candidates; more than 5 dropped). The binding tier reads edge-free ImportedSymbol refs, so it pins the exact defining module and carries an `as` rename back to the original symbol name without changing edge volume. Every edge carries a Resolution; ambiguous edges are rendered dashed/dimmed and can be hidden via a toolbar toggle. Import resolution covers Python relative imports, Python absolute imports resolved against detected package roots (repo root, src/ dirs, package-chain parents -- nearest the importing file first, so src layouts and monorepo packages/*/ layouts work), Rust use paths, and TS/JS relative paths. All path lookups go through a PathIndex holding full file paths only, so an extension-less module path (./util, mypkg.util, crate::util) is answered by extension probing scoped to the importing file's language -- util.py, util.ts and util.rs never shadow each other in polyglot repos, and Python .pyi stubs always rank behind the real module.
+        entry_points: [crates/cc-core/src/resolver/symbol_table.rs, crates/cc-core/src/resolver/import_resolver.rs, crates/cc-core/src/resolver/path_index.rs, crates/cc-core/src/resolver/python_roots.rs, crates/cc-tauri/src/commands/parse.rs]
         depends_on: [parsing, graph-model, repo-scanning]
         doc: docs/features/resolution_precision.md
 
@@ -61,8 +74,8 @@ Features Index:
         depends_on: [graph-model]
 
     zoom-views:
-        description: Two zoom-level views selected by a toolbar segmented control. Module view (default on load) is the trustworthy zoomed-out import graph -- files render collapsed and only Import edges show, as DERIVED constraints over the user's saved state (never mutating it). Symbol view is the detailed expandable view with all enabled edge kinds. Focus mode drills into a bounded neighborhood of a node (cc-core Neighborhood BFS via get_neighborhood) so the full symbol graph is never laid out; entered from the Sidebar/Tooltip Focus buttons or a module-view File double-click, exited via a breadcrumb chip (name + 1/2-hop depth + X) or Esc. viewMode persists per folder.
-        entry_points: [packages/app/src/stores/graphViewModel.ts, packages/app/src/stores/graphStore.ts, packages/app/src/canvas/Canvas.tsx, packages/app/src/canvas/FocusBreadcrumb.tsx, crates/cc-core/src/model/graph.rs, crates/cc-tauri/src/commands/parse.rs]
+        description: Two zoom-level views selected by a toolbar segmented control. Module view (default on load) is the trustworthy zoomed-out import graph -- files render collapsed and only Import edges show, as DERIVED constraints over the user's saved state (never mutating it). Symbol view is the detailed expandable view with all enabled edge kinds. Focus mode drills into a bounded neighborhood of a node (cc-core Neighborhood BFS via get_neighborhood) so the full symbol graph is never laid out; entered via the F hotkey (hovered node, falling back to the selected one), the canvas selection chip or Sidebar row Focus button, or a module-view File double-click, exited via a breadcrumb chip (name + 1/2-hop depth + X) or Esc. Focus actions are never placed in the hover tooltip, which unmounts on pointerout before it can be clicked. viewMode persists per folder.
+        entry_points: [packages/app/src/stores/graphViewModel.ts, packages/app/src/stores/graphStore.ts, packages/app/src/canvas/Canvas.tsx, packages/app/src/canvas/FocusBreadcrumb.tsx, packages/app/src/canvas/SelectionChip.tsx, packages/app/src/canvas/focusHotkey.ts, crates/cc-core/src/model/graph.rs, crates/cc-tauri/src/commands/parse.rs]
         depends_on: [state-management, graph-layout, graph-model, resolution_precision]
         doc: docs/features/zoom_views.md
 

@@ -1,6 +1,6 @@
 import { Container, Graphics, Text, TextStyle } from "pixi.js";
 import type { CodeNode, BlockKind } from "../../api/types";
-import { BLOCK_COLORS } from "../../api/types";
+import { BLOCK_COLORS, NODE_COLORS } from "../../api/types";
 import type { LayoutNodePosition } from "../layout/elkLayout";
 import { drawNodeShape, DIRECTORY_TAB_HEIGHT } from "./shapes";
 
@@ -70,19 +70,26 @@ export function createNodeDisplay(
   };
 }
 
+/** Node fills darken their palette colour by this factor to recede. */
+export const BLOCK_FILL_DARKEN = 0.25;
+
+function hexToInt(hex: string): number {
+  return parseInt(hex.replace("#", ""), 16);
+}
+
 export function getNodeColor(node: CodeNode): number {
   switch (node.type) {
     case "Directory":
-      return 0x1e293b;
+      return hexToInt(NODE_COLORS.Directory);
     case "File":
-      return 0x1e3a5f;
+      return hexToInt(NODE_COLORS.File);
     case "CodeBlock": {
       const hex = BLOCK_COLORS[node.kind] || "#334155";
-      const base = parseInt(hex.replace("#", ""), 16);
+      const base = hexToInt(hex);
       // Darken for background
-      const r = Math.floor(((base >> 16) & 0xff) * 0.25);
-      const g = Math.floor(((base >> 8) & 0xff) * 0.25);
-      const b = Math.floor((base & 0xff) * 0.25);
+      const r = Math.floor(((base >> 16) & 0xff) * BLOCK_FILL_DARKEN);
+      const g = Math.floor(((base >> 8) & 0xff) * BLOCK_FILL_DARKEN);
+      const b = Math.floor((base & 0xff) * BLOCK_FILL_DARKEN);
       return (r << 16) | (g << 8) | b;
     }
   }

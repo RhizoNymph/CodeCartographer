@@ -154,6 +154,7 @@ Full base layer rebuilds only happen on layout/visibility/LOD/drag changes.
 | `packages/app/tests/nodeRenderer.test.ts` | Node labels, colors, blockKindPrefix, selected-node state machine, color constants |
 | `packages/app/tests/edgeGeometry.test.ts` | Edge routing geometry (anchorEdgePolyline, rerouteOrthogonalEdge) |
 | `packages/app/tests/edgeLabels.test.ts` | Arc-length midpoint, count-chip LOD/count predicate, chip alpha clamping, label formatting |
+| `packages/app/tests/palette.test.ts` | Palette invariants: merged edge hues, cross-map hex/near-duplicate collisions, saturation ordering, contrast on the dark canvas (see `docs/features/palette.md`) |
 
 ## Invariants and Constraints
 
