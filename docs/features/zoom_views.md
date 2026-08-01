@@ -13,19 +13,28 @@
   view; effective edge kinds are forced to `{Import}`).
 - Per-folder persistence of `viewMode` alongside `expandedNodes`/`visibleNodes`
   (backward compatible with states saved before `viewMode` existed).
-- **Focus mode** (drill-down): scope symbol detail to a bounded neighborhood of
-  a node so the full symbol graph is never laid out. Backed by the cc-core
-  `neighborhood` BFS query and the `get_neighborhood` Tauri command.
-- Focus entry points: the `F` hotkey (hovered node, falling back to the selected
-  one), the canvas selection chip's "Focus" button, the Sidebar row "Focus"
-  button (selected node), and module-view double-click on a File.
-- Focus exit: breadcrumb chip overlay (name + 1/2-hop depth selector + X) and
-  the Esc key.
+- **Focus mode** (drill-down), in two flavours described by a `FocusFrame`:
+  - **Node focus**: scope symbol detail to a bounded neighborhood of a node so
+    the full symbol graph is never laid out. Backed by the cc-core
+    `neighborhood` BFS query and the `get_neighborhood` Tauri command.
+  - **Edge focus**: drill into ONE aggregated `source -> target` view edge and
+    lay out exactly the symbol pairs behind it — the answer to "what are these
+    14 imports?". Backed by the cc-core `edge_detail` query and the
+    `get_edge_detail` Tauri command.
+- Node-focus entry points: the `F` hotkey (hovered node, falling back to the
+  selected one), the canvas selection chip's "Focus" button, the Sidebar row
+  "Focus" button (selected node), and module-view double-click on a File.
+- Edge-focus entry point: double-click on an AGGREGATED edge (a layout edge with
+  `count > 1`) on the canvas.
+- Focus exit: breadcrumb chip overlay (label + X, plus a 1/2-hop depth selector
+  for node focus only) and the Esc key.
 
 **Not in scope:**
 - Automatic view switching based on canvas zoom level (view is chosen
   deliberately via the toolbar / entry points).
-- Multi-focus / pinned neighborhoods (a single focus node at a time).
+- Multi-focus / pinned neighborhoods (a single focus frame at a time).
+- Drilling into a NON-aggregated (direct, `count == 1`) edge: it has no hidden
+  contents, so a double-click on one does nothing.
 - Persisting focus state across reloads (focus is transient; only `viewMode`
   persists).
 
@@ -53,11 +62,28 @@ PixiRenderer.updateGraph(graph, layoutExpanded, displayVisible,
        -> also derives LayoutResult.edgeKindCounts, which PixiRenderer publishes
           to edgeLegendStore for the EdgeLegend overlay
 
-Switching mode -> graphStore.setViewMode -> reduceSetViewMode + bump
-layoutVersion + persist. Entering module view drops any active focus.
+Switching mode -> graphStore.setViewMode -> reduceSetViewModeFrame + bump
+layoutVersion + persist. Entering module view drops any active focus frame.
 ```
 
-### Focus mode (drill-down)
+### Focus state shape
+
+```
+FocusFrame  (graphViewModel.ts) -- WHAT the user drilled into:
+  | { type: "node"; nodeId: string; depth: 1 | 2 }
+  | { type: "edge"; source: string; target: string }
+
+graphStore:
+  focusFrame        : FocusFrame | null      -- the active frame (identity)
+  focusNeighborhood : Neighborhood | null    -- payload for a "node" frame
+  focusEdgeDetail   : EdgeDetail | null      -- payload for an "edge" frame
+  focusDepth        : 1 | 2                  -- active node frame's depth, and
+                                                the default for the next focus
+
+Exactly one payload is non-null at a time, matching focusFrame.type.
+```
+
+### Node focus (neighborhood drill-down)
 
 ```
 enterFocus(nodeId, depth) [F hotkey / SelectionChip / Sidebar row /
@@ -68,20 +94,52 @@ enterFocus(nodeId, depth) [F hotkey / SelectionChip / Sidebar row /
             filtered to kinds; collect discovered nodes + direct edges among
             them (with resolution); add the container chain (parents up to root)
             of every discovered node.
-  -> store: viewMode="symbol", focusNodeId, focusDepth, focusNeighborhood,
-     selectedNode=nodeId, bump layoutVersion   (reduceEnterFocus)
+  -> store: viewMode="symbol", focusFrame={type:"node",nodeId,depth},
+     focusDepth, focusNeighborhood, focusEdgeDetail=null,
+     selectedNode=nodeId, bump layoutVersion   (reduceEnterNodeFocus)
+```
 
-Canvas (isFocused = focusNodeId && focusNeighborhood):
-  displayVisible   = focusVisibleNodes(graph, neighborhood.node_ids)
-  layoutExpanded   = focusExpandedNodes(graph, neighborhood.node_ids)
-                       (containers holding a neighborhood child)
-  -> renders ONLY the neighborhood ids; getSubgraph over exactly those render
-     ids reproduces the neighborhood's direct edges.
+### Edge focus (aggregated-edge drill-in)
 
-Breadcrumb chip (FocusBreadcrumb.tsx):
-  depth selector -> setFocusDepth(d) -> re-enterFocus(focusNodeId, d)
-  X / Esc        -> exitFocus -> clear focusNodeId + focusNeighborhood,
-                     bump layoutVersion (view mode stays "symbol")
+```
+double-click an aggregated layout edge (count > 1) on the canvas
+  [PixiRenderer viewport "pointertap": two taps within DOUBLE_TAP_MS that
+   hitTestEdge() resolves to the SAME edge; node hover/drag take priority]
+  -> enterEdgeFocus(source, target)
+  -> getEdgeDetail(source, target,
+                   effectiveEdgeKinds(enabledEdgeKinds, viewMode))  (Tauri IPC)
+       ^ the EFFECTIVE kinds, so the drill-in expands exactly the aggregate the
+         user clicked (module view -> {Import})
+       -> cc-core CodeGraph::edge_detail(source, target, kinds):
+            every edge of an enabled kind whose source endpoint is `source` or a
+            descendant of it AND whose target endpoint is `target` or a
+            descendant of it (that direction only); node_ids = those endpoints
+            plus the container chain up to root.
+  -> store: viewMode="symbol", focusFrame={type:"edge",source,target},
+     focusEdgeDetail, focusNeighborhood=null, selectedNode=null,
+     bump layoutVersion   (reduceEnterEdgeFocus)
+```
+
+### Shared focus rendering + exit
+
+```
+Canvas:
+  focusIds       = focusLayoutIds(focusFrame, focusNeighborhood, focusEdgeDetail)
+                     node frame -> neighborhood.node_ids
+                     edge frame -> edgeDetail.node_ids
+                     null       -> not focused, normal derivation applies
+  displayVisible = focusVisibleNodes(graph, focusIds)
+  layoutExpanded = focusExpandedNodes(graph, focusIds)
+                     (containers holding a focus-set child)
+  -> renders ONLY those ids; getSubgraph over exactly those render ids
+     reproduces the focus set's direct edges.
+
+Breadcrumb chip (FocusBreadcrumb.tsx), from focusBreadcrumbModel(graph, frame):
+  node frame -> name + depth selector -> setFocusDepth(d)
+                                          -> re-enterFocus(frame.nodeId, d)
+  edge frame -> "sourceName -> targetName", NO depth selector
+  X / Esc    -> exitFocus -> clear focusFrame + both payloads,
+                 bump layoutVersion (view mode stays "symbol")
 ```
 
 ### Canvas focus affordances (hotkey + selection chip)
@@ -89,7 +147,8 @@ Breadcrumb chip (FocusBreadcrumb.tsx):
 ```
 window keydown (useFocusHotkey, mounted in App)
   -> describeKeyEvent(e)                       (DOM -> plain fields)
-  -> resolveFocusHotkey(event, {hovered, selected, focusNodeId})   (PURE)
+  -> resolveFocusHotkey(event, {hovered, selected,
+                                focusNodeId: focusedNodeId(focusFrame)})  (PURE)
        "f"/"F", no ctrl/meta/alt, not typing in INPUT/TEXTAREA/SELECT
        or a contenteditable
        -> target = hoveredNodeId ?? selectedNodeId   (hover wins: enterFocus
@@ -97,7 +156,7 @@ window keydown (useFocusHotkey, mounted in App)
        -> {kind:"focus", nodeId} | {kind:"ignore", reason}
   -> enterFocus(nodeId)
 
-SelectionChip (top-centre overlay), shown when selectedNodeId && !focusNodeId:
+SelectionChip (top-centre overlay), shown when selectedNodeId && !focusFrame:
   name/kind + "Focus (F)" button -> enterFocus(selectedNodeId)
   x -> setSelectedNode(null)
   Selection is sticky (node pointerdown sets it, empty-space pointerdown
@@ -116,22 +175,36 @@ only -- it unmounts on pointerout, so a button there is unreachable.
     — the BFS query; `None` for unknown nodes; depth clamped to `1..=2`. Uses
     `forward_adj` + `reverse_adj` (both directions) and `build_parent_map` for
     the container chain. Neighborhood tests live in the same module.
+  - `EdgeDetail { source, target, node_ids, edges }` (serde) — result type for
+    aggregated-edge drill-in.
+  - `CodeGraph::edge_detail(source, target, enabled_edge_kinds) -> Option<EdgeDetail>`
+    — the edges that lift into the `source -> target` aggregate; `None` when
+    either id is unknown, an EMPTY detail when the ids are known but nothing
+    connects them. Uses `is_self_or_descendant` (over `is_ancestor_of` +
+    `build_parent_map`) for subtree scoping.
 - `crates/cc-tauri/src/commands/parse.rs`
   - `get_neighborhood(node_id, depth, edge_kinds, state) -> Result<Neighborhood, String>`
     — Tauri command; reads server-side `GraphState` (adjacency is populated via
     `add_edge` during parse and preserved in-process). `parse_edge_kinds` helper
     shared with `get_subgraph`.
-- `src-tauri/src/lib.rs` — registers `get_neighborhood` in the invoke handler.
+  - `get_edge_detail(source_id, target_id, edge_kinds, state) -> Result<EdgeDetail, String>`
+    — Tauri command for edge drill-in; same state + `parse_edge_kinds` helper.
+- `src-tauri/src/lib.rs` — registers `get_neighborhood` and `get_edge_detail` in
+  the invoke handler.
 
 ### Frontend (TypeScript)
 - `packages/app/src/stores/graphViewModel.ts` — PURE derivation + reducers:
   `effectiveExpandedNodes`, `effectiveEdgeKinds`, `effectiveHideAmbiguous`,
-  `focusVisibleNodes`, `focusExpandedNodes`, and the `FocusViewState` reducers
-  `reduceSetViewMode` / `reduceEnterFocus` / `reduceExitFocus`.
-- `packages/app/src/stores/graphStore.ts` — `viewMode`, `focusNodeId`,
-  `focusDepth`, `focusNeighborhood` state; `setViewMode`, `enterFocus`,
-  `setFocusDepth`, `exitFocus` actions; restores/persists `viewMode`; resets
-  focus on new graph.
+  `focusVisibleNodes`, `focusExpandedNodes`; the `FocusFrame` type and its
+  `FocusFrameState` reducers `reduceSetViewModeFrame` / `reduceEnterNodeFocus` /
+  `reduceEnterEdgeFocus` / `reduceExitFocusFrame`; and the frame accessors
+  `focusedNodeId`, `focusHasDepth`, `focusBreadcrumbModel`, `focusLayoutIds`.
+  (`FocusViewState` + `reduceSetViewMode`/`reduceEnterFocus`/`reduceExitFocus`
+  remain as the pre-frame node-only projection, covered by `focusReducer.test.ts`.)
+- `packages/app/src/stores/graphStore.ts` — `viewMode`, `focusFrame`,
+  `focusDepth`, `focusNeighborhood`, `focusEdgeDetail` state; `setViewMode`,
+  `enterFocus`, `enterEdgeFocus`, `setFocusDepth`, `exitFocus` actions;
+  restores/persists `viewMode`; resets focus on new graph.
 - `packages/app/src/stores/persistenceStore.ts` — `ViewMode` type; `viewMode`
   added to `FolderState` (optional; defaults to `"module"` for old states).
 - `packages/app/src/canvas/Canvas.tsx` — derives effective layout inputs and
@@ -157,17 +230,24 @@ only -- it unmounts on pointerout, so a button there is unreachable.
 - `packages/app/src/canvas/Tooltip.tsx` — hover tooltip; carries an
   "F focus" hint (no button — see the unreachability invariant).
 - `packages/app/src/canvas/renderers/PixiRenderer.ts` — module-view double-click
-  on a File calls `enterFocus` instead of `toggleExpanded`.
-- `packages/app/src/api/{types,commands}.ts` — `Neighborhood` type +
-  `getNeighborhood` command.
+  on a File calls `enterFocus` instead of `toggleExpanded`; `hitTestEdge()`
+  (shared by edge hover and edge double-click) plus the viewport `pointertap`
+  pairing that calls `enterEdgeFocus` for aggregated edges.
+- `packages/app/src/api/{types,commands}.ts` — `Neighborhood` + `EdgeDetail`
+  types; `getNeighborhood` + `getEdgeDetail` commands.
 
 ### Tests
 - `crates/cc-core/src/model/graph.rs` (tests) — neighborhood direction (callers
   AND callees), depth bounds, depth clamping, kind filtering, container-chain
-  inclusion, unknown-node error.
+  inclusion, unknown-node error; `edge_detail` unknown ids, descendant pair
+  collection, endpoints' own edge, reverse-direction exclusion, kind filtering,
+  subtree scoping (both endpoints, transitive), container chain, empty result.
 - `packages/app/tests/graphViewModel.test.ts` — module-view derivation + focus
   set derivation.
 - `packages/app/tests/focusReducer.test.ts` — focus/view reducer transitions.
+- `packages/app/tests/edgeFocus.test.ts` — frame reducers (incl. frame
+  replacement + purity), frame accessors, breadcrumb model, `focusLayoutIds`
+  payload selection, and edge-focus visible/expanded set derivation.
 - `packages/app/tests/focusHotkey.test.ts` — hotkey resolution: hover-over-
   selection precedence, modifier/typing/no-target/already-focused ignores.
 - `packages/app/tests/viewModePersistence.test.ts` — viewMode persistence
@@ -183,10 +263,32 @@ only -- it unmounts on pointerout, so a button there is unreachable.
   saved edge-kind toggles. The `EdgeLegend` overlay reflects this by showing a
   single, non-interactive Import row in module view.
 - **Default view is module** on load and for any saved state lacking `viewMode`.
-- **Focus renders only the neighborhood.** The full symbol graph is never laid
-  out; visibility/expansion are restricted to `neighborhood.node_ids`, which
-  always include the container chain up to the root so ELK can build the
-  containment tree.
+- **Focus renders only the focus set.** The full symbol graph is never laid out;
+  visibility/expansion are restricted to `focusLayoutIds(...)` — a node frame's
+  `neighborhood.node_ids` or an edge frame's `edgeDetail.node_ids`. Both always
+  include the container chain up to the root so ELK can build the containment
+  tree; that shared convention is what lets one derivation serve both frames.
+- **The frame is the identity of the focus; the payload is a cache.** Exactly one
+  of `focusNeighborhood` / `focusEdgeDetail` is non-null at a time, matching
+  `focusFrame.type`; entering either kind of focus clears the other payload, and
+  `focusLayoutIds` returns null (falling back to normal derivation) rather than
+  mixing a frame with the wrong payload.
+- **Edge drill-in is exact and directional.** `edge_detail` returns precisely the
+  edges that lift into the clicked `source -> target` aggregate: kind-filtered,
+  both endpoints scoped to their subtrees, and `target -> source` traffic
+  excluded (it is a different aggregate with its own arrow).
+- **Edge drill-in uses the EFFECTIVE edge kinds.** `enterEdgeFocus` passes
+  `effectiveEdgeKinds(enabledEdgeKinds, viewMode)`, the same set the layout pass
+  used to build the aggregate, so the expansion matches what was clicked
+  (module view -> `{Import}`).
+- **Only aggregated edges are drillable.** A double-click is ignored unless the
+  layout edge has `count > 1`; a direct edge already shows its endpoints.
+- **Depth applies to node focus only.** The breadcrumb hides the depth selector
+  for an edge frame (`focusHasDepth`), and `setFocusDepth` on a non-node frame
+  only records the preference for the next node focus.
+- **Edge double-click never disturbs single-click or hover.** Node hover and
+  active drags short-circuit the handler, and the two taps must resolve to the
+  SAME edge (via the shared `hitTestEdge`) within the double-click window.
 - **Neighborhood BFS is bidirectional and bounded.** It follows both
   `forward_adj` (callees) and `reverse_adj` (callers), depth is clamped to
   `1..=2`, and is filtered to the requested edge kinds. Container-chain-only
@@ -194,6 +296,7 @@ only -- it unmounts on pointerout, so a button there is unreachable.
 - **Adjacency availability.** `forward_adj`/`reverse_adj` are `#[serde(skip)]`
   and built by `add_edge`; the server-side state graph retains them in-process,
   so `get_neighborhood` works without an explicit `rebuild_adjacency`.
+  (`edge_detail` scans `edges` directly and needs no adjacency at all.)
 - **Focus is transient.** Only `viewMode` persists; focus clears on new graph
   load and on switching to module view.
 - **Hover-driven overlays never hold actions.** The tooltip unmounts on
@@ -207,4 +310,4 @@ only -- it unmounts on pointerout, so a button there is unreachable.
   contenteditable (e.g. sidebar search) types normally, as does any `f` with
   ctrl/meta/alt held.
 - **One top-centre chip at a time.** `SelectionChip` renders only when
-  `focusNodeId` is null; `FocusBreadcrumb` only when it is set.
+  `focusFrame` is null; `FocusBreadcrumb` only when it is set.

@@ -32,11 +32,11 @@ const chipStyle: React.CSSProperties = {
 export function SelectionChip() {
   const graph = useGraphStore((s) => s.graph);
   const selectedNodeId = useGraphStore((s) => s.selectedNodeId);
-  const focusNodeId = useGraphStore((s) => s.focusNodeId);
+  const focusFrame = useGraphStore((s) => s.focusFrame);
   const enterFocus = useGraphStore((s) => s.enterFocus);
   const setSelectedNode = useGraphStore((s) => s.setSelectedNode);
 
-  if (!graph || !selectedNodeId || focusNodeId) return null;
+  if (!graph || !selectedNodeId || focusFrame) return null;
 
   const node = graph.nodes[selectedNodeId];
   if (!node) return null;

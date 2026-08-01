@@ -6,6 +6,9 @@ In scope:
 - Pixi.js-based interactive graph rendering (nodes, edges, minimap)
 - Node creation, styling, and interaction (click, drag, hover, double-click)
 - Edge drawing with LOD-based opacity/width, hover highlighting, and orthogonal routing
+- Edge pointer interaction: distance-based hit testing for hover, and
+  double-click on an aggregated edge to drill into it (the focus transition
+  itself lives in zoom_views)
 - "×N" count chips on aggregated (collapsed-container) edges
 - Minimap overlay showing node positions and viewport rectangle
 - Drag-and-drop with ancestor chain resizing
@@ -28,7 +31,15 @@ The PixiRenderer (orchestrator) delegates to focused sub-modules:
    - Constructor, init, destroy lifecycle
    - `updateGraph()`, `renderFromLayout()`, `updateVisibility()`
    - `setHoveredNode()`, `setSelectedNode()`, `zoomToNode()`
-   - Wires up interaction event handlers on node displays
+   - `hitTestEdge(globalPos)`: nearest rendered edge within a screen-space radius
+     (`EDGE_HIT_RADIUS_PX`), via `pointToPolylineDistance` over the routed
+     polylines. Edges are not Pixi interactive objects, so both edge hover and
+     edge double-click resolve through this one hit test.
+   - Wires up interaction event handlers on node displays, plus viewport-level
+     edge interactions: throttled hover, and a `pointertap` pair (two taps on the
+     SAME edge within `DOUBLE_TAP_MS`) that drills into an AGGREGATED edge
+     (`count > 1`) via `enterEdgeFocus` — see docs/features/zoom_views.md. Node
+     hover and active drags short-circuit both, so node interactions win.
    - Delegates to EdgeDrawingManager, MinimapRenderer, DragManager
 
 2. **edgeDrawing.ts** (~425 lines) - Edge rendering with two-layer architecture

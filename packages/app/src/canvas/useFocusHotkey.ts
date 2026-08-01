@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { useGraphStore } from "../stores/graphStore";
 import { resolveFocusHotkey, type FocusHotkeyEvent } from "./focusHotkey";
+import { focusedNodeId } from "../stores/graphViewModel";
 
 /** Project a DOM keydown onto the fields the pure resolver needs. */
 function describeKeyEvent(e: KeyboardEvent): FocusHotkeyEvent {
@@ -29,7 +30,7 @@ export function useFocusHotkey() {
       const result = resolveFocusHotkey(describeKeyEvent(e), {
         hoveredNodeId: store.hoveredNodeId,
         selectedNodeId: store.selectedNodeId,
-        focusNodeId: store.focusNodeId,
+        focusNodeId: focusedNodeId(store.focusFrame),
       });
       if (result.kind !== "focus") return;
       e.preventDefault();

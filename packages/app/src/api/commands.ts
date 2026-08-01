@@ -1,5 +1,5 @@
 import { invoke, Channel } from "@tauri-apps/api/core";
-import type { ParseEvent, ParseResult, SubGraph, Neighborhood } from "./types";
+import type { ParseEvent, ParseResult, SubGraph, Neighborhood, EdgeDetail } from "./types";
 
 export async function scanRepo(path: string): Promise<ParseResult> {
   return invoke<ParseResult>("scan_repo", { path });
@@ -47,6 +47,23 @@ export async function getNeighborhood(
   return invoke<Neighborhood>("get_neighborhood", {
     nodeId,
     depth,
+    edgeKinds,
+  });
+}
+
+/**
+ * Expand one aggregated `sourceId -> targetId` view edge into the underlying
+ * edges behind it (that direction only), filtered to `edgeKinds`. Returns those
+ * edges and the node ids to lay out (endpoints + container chain).
+ */
+export async function getEdgeDetail(
+  sourceId: string,
+  targetId: string,
+  edgeKinds: string[]
+): Promise<EdgeDetail> {
+  return invoke<EdgeDetail>("get_edge_detail", {
+    sourceId,
+    targetId,
     edgeKinds,
   });
 }

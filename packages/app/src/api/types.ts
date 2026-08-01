@@ -138,6 +138,21 @@ export interface Neighborhood {
   edges: CodeEdge[];
 }
 
+/**
+ * The underlying edges behind ONE aggregated view edge, returned by
+ * `get_edge_detail` when the user drills into an aggregated edge. `edges` are
+ * the graph edges running from the `source` subtree into the `target` subtree
+ * (that direction only); `node_ids` are their endpoints plus the container chain
+ * up to the root, using the same convention as `Neighborhood.node_ids` so the
+ * ELK containment tree builds identically.
+ */
+export interface EdgeDetail {
+  source: string;
+  target: string;
+  node_ids: string[];
+  edges: CodeEdge[];
+}
+
 export type ParseEvent =
   | { type: "FileStart"; path: string }
   | { type: "FileDone"; path: string; blocks: number }

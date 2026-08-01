@@ -393,6 +393,93 @@ impl CodeGraph {
     }
 }
 
+/// The underlying edges behind ONE aggregated view edge, for drill-in.
+///
+/// An aggregated `source -> target` edge in a view collapses every graph edge
+/// running from the `source` subtree into the `target` subtree. `EdgeDetail`
+/// re-expands exactly that set: `edges` are those underlying edges (direction
+/// preserved -- `target -> source` traffic is a different aggregate and never
+/// appears here), and `node_ids` are their endpoints plus the container chain
+/// (parents up to the root) of each endpoint, matching `Neighborhood.node_ids`
+/// so the frontend builds the ELK containment tree identically.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EdgeDetail {
+    pub source: NodeId,
+    pub target: NodeId,
+    pub node_ids: Vec<NodeId>,
+    pub edges: Vec<CodeEdge>,
+}
+
+/// Return true if `node_id` is `container` itself or any of its descendants.
+fn is_self_or_descendant(
+    node_id: &NodeId,
+    container: &NodeId,
+    parent_map: &HashMap<NodeId, NodeId>,
+) -> bool {
+    node_id == container || is_ancestor_of(container, node_id, parent_map)
+}
+
+impl CodeGraph {
+    /// Expand the aggregated `source -> target` edge into its contributing graph
+    /// edges: every edge whose kind is in `enabled_edge_kinds`, whose source
+    /// endpoint is `source` or a descendant of it, AND whose target endpoint is
+    /// `target` or a descendant of it. Returns `None` if either id is unknown.
+    ///
+    /// Direction is significant: this is the exact set of edges that lifts into
+    /// the `source -> target` aggregate, never the reverse one. When nothing
+    /// matches, the returned detail is empty (not `None`) -- the endpoints exist,
+    /// there is simply no traffic between them under these kinds.
+    pub fn edge_detail(
+        &self,
+        source: &NodeId,
+        target: &NodeId,
+        enabled_edge_kinds: &HashSet<EdgeKind>,
+    ) -> Option<EdgeDetail> {
+        if !self.nodes.contains_key(source) || !self.nodes.contains_key(target) {
+            return None;
+        }
+        let parent_map = build_parent_map(self);
+
+        let edges: Vec<CodeEdge> = self
+            .edges
+            .iter()
+            .filter(|e| {
+                enabled_edge_kinds.contains(&e.kind)
+                    && is_self_or_descendant(&e.source, source, &parent_map)
+                    && is_self_or_descendant(&e.target, target, &parent_map)
+            })
+            .cloned()
+            .collect();
+
+        // Endpoints plus their container chains, so the frontend can build the
+        // containment tree (same convention as `Neighborhood.node_ids`).
+        let mut node_set: HashSet<NodeId> = HashSet::new();
+        for e in edges.iter() {
+            node_set.insert(e.source.clone());
+            node_set.insert(e.target.clone());
+        }
+        for node in node_set.clone().iter() {
+            let mut current = node.clone();
+            while let Some(parent) = parent_map.get(&current) {
+                if !node_set.insert(parent.clone()) {
+                    break;
+                }
+                current = parent.clone();
+            }
+        }
+
+        let mut node_ids: Vec<NodeId> = node_set.into_iter().collect();
+        node_ids.sort_by(|a, b| a.0.cmp(&b.0));
+
+        Some(EdgeDetail {
+            source: source.clone(),
+            target: target.clone(),
+            node_ids,
+            edges,
+        })
+    }
+}
+
 /// The edge-less parse response sent over IPC.
 ///
 /// The full graph (nodes + edges) stays in server-side state; the frontend
@@ -1155,5 +1242,164 @@ mod tests {
         assert_eq!(n.edges.len(), 1);
         assert_eq!(n.edges[0].source, NodeId("fnA1".into()));
         assert_eq!(n.edges[0].target, NodeId("fnB1".into()));
+    }
+
+    // --- EdgeDetail (aggregated-edge drill-in) tests ---
+
+    fn detail(g: &CodeGraph, source: &str, target: &str) -> EdgeDetail {
+        g.edge_detail(
+            &NodeId(source.into()),
+            &NodeId(target.into()),
+            &all_kinds(),
+        )
+        .expect("known endpoints")
+    }
+
+    fn edge_pairs(d: &EdgeDetail) -> HashSet<(&str, &str)> {
+        d.edges
+            .iter()
+            .map(|e| (e.source.0.as_str(), e.target.0.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn edge_detail_unknown_ids_return_none() {
+        let g = sample_graph();
+        assert!(g
+            .edge_detail(
+                &NodeId("nope".into()),
+                &NodeId("fileB".into()),
+                &all_kinds()
+            )
+            .is_none());
+        assert!(g
+            .edge_detail(
+                &NodeId("fileA".into()),
+                &NodeId("nope".into()),
+                &all_kinds()
+            )
+            .is_none());
+    }
+
+    #[test]
+    fn edge_detail_collects_every_contributing_descendant_pair() {
+        // Two block-level calls both lift into the same fileA -> fileB aggregate.
+        let mut g = sample_graph();
+        g.add_edge(edge("fnA1", "fnB1", EdgeKind::FunctionCall));
+        g.add_edge(edge("fnA2", "fnB1", EdgeKind::FunctionCall));
+
+        let d = detail(&g, "fileA", "fileB");
+        assert_eq!(d.source, NodeId("fileA".into()));
+        assert_eq!(d.target, NodeId("fileB".into()));
+        assert_eq!(
+            edge_pairs(&d),
+            [("fnA1", "fnB1"), ("fnA2", "fnB1")].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn edge_detail_includes_the_endpoints_own_edge() {
+        // An edge whose endpoints ARE the queried pair (not descendants of it)
+        // contributes too -- "self or descendant" on both sides.
+        let mut g = sample_graph();
+        g.add_edge(edge("fileA", "fileB", EdgeKind::Import));
+        g.add_edge(edge("fnA1", "fileB", EdgeKind::Import));
+
+        let d = detail(&g, "fileA", "fileB");
+        assert_eq!(
+            edge_pairs(&d),
+            [("fileA", "fileB"), ("fnA1", "fileB")].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn edge_detail_excludes_the_reverse_direction() {
+        // fileB -> fileA traffic must never appear in the fileA -> fileB drill-in.
+        let mut g = sample_graph();
+        g.add_edge(edge("fnA1", "fnB1", EdgeKind::FunctionCall));
+        g.add_edge(edge("fnB1", "fnA2", EdgeKind::FunctionCall));
+
+        let d = detail(&g, "fileA", "fileB");
+        assert_eq!(edge_pairs(&d), [("fnA1", "fnB1")].into_iter().collect());
+        assert!(
+            !d.node_ids.contains(&NodeId("fnA2".into())),
+            "the reverse edge's endpoint is not part of this drill-in"
+        );
+    }
+
+    #[test]
+    fn edge_detail_filters_by_edge_kind() {
+        let mut g = sample_graph();
+        g.add_edge(edge("fnA1", "fnB1", EdgeKind::Import));
+        g.add_edge(edge("fnA2", "fnB1", EdgeKind::FunctionCall));
+
+        let d = g
+            .edge_detail(
+                &NodeId("fileA".into()),
+                &NodeId("fileB".into()),
+                &only_import(),
+            )
+            .unwrap();
+        assert_eq!(edge_pairs(&d), [("fnA1", "fnB1")].into_iter().collect());
+        assert!(d.edges.iter().all(|e| e.kind == EdgeKind::Import));
+        assert!(
+            !d.node_ids.contains(&NodeId("fnA2".into())),
+            "kind-filtered-out endpoints are excluded"
+        );
+    }
+
+    #[test]
+    fn edge_detail_scopes_both_endpoints_to_their_subtrees() {
+        // fnA1 -> fnA2 lives entirely inside fileA: it contributes to the
+        // fileA -> fileA drill-in but never to fileA -> fileB.
+        let mut g = sample_graph();
+        g.add_edge(edge("fnA1", "fnA2", EdgeKind::FunctionCall));
+        g.add_edge(edge("fnA2", "fnB1", EdgeKind::FunctionCall));
+
+        let cross = detail(&g, "fileA", "fileB");
+        assert_eq!(edge_pairs(&cross), [("fnA2", "fnB1")].into_iter().collect());
+
+        let internal = detail(&g, "fileA", "fileA");
+        assert_eq!(
+            edge_pairs(&internal),
+            [("fnA1", "fnA2")].into_iter().collect()
+        );
+    }
+
+    #[test]
+    fn edge_detail_scopes_to_transitive_descendants() {
+        // Querying the root container picks up edges nested two levels down.
+        let mut g = sample_graph();
+        g.add_edge(edge("fnA1", "fnB1", EdgeKind::FunctionCall));
+
+        let d = detail(&g, "root", "root");
+        assert_eq!(edge_pairs(&d), [("fnA1", "fnB1")].into_iter().collect());
+    }
+
+    #[test]
+    fn edge_detail_includes_container_chain_of_every_endpoint() {
+        let mut g = sample_graph();
+        g.add_edge(edge("fnA1", "fnB1", EdgeKind::FunctionCall));
+
+        let d = detail(&g, "fileA", "fileB");
+        let ids: HashSet<&str> = d.node_ids.iter().map(|id| id.0.as_str()).collect();
+        assert!(ids.contains("fnA1"));
+        assert!(ids.contains("fnB1"));
+        assert!(ids.contains("fileA"), "container of fnA1");
+        assert!(ids.contains("fileB"), "container of fnB1");
+        assert!(ids.contains("root"), "root of the container chain");
+        assert!(
+            !ids.contains("fnA2"),
+            "unrelated siblings are not part of the drill-in"
+        );
+    }
+
+    #[test]
+    fn edge_detail_with_no_contributing_edges_is_empty_not_none() {
+        // Known endpoints with nothing between them: a well-formed empty detail.
+        let g = sample_graph();
+        let d = detail(&g, "fileA", "fileB");
+        assert!(d.edges.is_empty());
+        assert!(d.node_ids.is_empty());
     }
 }
