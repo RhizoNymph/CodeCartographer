@@ -129,18 +129,15 @@ palette change automatically.
 - **The overlay must not block the canvas.** The panel sizes to its content and
   is the only element with pointer events; there is no full-size wrapper.
 
-## Known limitation (backend)
+## Per-kind aggregation (backend)
 
-`SubGraph::from_graph` keys `aggregated_edges` on `(source, target)` **without**
-the kind, labelling each aggregated edge with the first kind it saw and summing
-`count` across kinds. So when more than one kind is fetched, an aggregated edge's
-whole count is attributed to a single kind. The total across kinds stays correct,
-but the per-kind split can be off wherever collapsed containers mix kinds. Module
-view is unaffected (only `Import` is ever fetched), as is any symbol view with a
-single kind enabled.
+`SubGraph::from_graph` keys `aggregated_edges` on `(source, target, kind)` --
+one aggregate per kind and pair -- so the legend's per-kind counts over
+aggregated edges are exact in every view. (Before this, aggregates were keyed on
+the pair alone, labelled with the first kind seen, and summed counts across
+kinds, making the split approximate whenever collapsed containers mixed kinds.)
 
-For the same reason the frontend must NOT "fetch all kinds once and filter by
-kind client-side": aggregated edges are not decomposable by kind after the fact,
-and `direct_pairs` suppression is computed from the enabled set, so the result
-would differ from a narrower request. Fixing this properly means keying the
-backend's `agg_map` on `(source, target, kind)`.
+The frontend still fetches only the enabled kinds rather than fetching all kinds
+and filtering client-side -- per-kind keying makes the result decomposable by
+kind, but narrower requests keep the payload proportional to what is actually
+rendered.

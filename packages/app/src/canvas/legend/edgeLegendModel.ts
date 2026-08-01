@@ -61,12 +61,8 @@ export function unknownEdgeKindCounts(): EdgeKindCounts {
  * dropped from the layout, so they must not be counted either. Aggregated edges
  * carry no single resolution and are rendered -- and counted -- regardless.
  *
- * Known limitation: the backend keys aggregated edges on (source, target) only
- * and labels each with the first kind it saw, so when more than one kind is
- * fetched an aggregated edge's whole count is attributed to that one kind. The
- * total across kinds stays correct; the split can be off wherever collapsed
- * containers mix kinds. A proper fix means keying the backend's agg_map on
- * (source, target, kind).
+ * The backend keys aggregated edges on (source, target, kind) -- one aggregate
+ * per kind and pair -- so per-kind counts over aggregated edges are exact.
  */
 export function deriveEdgeKindCounts(
   subgraph: SubGraph,
