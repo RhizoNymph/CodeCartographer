@@ -20,6 +20,7 @@ export function Canvas() {
     graph,
     expandedNodes,
     visibleNodes,
+    selectedNodeIds,
     selectedNodeId,
     hoveredNodeId,
     enabledEdgeKinds,
@@ -34,6 +35,7 @@ export function Canvas() {
       graph: s.graph,
       expandedNodes: s.expandedNodes,
       visibleNodes: s.visibleNodes,
+      selectedNodeIds: s.selectedNodeIds,
       selectedNodeId: s.selectedNodeId,
       hoveredNodeId: s.hoveredNodeId,
       enabledEdgeKinds: s.enabledEdgeKinds,
@@ -135,9 +137,9 @@ export function Canvas() {
 
   useEffect(() => {
     if (rendererRef.current) {
-      rendererRef.current.setSelectedNode(selectedNodeId);
+      rendererRef.current.setSelection(selectedNodeIds, selectedNodeId);
     }
-  }, [selectedNodeId]);
+  }, [selectedNodeIds, selectedNodeId]);
 
   useEffect(() => {
     if (rendererRef.current) {

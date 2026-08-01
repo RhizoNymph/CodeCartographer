@@ -18,10 +18,9 @@ export interface NodeDisplay {
  * Event handlers are NOT attached here -- the caller is responsible.
  */
 export function createNodeDisplay(
-  nodeId: string,
   node: CodeNode,
   pos: LayoutNodePosition,
-  selectedNodeId: string | null
+  isSelected: boolean
 ): NodeDisplay {
   const container = new Container();
   container.x = pos.x;
@@ -32,8 +31,8 @@ export function createNodeDisplay(
   // Background
   const bg = new Graphics();
   const color = getNodeColor(node);
-  const borderColor = selectedNodeId === nodeId ? 0x60a5fa : 0x334155;
-  const borderWidth = selectedNodeId === nodeId ? 3 : 1;
+  const borderColor = isSelected ? 0x60a5fa : 0x334155;
+  const borderWidth = isSelected ? 3 : 1;
 
   drawNodeShape(bg, node, pos.width, pos.height, color, borderColor, borderWidth);
 

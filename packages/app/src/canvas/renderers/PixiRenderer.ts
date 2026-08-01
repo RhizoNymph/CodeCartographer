@@ -3,6 +3,15 @@ import { Viewport } from "pixi-viewport";
 import type { CodeGraph, CodeNode, EdgeKind } from "../../api/types";
 import { layoutGraph, type LayoutResult, type LayoutNodePosition } from "../layout/elkLayout";
 import { useGraphStore } from "../../stores/graphStore";
+import {
+  EMPTY_SELECTION,
+  highlightDimsBaseLayer,
+  resolveHighlightSource,
+  selectionFromStore,
+  selectionIds,
+  type HighlightSource,
+  type SelectionState,
+} from "../../stores/selectionModel";
 import { useViewportStore, type LODLevel } from "../../stores/viewportStore";
 import { useDebugStore } from "../../stores/debugStore";
 import { useEdgeLegendStore } from "../../stores/edgeLegendStore";
@@ -30,7 +39,8 @@ export class PixiRenderer {
   private resizeObserver: ResizeObserver;
   private containerEl: HTMLElement;
   private initialized = false;
-  private selectedNodeId: string | null = null;
+  /** Mirror of the store's selection; also the pinned edge highlight. */
+  private selection: SelectionState = EMPTY_SELECTION;
   private currentLOD: LODLevel = "detail";
   private lastLayout: LayoutResult | null = null;
   private currentGraph: CodeGraph | null = null;
@@ -144,10 +154,10 @@ export class PixiRenderer {
       }
     });
 
-    // Click on empty space to deselect
+    // Click on empty space to deselect (which also drops the pinned highlight)
     this.viewport.on("pointerdown", () => {
       if (!this.dragManager.dragTarget) {
-        useGraphStore.getState().setSelectedNode(null);
+        useGraphStore.getState().clearSelection();
       }
     });
 
@@ -330,9 +340,12 @@ export class PixiRenderer {
       this.addNodeDisplay(nodeId, node, pos, expandedNodes.has(nodeId));
     }
 
-    // Draw edges
+    // Draw edges. Recomputing the highlight here is what re-applies a pinned
+    // selection after a layout/visibility rebuild.
     this.edgeManager.buildEdgeData(layout);
-    this.rebuildHoveredEdgeIndices();
+    this.rebuildHighlightedEdgeIndices(
+      resolveHighlightSource(this.hoveredNodeId, this.selection)
+    );
     this.triggerEdgeRedraw();
 
     // Initial LOD update
@@ -372,12 +385,13 @@ export class PixiRenderer {
     pos: LayoutNodePosition,
     _isExpanded: boolean
   ) {
-    const display = createNodeDisplay(nodeId, node, pos, this.selectedNodeId);
+    const display = createNodeDisplay(node, pos, this.isSelected(nodeId));
 
-    // Click handler
+    // Click handler. Ctrl/Cmd-click toggles membership of the selection set
+    // (multi-select); a plain click replaces it.
     display.container.on("pointerdown", (e) => {
       e.stopPropagation();
-      useGraphStore.getState().setSelectedNode(nodeId);
+      useGraphStore.getState().selectNode(nodeId, e.ctrlKey || e.metaKey);
 
       const local = this.viewport.toLocal(e.global);
       const descendants = this.dragManager.collectDescendants(
@@ -422,7 +436,7 @@ export class PixiRenderer {
           this.currentGraph,
           this.nodeDisplays,
           this.currentVisibleNodes,
-          this.selectedNodeId,
+          selectionIds(this.selection),
           this.lastLayout
         );
         this.edgeManager.scheduleEdgeRedraw(() => {
@@ -484,36 +498,79 @@ export class PixiRenderer {
   /**
    * Set the hovered node and update edge highlighting.
    *
-   * Uses the two-layer optimisation in EdgeDrawingManager: on hover we only
-   * rebuild the lightweight highlight layer instead of destroying and
-   * recreating all edge graphics.
+   * Uses the two-layer optimisation in EdgeDrawingManager: we only rebuild the
+   * lightweight highlight layer instead of destroying and recreating all edge
+   * graphics. Unhovering falls back to the pinned selection's highlight rather
+   * than to full opacity (see `resolveHighlightSource`).
    */
   setHoveredNode(nodeId: string | null) {
     if (this.hoveredNodeId === nodeId) return;
     this.hoveredNodeId = nodeId;
-    this.rebuildHoveredEdgeIndices();
+    this.applyHighlight();
+  }
 
-    // Try a hover-only update (highlight layer only).
+  /**
+   * Recompute which edges are highlighted from the current hover + selection,
+   * then push the result onto the edge layers.
+   */
+  private applyHighlight() {
+    const source = resolveHighlightSource(this.hoveredNodeId, this.selection);
+    this.rebuildHighlightedEdgeIndices(source);
+
+    // Try a highlight-only update (highlight layer only).
     // Falls back to a full redraw if the base layer doesn't exist yet.
-    const handled = this.edgeManager.setHoveredNode(nodeId);
+    const handled = this.edgeManager.setHighlightActive(
+      highlightDimsBaseLayer(source)
+    );
     if (!handled) {
       this.triggerEdgeRedraw();
     }
   }
 
-  private rebuildHoveredEdgeIndices() {
-    this.edgeManager.highlightedEdgeIndices.clear();
+  /**
+   * Fill `highlightedEdgeIndices` for a highlight source.
+   *
+   * `connected` lights every edge touching the node's subtree; `induced` lights
+   * only edges whose BOTH endpoints fall inside the union of the selected
+   * nodes' subtrees (so selecting two collapsed files shows exactly the traffic
+   * between them).
+   */
+  private rebuildHighlightedEdgeIndices(source: HighlightSource) {
+    const indices = this.edgeManager.highlightedEdgeIndices;
+    indices.clear();
 
-    if (!this.hoveredNodeId) {
+    if (source.mode === "none") {
       return;
     }
 
-    for (const id of this.collectNodeSubtreeIds(this.hoveredNodeId)) {
-      const indices = this.edgeManager.nodeToEdgeIndices.get(id);
-      if (!indices) continue;
+    if (source.mode === "connected") {
+      for (const id of this.collectNodeSubtreeIds(source.nodeId)) {
+        const edgeIndices = this.edgeManager.nodeToEdgeIndices.get(id);
+        if (!edgeIndices) continue;
 
-      for (const idx of indices) {
-        this.edgeManager.highlightedEdgeIndices.add(idx);
+        for (const idx of edgeIndices) {
+          indices.add(idx);
+        }
+      }
+      return;
+    }
+
+    const members = new Set<string>();
+    for (const nodeId of source.nodeIds) {
+      for (const id of this.collectNodeSubtreeIds(nodeId)) {
+        members.add(id);
+      }
+    }
+
+    for (const id of members) {
+      const edgeIndices = this.edgeManager.nodeToEdgeIndices.get(id);
+      if (!edgeIndices) continue;
+
+      for (const idx of edgeIndices) {
+        const edge = this.edgeManager.edgeData[idx];
+        if (edge && members.has(edge.source) && members.has(edge.target)) {
+          indices.add(idx);
+        }
       }
     }
   }
@@ -539,23 +596,32 @@ export class PixiRenderer {
     return result;
   }
 
-  setSelectedNode(nodeId: string | null) {
-    const prev = this.selectedNodeId;
-    this.selectedNodeId = nodeId;
+  /**
+   * Apply the store's selection: restyle the nodes whose selected-ness changed
+   * and re-derive the pinned edge highlight.
+   */
+  setSelection(selectedNodeIds: ReadonlySet<string>, selectedNodeId: string | null) {
+    const previous = selectionIds(this.selection);
+    this.selection = selectionFromStore(selectedNodeIds, selectedNodeId);
+    const current = selectionIds(this.selection);
 
-    if (prev) {
-      const display = this.nodeDisplays.get(prev);
-      if (display) {
-        redrawNodeBg(display, false);
-      }
+    for (const id of previous) {
+      if (current.has(id)) continue;
+      const display = this.nodeDisplays.get(id);
+      if (display) redrawNodeBg(display, false);
     }
 
-    if (nodeId) {
-      const display = this.nodeDisplays.get(nodeId);
-      if (display) {
-        redrawNodeBg(display, true);
-      }
+    for (const id of current) {
+      if (previous.has(id)) continue;
+      const display = this.nodeDisplays.get(id);
+      if (display) redrawNodeBg(display, true);
     }
+
+    this.applyHighlight();
+  }
+
+  private isSelected(nodeId: string): boolean {
+    return selectionIds(this.selection).has(nodeId);
   }
 
   /**
@@ -576,7 +642,7 @@ export class PixiRenderer {
       ease: "easeInOutQuad",
     });
 
-    useGraphStore.getState().setSelectedNode(nodeId);
+    useGraphStore.getState().selectNode(nodeId);
   }
 
   /**
@@ -611,7 +677,9 @@ export class PixiRenderer {
 
     this.edgeManager.redrawEdgesWithHighlight(
       this.edgeLayer,
-      this.hoveredNodeId,
+      highlightDimsBaseLayer(
+        resolveHighlightSource(this.hoveredNodeId, this.selection)
+      ),
       this.currentLOD,
       this.currentVisibleNodes,
       getRef
