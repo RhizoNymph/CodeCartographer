@@ -11,6 +11,7 @@ import {
   effectiveHideAmbiguous,
   focusVisibleNodes,
   focusExpandedNodes,
+  focusIsActive,
 } from "../stores/graphViewModel";
 
 export function Canvas() {
@@ -26,7 +27,7 @@ export function Canvas() {
     hideUnconnectedNodes,
     hideAmbiguousEdges,
     viewMode,
-    focusNodeId,
+    focusStack,
     focusNeighborhood,
     layoutVersion,
   } = useGraphStore(
@@ -40,14 +41,15 @@ export function Canvas() {
       hideUnconnectedNodes: s.hideUnconnectedNodes,
       hideAmbiguousEdges: s.hideAmbiguousEdges,
       viewMode: s.viewMode,
-      focusNodeId: s.focusNodeId,
+      focusStack: s.focusStack,
       focusNeighborhood: s.focusNeighborhood,
       layoutVersion: s.layoutVersion,
     }))
   );
   const [error, setError] = useState<string | null>(null);
 
-  const isFocused = focusNodeId !== null && focusNeighborhood !== null;
+  // Focused == some frame is on the stack AND its neighborhood has been fetched.
+  const isFocused = focusIsActive(focusStack) && focusNeighborhood !== null;
 
   // Effective edge kinds fed to layout: module view forces {Import}; focus uses
   // the enabled kinds (already applied server-side to the neighborhood).

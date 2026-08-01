@@ -1,5 +1,6 @@
 import { useEffect } from "react";
 import { useGraphStore } from "../stores/graphStore";
+import { focusTopNodeId } from "../stores/graphViewModel";
 import { resolveFocusHotkey, type FocusHotkeyEvent } from "./focusHotkey";
 
 /** Project a DOM keydown onto the fields the pure resolver needs. */
@@ -17,7 +18,8 @@ function describeKeyEvent(e: KeyboardEvent): FocusHotkeyEvent {
 
 /**
  * Window-level "F" hotkey: enter focus on the hovered node, falling back to the
- * selected one. Mirrors Esc-to-exit in FocusBreadcrumb.
+ * selected one. Each press pushes a focus frame; `useEscapeKey` pops back out
+ * one frame at a time.
  *
  * Reads the store imperatively via getState() so the listener is installed once
  * and never goes stale on hover changes (which fire on every pointerover).
@@ -29,7 +31,9 @@ export function useFocusHotkey() {
       const result = resolveFocusHotkey(describeKeyEvent(e), {
         hoveredNodeId: store.hoveredNodeId,
         selectedNodeId: store.selectedNodeId,
-        focusNodeId: store.focusNodeId,
+        // Only the frame on screen counts as "already focused": F on a node
+        // deeper in the stack is a legitimate re-drill.
+        focusNodeId: focusTopNodeId(store.focusStack),
       });
       if (result.kind !== "focus") return;
       e.preventDefault();

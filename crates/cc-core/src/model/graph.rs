@@ -280,10 +280,40 @@ impl SubGraph {
     }
 }
 
+/// Which way a focus trace walks the graph from its focus node.
+///
+/// The BFS follows this direction at EVERY hop, not just the first, so an
+/// `Upstream` trace is a pure caller chain and a `Downstream` trace a pure
+/// callee chain. `Both` is the default and reproduces the original
+/// bidirectional neighborhood.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FocusDirection {
+    /// Callers and callees (`reverse_adj` + `forward_adj`).
+    #[default]
+    Both,
+    /// Callers only (`reverse_adj`): who reaches the focus.
+    Upstream,
+    /// Callees only (`forward_adj`): what the focus reaches.
+    Downstream,
+}
+
+impl FocusDirection {
+    /// Whether this direction walks `forward_adj` (focus -> target).
+    fn follows_forward(self) -> bool {
+        matches!(self, FocusDirection::Both | FocusDirection::Downstream)
+    }
+
+    /// Whether this direction walks `reverse_adj` (source -> focus).
+    fn follows_reverse(self) -> bool {
+        matches!(self, FocusDirection::Both | FocusDirection::Upstream)
+    }
+}
+
 /// A local neighborhood extracted around a focus node for drill-down rendering.
 ///
 /// `node_ids` is the closure of every node reachable within `depth` hops of the
-/// focus (following edges in BOTH directions), plus the container chain
+/// focus (following edges in the requested `direction`), plus the container chain
 /// (parents up to the root) of each such node so the frontend can build the ELK
 /// containment tree. `edges` are the direct edges (with resolution) among the
 /// neighborhood nodes only (excludes container-chain-only nodes that have no
@@ -292,14 +322,18 @@ impl SubGraph {
 pub struct Neighborhood {
     pub focus: NodeId,
     pub depth: u8,
+    /// The direction the trace was walked in; echoed back so the caller can tell
+    /// which query a payload answers.
+    pub direction: FocusDirection,
     pub node_ids: Vec<NodeId>,
     pub edges: Vec<CodeEdge>,
 }
 
 impl CodeGraph {
-    /// Compute the neighborhood around `focus` by breadth-first search over both
-    /// `forward_adj` and `reverse_adj`, bounded by `depth` hops and filtered to
-    /// `enabled_edge_kinds`. Returns `None` if `focus` is not a node in the graph.
+    /// Compute the neighborhood around `focus` by breadth-first search over
+    /// `forward_adj` and/or `reverse_adj` (per `direction`), bounded by `depth`
+    /// hops and filtered to `enabled_edge_kinds`. Returns `None` if `focus` is
+    /// not a node in the graph.
     ///
     /// The returned `node_ids` include, in addition to the BFS frontier, the
     /// container chain (parents up to the root, via the `children` hierarchy) of
@@ -313,14 +347,15 @@ impl CodeGraph {
         focus: &NodeId,
         depth: u8,
         enabled_edge_kinds: &HashSet<EdgeKind>,
+        direction: FocusDirection,
     ) -> Option<Neighborhood> {
         if !self.nodes.contains_key(focus) {
             return None;
         }
         let depth = depth.clamp(1, 2);
 
-        // BFS over both directions, tracking discovered nodes. `frontier`
-        // carries the nodes to expand at the current level.
+        // BFS in the requested direction(s), tracking discovered nodes.
+        // `frontier` carries the nodes to expand at the current level.
         let mut discovered: HashSet<NodeId> = HashSet::new();
         discovered.insert(focus.clone());
         let mut frontier: Vec<NodeId> = vec![focus.clone()];
@@ -328,8 +363,12 @@ impl CodeGraph {
         for _ in 0..depth {
             let mut next: Vec<NodeId> = Vec::new();
             for node in frontier.drain(..) {
-                // Forward: node -> target
-                if let Some(adj) = self.forward_adj.get(&node) {
+                // Forward: node -> target (callees)
+                if let Some(adj) = self
+                    .forward_adj
+                    .get(&node)
+                    .filter(|_| direction.follows_forward())
+                {
                     for (target, edge_idx) in adj {
                         if !enabled_edge_kinds.contains(&self.edges[*edge_idx].kind) {
                             continue;
@@ -340,7 +379,11 @@ impl CodeGraph {
                     }
                 }
                 // Reverse: source -> node (callers)
-                if let Some(adj) = self.reverse_adj.get(&node) {
+                if let Some(adj) = self
+                    .reverse_adj
+                    .get(&node)
+                    .filter(|_| direction.follows_reverse())
+                {
                     for (source, edge_idx) in adj {
                         if !enabled_edge_kinds.contains(&self.edges[*edge_idx].kind) {
                             continue;
@@ -387,6 +430,7 @@ impl CodeGraph {
         Some(Neighborhood {
             focus: focus.clone(),
             depth,
+            direction,
             node_ids,
             edges,
         })
@@ -1050,7 +1094,7 @@ mod tests {
     fn neighborhood_unknown_node_returns_none() {
         let g = sample_graph();
         assert!(g
-            .neighborhood(&NodeId("does_not_exist".into()), 1, &all_kinds())
+            .neighborhood(&NodeId("does_not_exist".into()), 1, &all_kinds(), FocusDirection::Both)
             .is_none());
     }
 
@@ -1062,7 +1106,7 @@ mod tests {
         g.add_edge(edge("fnA2", "fnA1", EdgeKind::FunctionCall));
 
         let n = g
-            .neighborhood(&NodeId("fnA1".into()), 1, &all_kinds())
+            .neighborhood(&NodeId("fnA1".into()), 1, &all_kinds(), FocusDirection::Both)
             .expect("known node");
         let ids: HashSet<&str> = n.node_ids.iter().map(|id| id.0.as_str()).collect();
 
@@ -1084,14 +1128,14 @@ mod tests {
         g.add_edge(edge("fnA2", "fnB1", EdgeKind::FunctionCall));
 
         let d1 = g
-            .neighborhood(&NodeId("fnA1".into()), 1, &all_kinds())
+            .neighborhood(&NodeId("fnA1".into()), 1, &all_kinds(), FocusDirection::Both)
             .unwrap();
         let ids1: HashSet<&str> = d1.node_ids.iter().map(|id| id.0.as_str()).collect();
         assert!(ids1.contains("fnA2"), "one hop reaches fnA2");
         assert!(!ids1.contains("fnB1"), "two hops away, excluded at depth 1");
 
         let d2 = g
-            .neighborhood(&NodeId("fnA1".into()), 2, &all_kinds())
+            .neighborhood(&NodeId("fnA1".into()), 2, &all_kinds(), FocusDirection::Both)
             .unwrap();
         let ids2: HashSet<&str> = d2.node_ids.iter().map(|id| id.0.as_str()).collect();
         assert!(ids2.contains("fnB1"), "two hops away, included at depth 2");
@@ -1103,13 +1147,13 @@ mod tests {
         g.add_edge(edge("fnA1", "fnA2", EdgeKind::FunctionCall));
         // depth 0 clamps up to 1; depth 5 clamps down to 2.
         assert_eq!(
-            g.neighborhood(&NodeId("fnA1".into()), 0, &all_kinds())
+            g.neighborhood(&NodeId("fnA1".into()), 0, &all_kinds(), FocusDirection::Both)
                 .unwrap()
                 .depth,
             1
         );
         assert_eq!(
-            g.neighborhood(&NodeId("fnA1".into()), 5, &all_kinds())
+            g.neighborhood(&NodeId("fnA1".into()), 5, &all_kinds(), FocusDirection::Both)
                 .unwrap()
                 .depth,
             2
@@ -1124,7 +1168,7 @@ mod tests {
         g.add_edge(edge("fnA1", "fnA2", EdgeKind::FunctionCall));
 
         let n = g
-            .neighborhood(&NodeId("fnA1".into()), 1, &only_import())
+            .neighborhood(&NodeId("fnA1".into()), 1, &only_import(), FocusDirection::Both)
             .unwrap();
         let ids: HashSet<&str> = n.node_ids.iter().map(|id| id.0.as_str()).collect();
         assert!(ids.contains("fnB1"), "import neighbor kept");
@@ -1145,7 +1189,7 @@ mod tests {
         g.add_edge(edge("fnA1", "fnB1", EdgeKind::FunctionCall));
 
         let n = g
-            .neighborhood(&NodeId("fnA1".into()), 1, &all_kinds())
+            .neighborhood(&NodeId("fnA1".into()), 1, &all_kinds(), FocusDirection::Both)
             .unwrap();
         let ids: HashSet<&str> = n.node_ids.iter().map(|id| id.0.as_str()).collect();
         assert!(ids.contains("fileA"), "container of fnA1");
@@ -1155,5 +1199,178 @@ mod tests {
         assert_eq!(n.edges.len(), 1);
         assert_eq!(n.edges[0].source, NodeId("fnA1".into()));
         assert_eq!(n.edges[0].target, NodeId("fnB1".into()));
+    }
+
+    // --- Directional trace (FocusDirection) tests ---
+
+    /// fnA2 -> fnA1 -> fnB1: fnA2 is a caller (upstream) of fnA1, fnB1 a callee
+    /// (downstream) of it.
+    fn directional_graph() -> CodeGraph {
+        let mut g = sample_graph();
+        g.add_edge(edge("fnA2", "fnA1", EdgeKind::FunctionCall));
+        g.add_edge(edge("fnA1", "fnB1", EdgeKind::FunctionCall));
+        g
+    }
+
+    #[test]
+    fn neighborhood_upstream_keeps_callers_and_excludes_callees() {
+        let g = directional_graph();
+
+        let n = g
+            .neighborhood(
+                &NodeId("fnA1".into()),
+                1,
+                &all_kinds(),
+                FocusDirection::Upstream,
+            )
+            .unwrap();
+        let ids: HashSet<&str> = n.node_ids.iter().map(|id| id.0.as_str()).collect();
+
+        assert!(ids.contains("fnA2"), "caller reached via reverse_adj");
+        assert!(!ids.contains("fnB1"), "callee excluded when tracing upstream");
+        // Only the caller edge survives (the callee edge has an undiscovered end).
+        assert_eq!(n.edges.len(), 1);
+        assert_eq!(n.edges[0].source, NodeId("fnA2".into()));
+        assert_eq!(n.edges[0].target, NodeId("fnA1".into()));
+        assert_eq!(n.direction, FocusDirection::Upstream);
+    }
+
+    #[test]
+    fn neighborhood_downstream_keeps_callees_and_excludes_callers() {
+        let g = directional_graph();
+
+        let n = g
+            .neighborhood(
+                &NodeId("fnA1".into()),
+                1,
+                &all_kinds(),
+                FocusDirection::Downstream,
+            )
+            .unwrap();
+        let ids: HashSet<&str> = n.node_ids.iter().map(|id| id.0.as_str()).collect();
+
+        assert!(ids.contains("fnB1"), "callee reached via forward_adj");
+        assert!(
+            !ids.contains("fnA2"),
+            "caller excluded when tracing downstream"
+        );
+        assert_eq!(n.edges.len(), 1);
+        assert_eq!(n.edges[0].source, NodeId("fnA1".into()));
+        assert_eq!(n.edges[0].target, NodeId("fnB1".into()));
+        assert_eq!(n.direction, FocusDirection::Downstream);
+    }
+
+    #[test]
+    fn neighborhood_both_is_the_union_of_the_two_directions() {
+        let g = directional_graph();
+
+        let both = g
+            .neighborhood(&NodeId("fnA1".into()), 1, &all_kinds(), FocusDirection::Both)
+            .unwrap();
+        let ids: HashSet<&str> = both.node_ids.iter().map(|id| id.0.as_str()).collect();
+
+        assert!(ids.contains("fnA2"), "caller kept");
+        assert!(ids.contains("fnB1"), "callee kept");
+        assert_eq!(both.edges.len(), 2);
+        assert_eq!(both.direction, FocusDirection::Both);
+        assert_eq!(
+            FocusDirection::default(),
+            FocusDirection::Both,
+            "Both is the default, preserving the pre-direction behavior"
+        );
+    }
+
+    #[test]
+    fn neighborhood_direction_applies_per_hop_not_just_at_the_focus() {
+        // fnB1 -> fnA1 -> fnA2 (a caller chain into fnA2). Tracing upstream from
+        // fnA2 must walk fnA1 then fnB1, never turning around.
+        let mut g = sample_graph();
+        g.add_edge(edge("fnA1", "fnA2", EdgeKind::FunctionCall));
+        g.add_edge(edge("fnB1", "fnA1", EdgeKind::FunctionCall));
+        // A callee of fnA1 that must NOT be pulled in while tracing upstream.
+        g.add_node(block("fnA3", "fileA"));
+        g.add_edge(edge("fnA1", "fnA3", EdgeKind::FunctionCall));
+
+        let n = g
+            .neighborhood(
+                &NodeId("fnA2".into()),
+                2,
+                &all_kinds(),
+                FocusDirection::Upstream,
+            )
+            .unwrap();
+        let ids: HashSet<&str> = n.node_ids.iter().map(|id| id.0.as_str()).collect();
+
+        assert!(ids.contains("fnA1"), "direct caller");
+        assert!(ids.contains("fnB1"), "caller of the caller (2 hops upstream)");
+        assert!(
+            !ids.contains("fnA3"),
+            "a callee of an upstream node is not upstream of the focus"
+        );
+    }
+
+    #[test]
+    fn neighborhood_direction_still_includes_the_container_chain() {
+        let g = directional_graph();
+
+        let n = g
+            .neighborhood(
+                &NodeId("fnA1".into()),
+                1,
+                &all_kinds(),
+                FocusDirection::Downstream,
+            )
+            .unwrap();
+        let ids: HashSet<&str> = n.node_ids.iter().map(|id| id.0.as_str()).collect();
+
+        assert!(ids.contains("fileA"), "container of the focus");
+        assert!(ids.contains("fileB"), "container of the discovered callee");
+        assert!(ids.contains("root"), "root of the container chain");
+        // Container-only nodes still contribute no edges.
+        assert_eq!(n.edges.len(), 1);
+    }
+
+    #[test]
+    fn neighborhood_direction_respects_edge_kind_filtering() {
+        // fnA1 -Import-> fnB1 downstream, fnA2 -FunctionCall-> fnA1 upstream.
+        let mut g = sample_graph();
+        g.add_edge(edge("fnA1", "fnB1", EdgeKind::Import));
+        g.add_edge(edge("fnA2", "fnA1", EdgeKind::FunctionCall));
+
+        let n = g
+            .neighborhood(
+                &NodeId("fnA1".into()),
+                1,
+                &only_import(),
+                FocusDirection::Downstream,
+            )
+            .unwrap();
+        let ids: HashSet<&str> = n.node_ids.iter().map(|id| id.0.as_str()).collect();
+
+        assert!(ids.contains("fnB1"), "import callee kept");
+        assert!(!ids.contains("fnA2"), "wrong kind AND wrong direction");
+        assert_eq!(n.edges.len(), 1);
+        assert_eq!(n.edges[0].kind, EdgeKind::Import);
+    }
+
+    #[test]
+    fn focus_direction_serializes_as_lowercase_for_ipc() {
+        // The frontend's FocusDirection union is lowercase; pin the wire format.
+        assert_eq!(
+            serde_json::to_string(&FocusDirection::Both).unwrap(),
+            "\"both\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FocusDirection::Upstream).unwrap(),
+            "\"upstream\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FocusDirection::Downstream).unwrap(),
+            "\"downstream\""
+        );
+        assert_eq!(
+            serde_json::from_str::<FocusDirection>("\"upstream\"").unwrap(),
+            FocusDirection::Upstream
+        );
     }
 }

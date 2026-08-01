@@ -125,15 +125,23 @@ export interface SubGraph {
 }
 
 /**
+ * Which way a focus trace walks the graph: `upstream` follows callers only,
+ * `downstream` callees only, `both` (the default) is the bidirectional
+ * neighborhood. Wire format of cc-core's `FocusDirection`.
+ */
+export type FocusDirection = "both" | "upstream" | "downstream";
+
+/**
  * A local neighborhood around a focus node, returned by `get_neighborhood` for
  * focus / drill-down. `node_ids` includes the BFS frontier plus the container
  * chain (parents up to root) of every discovered node so the frontend can build
  * the ELK containment tree; `edges` are the direct edges (with resolution) among
- * the discovered nodes.
+ * the discovered nodes. `direction` echoes the traced direction back.
  */
 export interface Neighborhood {
   focus: string;
   depth: number;
+  direction: FocusDirection;
   node_ids: string[];
   edges: CodeEdge[];
 }

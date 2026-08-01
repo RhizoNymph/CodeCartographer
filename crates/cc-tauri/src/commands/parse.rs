@@ -2,7 +2,8 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 
 use cc_core::model::{
-    CodeGraph, CodeNode, EdgeKind, Language, Neighborhood, NodeId, ParseResult, SubGraph,
+    CodeGraph, CodeNode, EdgeKind, FocusDirection, Language, Neighborhood, NodeId, ParseResult,
+    SubGraph,
 };
 use cc_core::parser::{Extractor, ParseEvent};
 use cc_core::resolver::{ImportResolver, SymbolTable};
@@ -254,15 +255,17 @@ fn parse_edge_kinds(edge_kinds: Vec<String>) -> Result<HashSet<EdgeKind>, String
 }
 
 /// Compute the local neighborhood around `node_id` for focus / drill-down. BFS
-/// over both forward and reverse adjacency, bounded by `depth` (clamped to
-/// 1..=2) and filtered to `edge_kinds`. Returns the neighborhood node ids
-/// (including the container chain up to the root) and the direct edges among
-/// them (carrying resolution). Errors if the node is unknown.
+/// over forward and/or reverse adjacency per `direction` ("both" | "upstream" |
+/// "downstream"), bounded by `depth` (clamped to 1..=2) and filtered to
+/// `edge_kinds`. Returns the neighborhood node ids (including the container
+/// chain up to the root) and the direct edges among them (carrying resolution).
+/// Errors if the node is unknown.
 #[command]
 pub async fn get_neighborhood(
     node_id: String,
     depth: u8,
     edge_kinds: Vec<String>,
+    direction: FocusDirection,
     state: tauri::State<'_, GraphState>,
 ) -> Result<Neighborhood, String> {
     let guard = state
@@ -277,7 +280,7 @@ pub async fn get_neighborhood(
     let focus = NodeId(node_id);
 
     graph
-        .neighborhood(&focus, depth, &kinds)
+        .neighborhood(&focus, depth, &kinds, direction)
         .ok_or_else(|| format!("Unknown node: {}", focus))
 }
 
