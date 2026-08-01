@@ -28,8 +28,21 @@ Features Index:
     canvas-rendering:
         description: Interactive Pixi.js canvas with node rendering, edge drawing, minimap, drag, and LOD-based visibility.
         entry_points: [packages/app/src/canvas/renderers/PixiRenderer.ts, packages/app/src/canvas/Canvas.tsx]
-        depends_on: [graph-layout]
+        depends_on: [graph-layout, palette]
         doc: docs/features/canvas-rendering.md
+
+    palette:
+        description: >
+            The graph's colour vocabulary, built so a colour identifies exactly one category.
+            Five edge hues cover seven edge kinds -- FunctionCall/MethodCall share one "calls" hue and
+            Inheritance/TraitImpl share one "subtype relation" hue, while the kinds stay distinct in the
+            model, tooltips, toggles and EDGE_STYLES. Edges own the saturated end of the spectrum and
+            blocks/nodes the muted end; no hex (and no near-duplicate hex) is shared across EDGE_COLORS,
+            BLOCK_COLORS and NODE_COLORS, and every edge hue clears WCAG 3:1 against the dark canvas and
+            every node fill it can cross. Colour is frontend-only -- cc-core's EdgeKind carries none.
+        entry_points: [packages/app/src/api/types.ts, packages/app/src/canvas/renderers/types.ts]
+        depends_on: []
+        doc: docs/features/palette.md
 
     graph-layout:
         description: ELK-based hierarchical graph layout running in a web worker (elk-api + elk-worker.min.js?worker) so layout does not block the UI thread. Fetches per-view direct + aggregated edges from the backend (get_subgraph) rather than filtering client-side, feeds them to ELK for routing, and falls back to straight-line edges (also used as the layout guard for views over 1500 rendered nodes).

@@ -58,15 +58,20 @@ Types of code blocks extracted:
 
 Relationship types between nodes:
 
-| Kind | Color | Description |
-|------|-------|-------------|
-| Import | #6366f1 | Module import |
-| FunctionCall | #22c55e | Function invocation |
-| MethodCall | #14b8a6 | Method invocation |
-| TypeReference | #f59e0b | Type usage |
-| Inheritance | #ef4444 | Class inheritance |
-| TraitImpl | #a855f7 | Trait implementation |
-| VariableUsage | #64748b | Variable reference |
+| Kind | Description |
+|------|-------------|
+| Import | Module import |
+| FunctionCall | Function invocation |
+| MethodCall | Method invocation |
+| TypeReference | Type usage |
+| Inheritance | Class inheritance |
+| TraitImpl | Trait implementation |
+| VariableUsage | Variable reference |
+
+`EdgeKind` carries no colour. Rendering colour is owned entirely by the
+frontend palette (`packages/app/src/api/types.ts`); see
+`docs/features/palette.md`. `EdgeKind::discriminant()` remains for
+deterministic ordering.
 
 ### CodeGraph
 
