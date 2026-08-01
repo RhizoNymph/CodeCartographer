@@ -5,6 +5,11 @@ import { EDGE_COLORS } from "../../api/types";
 import { getSubgraph } from "../../api/commands";
 import { useDebugStore } from "../../stores/debugStore";
 import {
+  deriveEdgeKindCounts,
+  unknownEdgeKindCounts,
+  type EdgeKindCounts,
+} from "../legend/edgeLegendModel";
+import {
   anchorEdgePolyline,
   dedupePolylinePoints,
   inferEdgeAnchor,
@@ -68,6 +73,12 @@ export interface LayoutEdge {
 export interface LayoutResult {
   nodes: Record<string, LayoutNodePosition>;
   edges: LayoutEdge[];
+  /**
+   * Underlying edge counts per kind for this view, derived from the fetched
+   * `SubGraph`. Kinds that were not requested are `null` (unknown). Published to
+   * `edgeLegendStore` by the renderer once the layout is known to be current.
+   */
+  edgeKindCounts: EdgeKindCounts;
 }
 
 function buildElkNode(
@@ -131,7 +142,7 @@ export async function layoutGraph(
 ): Promise<LayoutResult> {
   const rootNode = graph.nodes[graph.root];
   if (!rootNode) {
-    return { nodes: {}, edges: [] };
+    return { nodes: {}, edges: [], edgeKindCounts: unknownEdgeKindCounts() };
   }
 
   // Build ELK graph
@@ -171,8 +182,12 @@ export async function layoutGraph(
     : ALL_EDGE_KINDS;
 
   let viewEdges: ViewEdge[] = [];
+  // Per-kind counts for the legend, derived from the same payload the layout
+  // uses. Kinds outside `enabledKinds` were never fetched and stay unknown.
+  let edgeKindCounts: EdgeKindCounts = unknownEdgeKindCounts();
   try {
     const sub = await getSubgraph(renderIds, enabledKinds);
+    edgeKindCounts = deriveEdgeKindCounts(sub, enabledKinds, hideAmbiguousEdges);
     for (const e of sub.edges) {
       // Ambiguous direct edges can be hidden client-side (imports are exact so
       // this only ever affects reference edges).
@@ -262,7 +277,7 @@ export async function layoutGraph(
     if (import.meta.env.DEV) {
       useDebugStore.getState().addLog(`ELK layout done, extracting...`);
     }
-    const result = extractLayout(laidOut, viewEdges, viewEdgeInfo);
+    const result = extractLayout(laidOut, viewEdges, viewEdgeInfo, edgeKindCounts);
     if (import.meta.env.DEV) {
       useDebugStore.getState().addLog(`ELK extracted ${result.edges.length} edges`);
 
@@ -293,16 +308,17 @@ export async function layoutGraph(
     if (import.meta.env.DEV) {
       useDebugStore.getState().addLog(`ELK FAILED: ${err}`);
     }
-    return fallbackLayout(graph, visibleNodes);
+    return fallbackLayout(graph, visibleNodes, edgeKindCounts);
   }
 }
 
 function extractLayout(
   elkNode: ElkNode,
   viewEdges: ViewEdge[],
-  viewEdgeInfo: Map<string, ViewEdge>
+  viewEdgeInfo: Map<string, ViewEdge>,
+  edgeKindCounts: EdgeKindCounts
 ): LayoutResult {
-  const result: LayoutResult = { nodes: {}, edges: [] };
+  const result: LayoutResult = { nodes: {}, edges: [], edgeKindCounts };
 
   let edgesWithSections = 0;
   let edgesWithoutSections = 0;
@@ -526,9 +542,10 @@ function extractLayout(
 
 function fallbackLayout(
   graph: CodeGraph,
-  visibleNodes: Set<string>
+  visibleNodes: Set<string>,
+  edgeKindCounts: EdgeKindCounts
 ): LayoutResult {
-  const result: LayoutResult = { nodes: {}, edges: [] };
+  const result: LayoutResult = { nodes: {}, edges: [], edgeKindCounts };
   let x = 20;
   let y = 20;
   const colWidth = 220;

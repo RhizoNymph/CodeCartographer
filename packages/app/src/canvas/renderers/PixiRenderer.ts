@@ -5,6 +5,7 @@ import { layoutGraph, type LayoutResult, type LayoutNodePosition } from "../layo
 import { useGraphStore } from "../../stores/graphStore";
 import { useViewportStore, type LODLevel } from "../../stores/viewportStore";
 import { useDebugStore } from "../../stores/debugStore";
+import { useEdgeLegendStore } from "../../stores/edgeLegendStore";
 import { buildParentMap } from "../utils/graphUtils";
 import { pointToPolylineDistance } from "../layout/edgeGeometry";
 import { EdgeDrawingManager, type NodeDisplayRef } from "./edgeDrawing";
@@ -282,6 +283,9 @@ export class PixiRenderer {
     layoutGraph(graph, expandedNodes, visibleNodes, enabledEdgeKinds, hideAmbiguousEdges).then((layout) => {
       if (requestId !== this._layoutRequestId) return; // stale -- discard
       this.lastLayout = layout;
+      // Publish per-kind view counts for the legend only once the layout is
+      // known to be current, so a superseded fetch cannot clobber fresh counts.
+      useEdgeLegendStore.getState().setCounts(layout.edgeKindCounts);
       this.renderFromLayout(graph, layout, expandedNodes, visibleNodes);
     });
   }

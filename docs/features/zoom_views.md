@@ -49,6 +49,8 @@ Canvas derives the layout inputs each render (graphViewModel.ts):
 PixiRenderer.updateGraph(graph, layoutExpanded, displayVisible,
                          layoutEdgeKinds, layoutHideAmbig)
   -> elkLayout.layoutGraph(...) -> getSubgraph(renderIds, layoutEdgeKinds)
+       -> also derives LayoutResult.edgeKindCounts, which PixiRenderer publishes
+          to edgeLegendStore for the EdgeLegend overlay
 
 Switching mode -> graphStore.setViewMode -> reduceSetViewMode + bump
 layoutVersion + persist. Entering module view drops any active focus.
@@ -112,7 +114,10 @@ Breadcrumb chip (FocusBreadcrumb.tsx):
 - `packages/app/src/canvas/FocusBreadcrumb.tsx` — the exit chip (name + depth
   selector + X + Esc).
 - `packages/app/src/toolbar/Toolbar.tsx` — Module|Symbol segmented control;
-  edge-kind toggles + ambiguous checkbox hidden in module view.
+  hide-unconnected + ambiguous checkboxes hidden in module view.
+- `packages/app/src/canvas/legend/EdgeLegend.tsx` — the edge-kind toggle UI
+  (canvas overlay). Collapses to a single non-interactive Import row in module
+  view; shows every kind with its per-view count in symbol/focus view.
 - `packages/app/src/sidebar/Sidebar.tsx` — "Focus" button on the selected row.
 - `packages/app/src/canvas/Tooltip.tsx` — "Focus" button in the node tooltip.
 - `packages/app/src/canvas/renderers/PixiRenderer.ts` — module-view double-click
@@ -136,8 +141,9 @@ Breadcrumb chip (FocusBreadcrumb.tsx):
   are never mutated when entering module view; the effective values are computed
   at layout time. Returning to symbol view restores the user's exact state.
 - **Module view is import-only.** Effective edge kinds are always `{Import}` and
-  the ambiguous filter is a no-op (imports are exact), regardless of toolbar
-  toggles (which are hidden in module view).
+  the ambiguous filter is a no-op (imports are exact), regardless of the user's
+  saved edge-kind toggles. The `EdgeLegend` overlay reflects this by showing a
+  single, non-interactive Import row in module view.
 - **Default view is module** on load and for any saved state lacking `viewMode`.
 - **Focus renders only the neighborhood.** The full symbol graph is never laid
   out; visibility/expansion are restricted to `neighborhood.node_ids`, which
