@@ -23,7 +23,8 @@ Overview:
         6. PixiRenderer delegates to elkLayout: build the ELK node tree, collect the render set (elkNodeIds), fetch per-view direct + aggregated edges via get_subgraph(render_ids, edge_kinds) computed server-side (direct edges carry a Resolution; ambiguous edges may be hidden client-side), then render nodes and edges on the Pixi.js canvas. Views over 1500 rendered nodes skip ELK edge routing and use straight-line fallback edges.
         7. The layout pass also derives per-kind edge counts for the view from that same SubGraph payload; PixiRenderer publishes them to edgeLegendStore once the layout is known to be current, and the bottom-left EdgeLegend overlay renders one row per edge kind (colour, name, count) which doubles as the edge-kind toggle UI.
         8. User interactions (hover, select, expand, drag, zoom) update stores and trigger re-renders. Edge tooltips read kind + count from the layout edges (aggregated edges carry a collapsed count). Aggregated edges (count > 1) additionally render a world-space "×N" chip at the arc-length midpoint of their routed polyline, at the "detail" LOD only.
-        9. Focus / drill-down: the user focuses a node (F hotkey on the hovered/selected node, the canvas selection chip or Sidebar row Focus button, or a module-view File double-click) -> get_neighborhood(node_id, depth, edge_kinds) runs a bidirectional BFS in cc-core and returns the neighborhood node ids (incl. container chain) + direct edges -> the store switches to symbol view and the canvas lays out ONLY that neighborhood. A breadcrumb chip (depth selector + X) and Esc exit focus.
+        9. Selecting a node also drives the right-side details panel: it fetches get_neighborhood(selectedNodeId, 1, ALL kinds) (debounced, with a monotonic stale-request guard), splits those edges into incoming/outgoing around the selected node, groups them per kind, and renders clickable endpoint rows with per-row Focus buttons.
+        10. Focus / drill-down: the user focuses a node (F hotkey on the hovered/selected node, the canvas selection chip, Sidebar row or details-panel Focus buttons, or a module-view File double-click) -> get_neighborhood(node_id, depth, edge_kinds) runs a bidirectional BFS in cc-core and returns the neighborhood node ids (incl. container chain) + direct edges -> the store switches to symbol view and the canvas lays out ONLY that neighborhood. A breadcrumb chip (depth selector + X) and Esc exit focus.
 
 Features Index:
     canvas-rendering:
@@ -75,7 +76,7 @@ Features Index:
         depends_on: [graph-model]
 
     zoom-views:
-        description: Two zoom-level views selected by a toolbar segmented control. Module view (default on load) is the trustworthy zoomed-out import graph -- files render collapsed and only Import edges show, as DERIVED constraints over the user's saved state (never mutating it). Symbol view is the detailed expandable view with all enabled edge kinds. Focus mode drills into a bounded neighborhood of a node (cc-core Neighborhood BFS via get_neighborhood) so the full symbol graph is never laid out; entered via the F hotkey (hovered node, falling back to the selected one), the canvas selection chip or Sidebar row Focus button, or a module-view File double-click, exited via a breadcrumb chip (name + 1/2-hop depth + X) or Esc. Focus actions are never placed in the hover tooltip, which unmounts on pointerout before it can be clicked. viewMode persists per folder.
+        description: Two zoom-level views selected by a toolbar segmented control. Module view (default on load) is the trustworthy zoomed-out import graph -- files render collapsed and only Import edges show, as DERIVED constraints over the user's saved state (never mutating it). Symbol view is the detailed expandable view with all enabled edge kinds. Focus mode drills into a bounded neighborhood of a node (cc-core Neighborhood BFS via get_neighborhood) so the full symbol graph is never laid out; entered via the F hotkey (hovered node, falling back to the selected one), the canvas selection chip, the Sidebar row or details-panel Focus buttons (the panel also focuses any listed edge endpoint), or a module-view File double-click, exited via a breadcrumb chip (name + 1/2-hop depth + X) or Esc. Focus actions are never placed in the hover tooltip, which unmounts on pointerout before it can be clicked. viewMode persists per folder.
         entry_points: [packages/app/src/stores/graphViewModel.ts, packages/app/src/stores/graphStore.ts, packages/app/src/canvas/Canvas.tsx, packages/app/src/canvas/FocusBreadcrumb.tsx, packages/app/src/canvas/SelectionChip.tsx, packages/app/src/canvas/focusHotkey.ts, crates/cc-core/src/model/graph.rs, crates/cc-tauri/src/commands/parse.rs]
         depends_on: [state-management, graph-layout, graph-model, resolution_precision]
         doc: docs/features/zoom_views.md
@@ -102,6 +103,21 @@ Features Index:
         entry_points: [packages/app/src/canvas/legend/EdgeLegend.tsx, packages/app/src/canvas/legend/edgeLegendModel.ts, packages/app/src/stores/edgeLegendStore.ts]
         depends_on: [graph-layout, state-management, zoom-views]
         doc: docs/features/edge-legend.md
+
+    details-panel:
+        description: >
+            Collapsible right-side panel describing the selected node: kind badge, name, and its
+            facts (path/language for files and directories, signature/visibility/line span for code
+            blocks). Below that, incoming and outgoing edge sections grouped by edge kind with
+            EDGE_COLORS swatches and per-kind counts; each row names the other endpoint, selects it
+            on click, and carries a Focus button. Fed by a debounced, stale-guarded
+            get_neighborhood(selectedNodeId, 1, ALL kinds) fetch -- always all kinds, since the panel
+            describes the node rather than the current view. Also holds the prominent Focus action
+            for the selected node itself (the hover tooltip cannot hold buttons -- it unmounts on
+            pointerout). Grouping/ordering lives in a pure, type-only-import model module.
+        entry_points: [packages/app/src/details/DetailsPanel.tsx, packages/app/src/details/detailsPanelModel.ts]
+        depends_on: [state-management, graph-model, zoom-views, palette]
+        doc: docs/features/details-panel.md
 
     error-handling:
         description: React ErrorBoundary components wrapping major UI sections for graceful error recovery.

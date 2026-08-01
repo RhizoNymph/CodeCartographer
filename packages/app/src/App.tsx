@@ -6,6 +6,7 @@ import { Tooltip } from "./canvas/Tooltip";
 import { FocusBreadcrumb } from "./canvas/FocusBreadcrumb";
 import { EdgeLegend } from "./canvas/legend/EdgeLegend";
 import { SelectionChip } from "./canvas/SelectionChip";
+import { DetailsPanel } from "./details/DetailsPanel";
 import { useFocusHotkey } from "./canvas/useFocusHotkey";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { useGraphStore } from "./stores/graphStore";
@@ -58,6 +59,13 @@ export function App() {
             </ErrorBoundary>
           )}
         </div>
+        {/* In-flow (not an overlay) so the details of the selected node never
+            cover the graph they describe. Renders nothing without a selection. */}
+        {isLoaded && (
+          <ErrorBoundary fallbackMessage="Details panel error">
+            <DetailsPanel />
+          </ErrorBoundary>
+        )}
         <Tooltip />
         <SelectionChip />
         <FocusBreadcrumb />
