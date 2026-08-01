@@ -240,6 +240,10 @@ export type SelectionEscapeFallThroughReason =
   | "not-escape"
   /** The key went into a text field (e.g. the sidebar search box). */
   | "typing"
+  /** Focus mode is active: Esc navigates the focus stack, whose frame changes
+   *  re-sync the selection themselves. Clearing here first would double every
+   *  Esc press (clear -> pop re-selects -> clear -> ...). */
+  | "focus-active"
   /** Nothing is selected, so Esc belongs to whoever handles it next. */
   | "no-selection";
 
@@ -253,14 +257,15 @@ export type SelectionEscapeResult =
 const EDITABLE_TAGS: ReadonlySet<string> = new Set(["INPUT", "TEXTAREA", "SELECT"]);
 
 /**
- * Esc contract: clear the selection FIRST if there is one; otherwise fall
- * through untouched so the focus layer can handle Esc with its own semantics.
- * This function never knows anything about focus -- it only decides whether Esc
- * has been consumed by the selection layer.
+ * Esc contract: while focus mode is active, Esc belongs to the focus layer
+ * (popping a frame re-syncs the selection to the revealed frame, so a
+ * selection-first clear would double every press). Unfocused, Esc clears the
+ * selection first if there is one; otherwise it falls through untouched.
  */
 export function resolveSelectionEscape(
   event: SelectionEscapeEvent,
-  selection: SelectionState
+  selection: SelectionState,
+  focusActive: boolean
 ): SelectionEscapeResult {
   if (event.key !== "Escape") {
     return { kind: "fall-through", reason: "not-escape" };
@@ -270,6 +275,9 @@ export function resolveSelectionEscape(
     (event.targetTagName !== null && EDITABLE_TAGS.has(event.targetTagName))
   ) {
     return { kind: "fall-through", reason: "typing" };
+  }
+  if (focusActive) {
+    return { kind: "fall-through", reason: "focus-active" };
   }
   if (selection.status === "empty") {
     return { kind: "fall-through", reason: "no-selection" };

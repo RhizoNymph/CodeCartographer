@@ -298,14 +298,28 @@ test("shrinking a multi-selection back to one node returns to connected mode", (
 const escape = { key: "Escape", targetTagName: null, targetIsEditable: false };
 
 test("Esc clears a non-empty selection instead of falling through", () => {
-  assert.deepEqual(resolveSelectionEscape(escape, select("a")), { kind: "clear-selection" });
-  assert.deepEqual(resolveSelectionEscape(escape, select("a", "b")), {
+  assert.deepEqual(resolveSelectionEscape(escape, select("a"), false), { kind: "clear-selection" });
+  assert.deepEqual(resolveSelectionEscape(escape, select("a", "b"), false), {
     kind: "clear-selection",
   });
 });
 
+test("Esc while focus mode is active always falls through to the focus layer", () => {
+  // Focus frames re-sync the selection on every push/pop, so a selection-first
+  // clear would double every Esc press while focused. Deliberate integration
+  // revision of the original selection-first contract.
+  assert.deepEqual(resolveSelectionEscape(escape, select("a"), true), {
+    kind: "fall-through",
+    reason: "focus-active",
+  });
+  assert.deepEqual(resolveSelectionEscape(escape, EMPTY_SELECTION, true), {
+    kind: "fall-through",
+    reason: "focus-active",
+  });
+});
+
 test("Esc with no selection falls through to focus handling", () => {
-  assert.deepEqual(resolveSelectionEscape(escape, EMPTY_SELECTION), {
+  assert.deepEqual(resolveSelectionEscape(escape, EMPTY_SELECTION, false), {
     kind: "fall-through",
     reason: "no-selection",
   });
@@ -313,7 +327,7 @@ test("Esc with no selection falls through to focus handling", () => {
 
 test("keys other than Esc never touch the selection", () => {
   for (const key of ["f", "Enter", "Delete", "Backspace", " ", "esc"]) {
-    assert.deepEqual(resolveSelectionEscape({ ...escape, key }, select("a")), {
+    assert.deepEqual(resolveSelectionEscape({ ...escape, key }, select("a"), false), {
       kind: "fall-through",
       reason: "not-escape",
     });
@@ -323,19 +337,19 @@ test("keys other than Esc never touch the selection", () => {
 test("Esc typed into a text field falls through", () => {
   for (const tag of ["INPUT", "TEXTAREA", "SELECT"]) {
     assert.deepEqual(
-      resolveSelectionEscape({ ...escape, targetTagName: tag }, select("a")),
+      resolveSelectionEscape({ ...escape, targetTagName: tag }, select("a"), false),
       { kind: "fall-through", reason: "typing" }
     );
   }
   assert.deepEqual(
-    resolveSelectionEscape({ ...escape, targetIsEditable: true }, select("a")),
+    resolveSelectionEscape({ ...escape, targetIsEditable: true }, select("a"), false),
     { kind: "fall-through", reason: "typing" }
   );
 });
 
 test("Esc on a non-editable element still clears the selection", () => {
   assert.deepEqual(
-    resolveSelectionEscape({ ...escape, targetTagName: "DIV" }, select("a")),
+    resolveSelectionEscape({ ...escape, targetTagName: "DIV" }, select("a"), false),
     { kind: "clear-selection" }
   );
 });

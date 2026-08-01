@@ -36,7 +36,8 @@ export function useSelectionEscape() {
       const store = useGraphStore.getState();
       const result = resolveSelectionEscape(
         describeKeyEvent(e),
-        selectionFromStore(store.selectedNodeIds, store.selectedNodeId)
+        selectionFromStore(store.selectedNodeIds, store.selectedNodeId),
+        store.focusStack.length > 0
       );
       if (result.kind !== "clear-selection") return;
       e.preventDefault();
