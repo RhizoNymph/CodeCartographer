@@ -24,7 +24,9 @@
   every BFS hop, toggled per-frame from the breadcrumb.
 - Focus entry points: the `F` hotkey (hovered node, falling back to the selected
   one), the canvas selection chip's "Focus" button, the Sidebar row "Focus"
-  button (selected node), and module-view double-click on a File.
+  button (selected node), the details panel's "Focus this node" button and its
+  per-endpoint row Focus buttons (see docs/features/details-panel.md), and
+  module-view double-click on a File.
 - Focus exit / navigation: the breadcrumb trail (root "All" chip + one chip per
   frame; earlier chips pop back to that frame, X clears the whole stack) and the
   Esc key, which pops exactly ONE frame.
@@ -80,7 +82,8 @@ graphStore.focusStack: FocusFrame[]   empty == unfocused
 graphStore.focusNeighborhood          the top frame's fetched payload
 
 enterFocus(nodeId, depth?, direction?) [F hotkey / SelectionChip / Sidebar row /
-                                        module-view File double-click]
+                                        DetailsPanel (selected node or a listed
+                                        endpoint) / module-view File double-click]
   -> depth/direction default to the CURRENT top frame's (so drilling deeper
      keeps the trace settings), else 1 / "both"
   -> pushFocusFrame(nodeFrame(...)) -> reduceEnterFocus (PURE):
@@ -318,7 +321,7 @@ only -- it unmounts on pointerout, so a button there is unreachable.
 - **Hover-driven overlays never hold actions.** The tooltip unmounts on
   `pointerout`, so any control inside it is destroyed by the pointer travelling
   toward it. Focus actions live on selection-anchored UI (SelectionChip,
-  Sidebar row) or the `F` hotkey, which need no pointer travel.
+  Sidebar row, DetailsPanel) or the `F` hotkey, which need no pointer travel.
 - **Hover wins over selection for the hotkey.** `enterFocus` sets
   `selectedNodeId` to the focus node, so resolving selection first would pin the
   hotkey to the current focus node and make re-focusing by hover impossible.
