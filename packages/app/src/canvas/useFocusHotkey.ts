@@ -13,6 +13,8 @@ function describeKeyEvent(e: KeyboardEvent): FocusHotkeyEvent {
     altKey: e.altKey,
     targetTagName: target ? target.tagName : null,
     targetIsEditable: target ? target.isContentEditable : false,
+    repeat: e.repeat,
+    isComposing: e.isComposing,
   };
 }
 

@@ -122,3 +122,37 @@ describe("focus hotkey resolution", () => {
     assert.deepEqual(result, { kind: "focus", nodeId: "fileB" });
   });
 });
+
+describe("focus hotkey auto-repeat and IME guards", () => {
+  it("ignores auto-repeat keydowns from a held F", () => {
+    // Holding F fires ~30 keydowns/sec, each of which would dispatch a
+    // get_neighborhood round-trip: the already-focused guard only catches them
+    // once the FIRST fetch has resolved and set focusNodeId.
+    const result = resolveFocusHotkey(
+      { ...keyF, repeat: true },
+      { ...nothing, hoveredNodeId: "fileA" }
+    );
+    assert.deepEqual(result, { kind: "ignore", reason: "repeat" });
+  });
+
+  it("still focuses on the initial (non-repeat) press", () => {
+    const result = resolveFocusHotkey(
+      { ...keyF, repeat: false },
+      { ...nothing, hoveredNodeId: "fileA" }
+    );
+    assert.deepEqual(result, { kind: "focus", nodeId: "fileA" });
+  });
+
+  it("ignores keydowns delivered mid-IME-composition", () => {
+    const result = resolveFocusHotkey(
+      { ...keyF, isComposing: true },
+      { ...nothing, hoveredNodeId: "fileA" }
+    );
+    assert.deepEqual(result, { kind: "ignore", reason: "composing" });
+  });
+
+  it("treats omitted repeat/isComposing as absent, so existing callers are unaffected", () => {
+    const result = resolveFocusHotkey(keyF, { ...nothing, hoveredNodeId: "fileA" });
+    assert.deepEqual(result, { kind: "focus", nodeId: "fileA" });
+  });
+});

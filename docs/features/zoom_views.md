@@ -157,7 +157,8 @@ canvas picks the payload via `focusLayoutIds(topFrame, neighborhood, edgeDetail)
 window keydown (useFocusHotkey, mounted in App)
   -> describeKeyEvent(e)                       (DOM -> plain fields)
   -> resolveFocusHotkey(event, {hovered, selected, focusNodeId})   (PURE)
-       "f"/"F", no ctrl/meta/alt, not typing in INPUT/TEXTAREA/SELECT
+       "f"/"F", no ctrl/meta/alt, not an IME composition, not an OS
+       auto-repeat from a held key, not typing in INPUT/TEXTAREA/SELECT
        or a contenteditable
        -> target = hoveredNodeId ?? selectedNodeId   (hover wins: enterFocus
           sets selectedNodeId, so a stale selection must not shadow the hover)
@@ -167,15 +168,18 @@ window keydown (useFocusHotkey, mounted in App)
           is a legitimate re-drill.
   -> enterFocus(nodeId)                        (pushes a frame)
 
-window keydown Escape (useEscapeKey, mounted in App) -- ORDERED chain:
-  1. [feat/pinned-selection inserts its "clear pinned selection" step here]
-  2. focusStack non-empty -> popFocus()  (consume the key)
-  Esc lives in its own window-level hook rather than inside FocusBreadcrumb so
-  the chain has one home and steps above the pop can be added cleanly.
+window keydown Escape -- ORDERED chain across two hooks:
+  1. useSelectionEscape (CAPTURE phase): clears the selection, but ONLY while
+     the focus stack is empty. While focused it always yields, because each
+     push/pop re-selects the frame's node -- clearing first would cost 2N+1
+     presses to back out of an N-deep stack.
+  2. useEscapeKey (bubble): focusStack non-empty -> popFocus()  (consume the key)
+  Esc lives in window-level hooks rather than inside FocusBreadcrumb so the
+  chain has one home and its order is explicit.
 
 SelectionChip (top-centre overlay), shown when selectedNodeId && stack empty:
   name/kind + "Focus (F)" button -> enterFocus(selectedNodeId)
-  x -> setSelectedNode(null)
+  x -> clearSelection()
   Selection is sticky (node pointerdown sets it, empty-space pointerdown
   clears it), so the button survives pointer travel.
 
@@ -322,6 +326,10 @@ only -- it unmounts on pointerout, so a button there is unreachable.
   `pointerout`, so any control inside it is destroyed by the pointer travelling
   toward it. Focus actions live on selection-anchored UI (SelectionChip,
   Sidebar row, DetailsPanel) or the `F` hotkey, which need no pointer travel.
+- **One press, one focus.** The `F` hotkey drops OS auto-repeat (`repeat`) and
+  IME-composition keydowns. Without that, holding F would queue a
+  `get_neighborhood` round-trip per repeat, since the already-focused guard
+  cannot catch them until the first fetch resolves.
 - **Hover wins over selection for the hotkey.** `enterFocus` sets
   `selectedNodeId` to the focus node, so resolving selection first would pin the
   hotkey to the current focus node and make re-focusing by hover impossible.

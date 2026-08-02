@@ -9,6 +9,7 @@ In scope:
 - Edge pointer interaction: distance-based hit testing for hover, and
   double-click on an aggregated edge to drill into it (the focus transition
   itself lives in zoom_views)
+- Node border emphasis: selected, endpoint-of-the-hovered-edge, or plain
 - "×N" count chips on aggregated (collapsed-container) edges
 - Minimap overlay showing node positions and viewport rectangle
 - Drag-and-drop with ancestor chain resizing
@@ -106,7 +107,17 @@ The PixiRenderer (orchestrator) delegates to focused sub-modules:
    - `getNodeLayer()`: routes nodes to container vs component layer
    - Exports `NodeDisplay` interface used by other modules
 
-7. **Re-export shims** (replace dead code):
+7. **nodeEmphasis.ts** (~85 lines) - Node border emphasis model (pure)
+   - `NodeEmphasis` = `"none" | "edge-endpoint" | "selected"`, with
+     `NODE_EMPHASIS_STYLES` mapping each level to a border colour + width
+   - `resolveNodeEmphasis(isSelected, isEdgeEndpoint)`: selection outranks being
+     a hovered edge's endpoint
+   - `edgeEndpointIds(source, target)` / `emphasisRedrawIds(prev, next)`:
+     the hovered edge's endpoints, and the symmetric difference to redraw
+   - Import-free so it loads under `node --test`; the pixi side
+     (`redrawNodeBg`, `createNodeDisplay`) reads the style table
+
+8. **Re-export shims** (replace dead code):
    - `EdgeRenderer.ts`: re-exports EdgeDrawingManager and related types from edgeDrawing.ts
    - `NodeRenderer.ts`: re-exports from nodeCreation.ts and dragManager.ts
    - `LabelRenderer.ts`: re-exports updateNodeLabelWrap from dragManager.ts
@@ -159,6 +170,19 @@ the result:
   are unioned, and only edges with BOTH endpoints in that union light up.
 - `none` -- no dimming; the base layer renders at full opacity.
 
+### Hovered-edge endpoint emphasis
+
+Edge hover has a node-side counterpart, separate from the edge highlight above:
+`Canvas` feeds `hoveredEdgeInfo`'s endpoints to
+`PixiRenderer.setHoveredEdgeEndpoints(source, target)`, which redraws just those
+nodes' backgrounds with a lighter-blue border. This answers "where does this
+edge actually land?" without tracing the polyline by eye -- the tooltip only
+names the endpoints in text.
+
+Each affected node is redrawn at its RESOLVED emphasis
+(`resolveNodeEmphasis`), so a selected endpoint keeps its selected border, and
+only the symmetric difference of the endpoint set is touched per hover change.
+
 ## Files
 
 | File | Role | Key Exports |
@@ -170,6 +194,7 @@ the result:
 | `packages/app/src/canvas/renderers/minimapRenderer.ts` | Minimap | `MinimapRenderer` |
 | `packages/app/src/canvas/renderers/dragManager.ts` | Drag + resize | `DragManager`, `redrawNodeBg`, `syncDisplayBounds` |
 | `packages/app/src/canvas/renderers/nodeCreation.ts` | Node factory | `createNodeDisplay`, `NodeDisplay`, `getNodeLayer` |
+| `packages/app/src/canvas/renderers/nodeEmphasis.ts` | Node border emphasis (pure) | `NodeEmphasis`, `NODE_EMPHASIS_STYLES`, `resolveNodeEmphasis`, `edgeEndpointIds`, `emphasisRedrawIds` |
 | `packages/app/src/canvas/renderers/EdgeRenderer.ts` | Re-export shim | Re-exports from edgeDrawing.ts |
 | `packages/app/src/canvas/renderers/NodeRenderer.ts` | Re-export shim | Re-exports from nodeCreation.ts + dragManager.ts |
 | `packages/app/src/canvas/renderers/LabelRenderer.ts` | Re-export shim | Re-exports from dragManager.ts |
@@ -185,10 +210,17 @@ the result:
 | `packages/app/tests/nodeRenderer.test.ts` | Node labels, colors, blockKindPrefix, selected-node state machine, color constants |
 | `packages/app/tests/edgeGeometry.test.ts` | Edge routing geometry (anchorEdgePolyline, rerouteOrthogonalEdge) |
 | `packages/app/tests/edgeLabels.test.ts` | Arc-length midpoint, count-chip LOD/count predicate, chip alpha clamping, label formatting |
+| `packages/app/tests/nodeEmphasis.test.ts` | Emphasis precedence (selected > edge-endpoint > none), border style table, hovered-edge endpoint ids, redraw diffing |
 | `packages/app/tests/selectionModel.test.ts` | Highlight-source precedence (hover > pin > none, induced at 2+), selection reducer, invalidation, Esc precedence (see `docs/features/selection.md`) |
 | `packages/app/tests/palette.test.ts` | Palette invariants: merged edge hues, cross-map hex/near-duplicate collisions, saturation ordering, contrast on the dark canvas (see `docs/features/palette.md`) |
 
 ## Invariants and Constraints
+
+- Node borders have exactly one source of truth: `NODE_EMPHASIS_STYLES`. Both
+  the create path (`createNodeDisplay`) and the redraw path (`redrawNodeBg`)
+  read it, so a node's border cannot drift between creation and restyle.
+- Selection outranks hovered-edge-endpoint emphasis; a pinned node never looks
+  less selected because an edge touching it is hovered.
 
 - No circular dependencies between extracted modules. PixiRenderer imports from all sub-modules but sub-modules do not import from PixiRenderer.
 - `edgeDrawing.ts` receives node display info via a callback (`getNodeDisplayRef`) rather than holding a reference to the nodeDisplays map.

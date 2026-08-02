@@ -10,8 +10,11 @@ import { useGraphStore } from "../stores/graphStore";
  * Each step either consumes the key and returns, or falls through to the next.
  *
  * PRECEDENCE CHAIN -- keep in this order:
- *   1. (feat/pinned-selection) clear a pinned selection. Insert ABOVE the focus
- *      pop below, so Esc unpins before it starts leaving the neighborhood.
+ *   1. Selection: handled ABOVE this hook by `useSelectionEscape`, which runs in
+ *      the CAPTURE phase and consumes Esc only while focus is INACTIVE. Do not
+ *      add an unpin step here: entering/popping a focus frame re-selects the
+ *      frame's node, so clearing the selection first would make backing out of
+ *      an N-deep stack take 2N+1 presses.
  *   2. Focus stack: pop exactly ONE frame. Focus exits only when the stack
  *      empties, so Esc retraces a drill-down the way the user walked in.
  */
@@ -21,7 +24,8 @@ export function useEscapeKey() {
       if (e.key !== "Escape") return;
       const store = useGraphStore.getState();
 
-      // --- 1. pinned selection goes here (feat/pinned-selection) ---
+      // --- 1. selection: owned by useSelectionEscape (capture phase, and only
+      //         while unfocused) -- see the precedence note above ---
 
       // --- 2. focus stack: pop one frame ---
       if (store.focusStack.length === 0) return;

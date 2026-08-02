@@ -32,13 +32,10 @@ interface ViewportState {
   // Edge LOD settings
   edgeLODSettings: EdgeLODSettings;
 
-  /** Whether semantic edge bundling is enabled. */
-  edgeBundling: boolean;
 
   // Actions
   updateViewport: (x: number, y: number, w: number, h: number, scale: number) => void;
   setEdgeLODSettings: (settings: Partial<EdgeLODSettings>) => void;
-  setEdgeBundling: (enabled: boolean) => void;
 }
 
 function getLODLevel(scale: number): LODLevel {
@@ -93,7 +90,6 @@ export const useViewportStore = create<ViewportState>((set, get) => ({
   scale: 1,
   lodLevel: "detail",
   edgeLODSettings: loadEdgeLODSettings(),
-  edgeBundling: false,
 
   updateViewport: (x, y, width, height, scale) =>
     set({
@@ -111,6 +107,4 @@ export const useViewportStore = create<ViewportState>((set, get) => ({
     saveEdgeLODSettings(updated);
     set({ edgeLODSettings: updated });
   },
-
-  setEdgeBundling: (enabled) => set({ edgeBundling: enabled }),
 }));
