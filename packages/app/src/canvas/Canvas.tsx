@@ -25,6 +25,7 @@ export function Canvas() {
     selectedNodeIds,
     selectedNodeId,
     hoveredNodeId,
+    hoveredEdgeInfo,
     enabledEdgeKinds,
     hideUnconnectedNodes,
     hideAmbiguousEdges,
@@ -41,6 +42,7 @@ export function Canvas() {
       selectedNodeIds: s.selectedNodeIds,
       selectedNodeId: s.selectedNodeId,
       hoveredNodeId: s.hoveredNodeId,
+      hoveredEdgeInfo: s.hoveredEdgeInfo,
       enabledEdgeKinds: s.enabledEdgeKinds,
       hideUnconnectedNodes: s.hideUnconnectedNodes,
       hideAmbiguousEdges: s.hideAmbiguousEdges,
@@ -155,6 +157,17 @@ export function Canvas() {
       rendererRef.current.setHoveredNode(hoveredNodeId);
     }
   }, [hoveredNodeId]);
+
+  // Emphasise the hovered edge's endpoint nodes, so it is visible where the
+  // edge lands without tracing the polyline by eye.
+  useEffect(() => {
+    if (rendererRef.current) {
+      rendererRef.current.setHoveredEdgeEndpoints(
+        hoveredEdgeInfo?.sourceId ?? null,
+        hoveredEdgeInfo?.targetId ?? null
+      );
+    }
+  }, [hoveredEdgeInfo]);
 
   // Redraw edges when LOD settings change
   const edgeLODSettings = useViewportStore((s) => s.edgeLODSettings);

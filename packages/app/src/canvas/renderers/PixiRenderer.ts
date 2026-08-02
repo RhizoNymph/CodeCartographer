@@ -26,6 +26,12 @@ import {
   getNodeLayer,
   type NodeDisplay,
 } from "./nodeCreation";
+import {
+  edgeEndpointIds,
+  emphasisRedrawIds,
+  resolveNodeEmphasis,
+  type NodeEmphasis,
+} from "./nodeEmphasis";
 
 /** Window within which two taps count as a double-click. */
 const DOUBLE_TAP_MS = 350;
@@ -41,6 +47,8 @@ export class PixiRenderer {
   private componentLayer!: Container;
   private nodeDisplays = new Map<string, NodeDisplay>();
   private hoveredNodeId: string | null = null;
+  /** Endpoints of the edge currently under the pointer (emphasised borders). */
+  private hoveredEdgeEndpoints: ReadonlySet<string> = new Set<string>();
   private currentEnabledEdgeKinds: Set<EdgeKind> | null = null;
   private parentByNodeId = new Map<string, string>();
   private resizeObserver: ResizeObserver;
@@ -438,7 +446,7 @@ export class PixiRenderer {
     pos: LayoutNodePosition,
     _isExpanded: boolean
   ) {
-    const display = createNodeDisplay(node, pos, this.isSelected(nodeId));
+    const display = createNodeDisplay(node, pos, this.nodeEmphasisFor(nodeId));
 
     // Click handler. Ctrl/Cmd-click toggles membership of the selection set
     // (multi-select); a plain click replaces it.
@@ -660,14 +668,12 @@ export class PixiRenderer {
 
     for (const id of previous) {
       if (current.has(id)) continue;
-      const display = this.nodeDisplays.get(id);
-      if (display) redrawNodeBg(display, false);
+      this.restyleNode(id);
     }
 
     for (const id of current) {
       if (previous.has(id)) continue;
-      const display = this.nodeDisplays.get(id);
-      if (display) redrawNodeBg(display, true);
+      this.restyleNode(id);
     }
 
     this.applyHighlight();
@@ -675,6 +681,40 @@ export class PixiRenderer {
 
   private isSelected(nodeId: string): boolean {
     return selectionIds(this.selection).has(nodeId);
+  }
+
+  /** A node's border emphasis from the current selection + hovered edge. */
+  private nodeEmphasisFor(nodeId: string): NodeEmphasis {
+    return resolveNodeEmphasis(
+      this.isSelected(nodeId),
+      this.hoveredEdgeEndpoints.has(nodeId)
+    );
+  }
+
+  /** Redraw one node's background at its currently resolved emphasis. */
+  private restyleNode(nodeId: string): void {
+    const display = this.nodeDisplays.get(nodeId);
+    if (display) redrawNodeBg(display, this.nodeEmphasisFor(nodeId));
+  }
+
+  /**
+   * Emphasise the endpoints of the edge under the pointer, so it is obvious
+   * where an edge actually lands in a dense view -- the tooltip only names them
+   * in text. Pass nulls when no edge is hovered.
+   *
+   * Only the nodes whose endpoint-ness actually changed are redrawn, and each
+   * is redrawn at its RESOLVED emphasis, so a selected endpoint keeps its
+   * selected border throughout.
+   */
+  setHoveredEdgeEndpoints(source: string | null, target: string | null): void {
+    const next = edgeEndpointIds(source, target);
+    const changed = emphasisRedrawIds(this.hoveredEdgeEndpoints, next);
+    if (changed.length === 0) return;
+
+    this.hoveredEdgeEndpoints = next;
+    for (const id of changed) {
+      this.restyleNode(id);
+    }
   }
 
   /**

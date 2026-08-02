@@ -3,6 +3,7 @@ import type { CodeNode, BlockKind } from "../../api/types";
 import { BLOCK_COLORS, NODE_COLORS } from "../../api/types";
 import type { LayoutNodePosition } from "../layout/elkLayout";
 import { drawNodeShape, DIRECTORY_TAB_HEIGHT } from "./shapes";
+import { nodeBorderStyle, type NodeEmphasis } from "./nodeEmphasis";
 
 export interface NodeDisplay {
   container: Container;
@@ -20,7 +21,7 @@ export interface NodeDisplay {
 export function createNodeDisplay(
   node: CodeNode,
   pos: LayoutNodePosition,
-  isSelected: boolean
+  emphasis: NodeEmphasis
 ): NodeDisplay {
   const container = new Container();
   container.x = pos.x;
@@ -31,10 +32,9 @@ export function createNodeDisplay(
   // Background
   const bg = new Graphics();
   const color = getNodeColor(node);
-  const borderColor = isSelected ? 0x60a5fa : 0x334155;
-  const borderWidth = isSelected ? 3 : 1;
+  const border = nodeBorderStyle(emphasis);
 
-  drawNodeShape(bg, node, pos.width, pos.height, color, borderColor, borderWidth);
+  drawNodeShape(bg, node, pos.width, pos.height, color, border.color, border.width);
 
   container.addChild(bg);
 

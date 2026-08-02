@@ -2,6 +2,7 @@ import type { CodeGraph, CodeNode } from "../../api/types";
 import type { LayoutNodePosition, LayoutResult } from "../layout/elkLayout";
 import { getNodeColor, type NodeDisplay } from "./nodeCreation";
 import { drawNodeShape } from "./shapes";
+import { nodeBorderStyle, resolveNodeEmphasis, type NodeEmphasis } from "./nodeEmphasis";
 import type { NodePadding } from "./types";
 
 interface DragTarget {
@@ -140,7 +141,9 @@ export class DragManager {
     display.container.y = nextY;
     display.layoutPos.width = nextWidth;
     display.layoutPos.height = nextHeight;
-    redrawNodeBg(display, selectedNodeIds.has(nodeId));
+    // Edge hover is suppressed while a drag is active, so a dragged node is
+    // never also a hovered edge's endpoint.
+    redrawNodeBg(display, resolveNodeEmphasis(selectedNodeIds.has(nodeId), false));
     updateNodeLabelWrap(display);
     syncDisplayBounds(nodeId, display, lastLayout);
   }
@@ -167,10 +170,11 @@ function getNodePadding(node: CodeNode): NodePadding {
 /**
  * Redraw a node's background graphics using the shared shape drawing.
  */
-export function redrawNodeBg(display: NodeDisplay, selected: boolean): void {
+export function redrawNodeBg(display: NodeDisplay, emphasis: NodeEmphasis): void {
   const bg = display.bg;
   const pos = display.layoutPos;
   const color = getNodeColor(display.nodeData);
+  const border = nodeBorderStyle(emphasis);
 
   bg.clear();
   drawNodeShape(
@@ -179,8 +183,8 @@ export function redrawNodeBg(display: NodeDisplay, selected: boolean): void {
     pos.width,
     pos.height,
     color,
-    selected ? 0x60a5fa : 0x334155,
-    selected ? 3 : 1
+    border.color,
+    border.width
   );
 }
 
