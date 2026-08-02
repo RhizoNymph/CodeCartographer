@@ -20,6 +20,14 @@ export interface FocusHotkeyEvent {
   targetTagName: string | null;
   /** Whether the event target is a contenteditable host. */
   targetIsEditable: boolean;
+  /**
+   * Whether this keydown came from the key being HELD (OS auto-repeat).
+   * Optional: an omitted value means "not a repeat", which is what every
+   * synthetic caller means and what the DOM reports for a first press.
+   */
+  repeat?: boolean;
+  /** Whether the keydown was delivered mid-IME-composition. Optional as above. */
+  isComposing?: boolean;
 }
 
 /** The graph-store state the hotkey decision depends on. */
@@ -36,6 +44,10 @@ export type FocusHotkeyIgnoreReason =
   | "modifier"
   /** The key went into a text field (e.g. the sidebar search box). */
   | "typing"
+  /** The keystroke belongs to an in-flight IME composition. */
+  | "composing"
+  /** OS auto-repeat from a held key -- one press means one focus. */
+  | "repeat"
   /** Nothing is hovered or selected. */
   | "no-target"
   /** The target is already the active focus node. */
@@ -58,6 +70,15 @@ export function resolveFocusHotkey(
 ): FocusHotkeyResult {
   if (event.key.toLowerCase() !== "f") {
     return { kind: "ignore", reason: "not-hotkey" };
+  }
+  if (event.isComposing) {
+    return { kind: "ignore", reason: "composing" };
+  }
+  // Auto-repeat is dropped BEFORE the target checks: each repeat would
+  // otherwise dispatch its own get_neighborhood IPC round-trip, and the
+  // already-focused guard cannot catch them until the first fetch resolves.
+  if (event.repeat) {
+    return { kind: "ignore", reason: "repeat" };
   }
   if (event.ctrlKey || event.metaKey || event.altKey) {
     return { kind: "ignore", reason: "modifier" };
