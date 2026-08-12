@@ -32,7 +32,10 @@ The PixiRenderer (orchestrator) delegates to focused sub-modules:
 1. **PixiRenderer.ts** (~565 lines) - Orchestrator
    - Owns the Pixi Application, Viewport, and layer containers
    - Constructor, init, destroy lifecycle
-   - `updateGraph()`, `renderFromLayout()`, `updateVisibility()`
+   - `updateGraph()` (full layout), `updateEdges()` (edge-only phase),
+     `renderFromLayout()`, `rebuildEdgeDisplays()`, `updateVisibility()`
+   - `layoutQueue`: a `CoalescingScheduler<LayoutRequest>` that serialises layout
+     work and collapses a burst of requests into ONE rerun (see graph-layout.md)
    - `setHoveredNode()`, `setSelection(nodeIds, primaryId)`, `zoomToNode()`
    - `applyHighlight()` / `rebuildHighlightedEdgeIndices(source)`: resolve and apply
      the hover-or-pin highlight (connected vs induced subgraph)
@@ -132,8 +135,14 @@ The PixiRenderer (orchestrator) delegates to focused sub-modules:
 ## Data/Control Flow
 
 1. Canvas component subscribes to graphStore changes
-2. On graph/expansion/visibility change, calls `pixiRenderer.updateGraph(graph, expanded, visible, edgeKinds)`
-3. PixiRenderer builds parent map, calls `layoutGraph()` (async)
+2. When the store's `layoutVersion` bumps (node positions changed), calls
+   `pixiRenderer.updateGraph(graph, expanded, visible, edgeKinds, hideAmbiguous)`;
+   when `edgeVersion` bumps (only which edges show changed), calls
+   `pixiRenderer.updateEdges(edgeKinds, hideAmbiguous)`, which re-fetches the view
+   edges and redraws them on the cached positions without touching ELK or the
+   camera. Hiding nodes calls `updateVisibility()`. See graph-layout.md for the
+   full trigger table.
+3. For a full request PixiRenderer builds the parent map and calls `layoutGraph()` (async)
    - `elkLayout.ts` runs ELK in a web worker (via `elkjs/lib/elk-api` with `workerFactory: () => new ElkWorker()`, where `ElkWorker` is imported from `elkjs/lib/elk-worker.min.js?worker`). Layout computation therefore happens off the main thread, so large graphs no longer freeze the UI. `layoutGraph()` is already async and PixiRenderer already discards stale results, so no other behavior changes.
 4. On layout result, `renderFromLayout()`:
    a. Clears existing displays
@@ -233,4 +242,4 @@ only the symmetric difference of the endpoint set is touched per hover change.
 - Count chips are built inside the same pass that strokes the edges, so they are rebuilt exactly when their layer is (including drag redraws) and add no per-frame work. Chips are world-space children of the edge layer, so they scale with zoom.
 - Allocation per rebuild is bounded by the number of `count > 1` edges in view. Aggregated edges only exist for collapsed containers, so this stays small.
 - A chip's alpha equals its edge's alpha (`chipAlphaForEdge`), and `setBaseLayerAlpha()` dims base edges and base chips together, so a chip can never read brighter than the edge it labels.
-- The public API of PixiRenderer (as consumed by Canvas.tsx) is: constructor, waitForInit, updateGraph, updateVisibility, setSelection, setHoveredNode, refreshEdges, zoomToNode, destroy. (`setSelectedNode` was replaced by `setSelection(nodeIds, primaryId)` when selection became a set.)
+- The public API of PixiRenderer (as consumed by Canvas.tsx) is: constructor, waitForInit, updateGraph, updateEdges, updateVisibility, setSelection, setHoveredNode, setHoveredEdgeEndpoints, refreshEdges, zoomToNode, destroy. (`setSelectedNode` was replaced by `setSelection(nodeIds, primaryId)` when selection became a set.)
