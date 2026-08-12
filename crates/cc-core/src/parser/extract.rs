@@ -59,20 +59,36 @@ pub enum RawRefKind {
     VariableUsage,
 }
 
+/// One file that failed to parse, reported inside a [`ParseEvent::Progress`]
+/// batch rather than as its own event.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ParseFileError {
+    pub path: String,
+    pub message: String,
+}
+
 /// Progress event emitted during parsing.
+///
+/// Progress is BATCHED: a per-file event pair meant two IPC messages, two JSON
+/// serializations and two JS main-thread wakeups per file, and one store
+/// broadcast each -- O(files) work on the UI thread purely to animate a progress
+/// bar. One `Progress` event instead carries the running totals (which is all
+/// the UI renders), the file the batch ended on, and any errors seen since the
+/// previous batch.
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(tag = "type")]
 pub enum ParseEvent {
-    FileStart {
-        path: String,
-    },
-    FileDone {
-        path: String,
-        blocks: usize,
-    },
-    Error {
-        path: String,
-        message: String,
+    Progress {
+        /// Files merged so far, including failures.
+        parsed_files: usize,
+        /// Files this parse will visit in total (known up front).
+        total_files: usize,
+        /// Code blocks extracted so far.
+        total_blocks: usize,
+        /// The last file merged in this batch, for the "currently parsing" line.
+        current_file: String,
+        /// Failures since the previous batch (usually empty).
+        errors: Vec<ParseFileError>,
     },
     Complete {
         total_files: usize,
