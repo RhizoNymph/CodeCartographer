@@ -142,6 +142,28 @@ Features Index:
         depends_on: [state-management, graph-model, zoom-views, palette]
         doc: docs/features/details-panel.md
 
+    benchmarking:
+        description: >
+            Performance measurement across all three layers, with no pass/fail gate anywhere.
+            Criterion benches cover cc-core's hot functions on fixtures shaped like real data --
+            nested Directory > File > CodeBlock trees rendered with containers COLLAPSED, so
+            aggregation actually walks ancestor chains (the previous flat fixture had an empty
+            parent map and skipped that path entirely). An end-to-end harness
+            (cc-core example perf_harness) runs scan -> parse -> resolve plus the UI's query
+            battery -- subgraph extraction at four render-set sizes, neighborhood BFS,
+            edge-detail drill-in, parse-payload build + serialize -- and prints one JSON object
+            of timings, graph stats and payload bytes; it is written against only the cc-core
+            API that is identical across compared branches, so the same binary source measures
+            both sides. A seeded Python generator produces byte-identical synthetic repos
+            (200/2000/10000 modules, configurable hub-name collision fraction driving resolver
+            ambiguity). A node script benchmarks the canvas edge-routing pass, degrading
+            gracefully where the obstacle index and routing budget do not exist. run_all.sh
+            drives every layer in one pass; the bench workflow uploads the same artifacts on
+            demand.
+        entry_points: [crates/cc-core/benches/graph_bench.rs, crates/cc-core/benches/parse_bench.rs, crates/cc-core/benches/common/mod.rs, crates/cc-core/examples/perf_harness.rs, benchmarks/gen_repo.py, benchmarks/run_all.sh, packages/app/benchmarks/edgeRouting.bench.ts, .github/workflows/bench.yml]
+        depends_on: [graph-model, parsing, resolution_precision, repo-scanning, canvas-rendering]
+        doc: docs/features/benchmarking.md
+
     error-handling:
         description: React ErrorBoundary components wrapping major UI sections for graceful error recovery.
         entry_points: [packages/app/src/components/ErrorBoundary.tsx, packages/app/src/App.tsx]
