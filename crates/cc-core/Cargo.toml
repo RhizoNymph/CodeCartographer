@@ -21,6 +21,14 @@ tree-sitter-javascript = "0.23"
 tempfile = "3"
 criterion = { workspace = true }
 
+# The lib has no `#[bench]` functions, but cargo still builds a libtest bench
+# harness for it and runs it as part of `cargo bench -p cc-core`. That harness
+# rejects criterion's CLI flags, so `cargo bench -p cc-core -- --sample-size 20`
+# fails before reaching a single benchmark. Opting the lib out leaves the two
+# criterion targets as the only bench targets.
+[lib]
+bench = false
+
 [[bench]]
 name = "graph_bench"
 harness = false

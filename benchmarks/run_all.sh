@@ -22,7 +22,7 @@
 set -euo pipefail
 
 if [ $# -lt 3 ]; then
-  echo "usage: $0 <label> <output-dir> <synthetic-repos-dir>" >&2
+  echo "usage: $0 <label> <output-dir> <synthetic-repos-dir> [real-repo-path]" >&2
   exit 2
 fi
 
@@ -30,6 +30,10 @@ LABEL="$1"
 OUT="$(mkdir -p "$2" && cd "$2" && pwd)"
 REPOS="$3"
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The "real repo" case. Defaults to this checkout, but when comparing two
+# branches pass the SAME path to both runs: the two checkouts differ in content,
+# and a difference in input is not a difference in speed.
+REAL_REPO="${4:-$ROOT}"
 
 CRITERION_ARGS=(--warm-up-time 1 --measurement-time 3 --sample-size 20)
 
@@ -49,11 +53,15 @@ for size in small medium large; do
     > /dev/null 2> "$OUT/harness-$size.log"
 done
 
-echo "== [$LABEL] harness on the CodeCartographer repo itself =="
-"$HARNESS" --repo "$ROOT" --label "$LABEL/self" --out "$OUT/harness-self.json" \
+echo "== [$LABEL] harness on the real repo ($REAL_REPO) =="
+"$HARNESS" --repo "$REAL_REPO" --label "$LABEL/self" --out "$OUT/harness-self.json" \
   > /dev/null 2> "$OUT/harness-self.log"
 
 echo "== [$LABEL] criterion =="
+# Requires `[lib] bench = false` in crates/cc-core/Cargo.toml: without it cargo
+# builds a libtest bench harness for the lib and runs it first, and that harness
+# rejects criterion's CLI flags, failing the invocation before a single benchmark
+# runs. A baseline checkout predating that line needs it copied in too.
 (cd "$ROOT" && cargo bench -p cc-core -- "${CRITERION_ARGS[@]}") \
   > "$OUT/criterion.txt" 2>&1 || echo "criterion exited non-zero; see $OUT/criterion.txt" >&2
 
