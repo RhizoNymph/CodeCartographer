@@ -120,7 +120,21 @@ edition = "2021"
 opt-level = 1
 [profile.dev.package."*"]
 opt-level = 3
+
+# The workspace crates hold the hot loops, so they are optimized even in dev.
+[profile.dev.package.cc-core]
+opt-level = 3
+[profile.dev.package.cc-tauri]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
 ```
+
+`panic` is left at the default `unwind` in release: rayon propagates a panic
+from a worker thread to its joiner by catching the unwind, so `panic = "abort"`
+would turn a parser panic on a single file into an abort of the whole app.
 
 ### src-tauri/Cargo.toml
 
@@ -221,7 +235,7 @@ Frontend                          Backend
 
 | Variable | Purpose |
 |----------|---------|
-| RUST_LOG | Tracing log level |
+| RUST_LOG | Tracing log level. `start.sh` defaults it to `info`; export `RUST_LOG=debug` before running it for verbose per-file scanner/parser logs. |
 | TAURI_DEBUG | Debug build flag |
 
 ## Icons
