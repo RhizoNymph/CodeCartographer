@@ -412,7 +412,6 @@ export class PixiRenderer {
 
     const { graph, expandedNodes, visibleNodes } = request;
     this.currentGraph = graph;
-    this.currentVisibleNodes = visibleNodes;
     this.currentEnabledEdgeKinds = request.enabledEdgeKinds;
     this.parentByNodeId = buildParentMap(graph);
 
@@ -425,6 +424,9 @@ export class PixiRenderer {
     );
     if (requestId !== this._layoutRequestId || this.destroyed) return; // stale -- discard
 
+    // Adopt the request's visible set only now, so a visibility toggle made
+    // while this layout ran keeps applying to the displays on screen.
+    this.currentVisibleNodes = visibleNodes;
     this.lastLayout = layout;
     // Publish per-kind view counts for the legend only once the layout is
     // known to be current, so a superseded fetch cannot clobber fresh counts.
