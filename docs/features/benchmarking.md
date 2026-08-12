@@ -94,8 +94,13 @@ cargo run --release --example perf_harness -- --repo /path/to/repo --label main
 ```
 
 Flags: `--repo` (required), `--label`, `--seed`, `--subgraph-reps`,
-`--neighborhood-queries`, `--edge-detail-queries`, `--out FILE`. JSON goes to
-stdout, progress to stderr.
+`--neighborhood-queries`, `--edge-detail-queries`, `--out FILE`,
+`--dump-payload FILE`. JSON goes to stdout, progress to stderr.
+
+`--dump-payload` writes the serialized `ParseResult` itself, for answering "what
+is the payload MADE of" rather than just how big it is. Measuring per-field byte
+shares that way is what showed `signature` to be the fifth-largest contributor,
+not the first (see `benchmarks/RESULTS.md`).
 
 Two properties are load-bearing and must be preserved:
 

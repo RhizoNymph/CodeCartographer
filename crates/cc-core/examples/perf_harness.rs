@@ -184,6 +184,7 @@ struct Args {
     neighborhood_queries: usize,
     edge_detail_queries: usize,
     out: Option<PathBuf>,
+    dump_payload: Option<PathBuf>,
 }
 
 fn parse_args() -> Result<Args, String> {
@@ -194,6 +195,7 @@ fn parse_args() -> Result<Args, String> {
     let mut neighborhood_queries = 200usize;
     let mut edge_detail_queries = 50usize;
     let mut out: Option<PathBuf> = None;
+    let mut dump_payload: Option<PathBuf> = None;
 
     let mut argv = std::env::args().skip(1);
     while let Some(arg) = argv.next() {
@@ -219,11 +221,13 @@ fn parse_args() -> Result<Args, String> {
                     .map_err(|e| format!("--edge-detail-queries: {e}"))?
             }
             "--out" => out = Some(PathBuf::from(value()?)),
+            "--dump-payload" => dump_payload = Some(PathBuf::from(value()?)),
             "--help" | "-h" => {
                 eprintln!(
                     "perf_harness --repo PATH [--label NAME] [--seed N] \
                      [--subgraph-reps N] [--neighborhood-queries N] \
-                     [--edge-detail-queries N] [--out FILE]"
+                     [--edge-detail-queries N] [--out FILE] \
+                     [--dump-payload FILE]"
                 );
                 std::process::exit(0);
             }
@@ -239,6 +243,7 @@ fn parse_args() -> Result<Args, String> {
         neighborhood_queries,
         edge_detail_queries,
         out,
+        dump_payload,
     })
 }
 
@@ -533,6 +538,11 @@ fn main() -> anyhow::Result<()> {
         let json = serde_json::to_string(&result)?;
         payload_serialize.push(t_ser.elapsed());
         payload_bytes = json.len();
+        if let Some(path) = &args.dump_payload {
+            // For inspecting WHAT the payload is made of (which fields carry the
+            // bytes), not just how many there are. Written once, not per rep.
+            std::fs::write(path, &json)?;
+        }
         black_box(&json);
     }
 
