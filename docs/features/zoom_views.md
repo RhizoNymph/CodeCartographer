@@ -60,11 +60,19 @@ Canvas derives the layout inputs each render (graphViewModel.ts):
   displayVisible    = computeDisplayVisibleNodes(graph, visibleNodes,
                         layoutEdgeKinds, hideUnconnectedNodes)
 
-PixiRenderer.updateGraph(graph, layoutExpanded, displayVisible,
-                         layoutEdgeKinds, layoutHideAmbig)
-  -> elkLayout.layoutGraph(...) -> getSubgraph(renderIds, layoutEdgeKinds)
-       -> also derives LayoutResult.edgeKindCounts, which PixiRenderer publishes
-          to edgeLegendStore for the EdgeLegend overlay
+Canvas feeds those inputs to the renderer through the trigger counters, NOT by
+depending on their (always-new) Set identities -- see graph-layout.md:
+  layoutVersion++ -> PixiRenderer.updateGraph(graph, layoutExpanded,
+                       displayVisible, layoutEdgeKinds, layoutHideAmbig)
+                     -> elkLayout.layoutGraph(...) -> getSubgraph(renderIds, kinds)
+  edgeVersion++   -> PixiRenderer.updateEdges(layoutEdgeKinds, layoutHideAmbig)
+                     -> edgePhase against the cached positions
+  either way LayoutResult.edgeKindCounts is published to edgeLegendStore for the
+  EdgeLegend overlay.
+
+Because module view DERIVES its constraints, changes it ignores cost nothing:
+file expansion and edge-kind/ambiguity toggles are classified "none" by
+relayoutPolicy while viewMode is "module".
 
 Switching mode -> graphStore.setViewMode -> reduceSetViewMode + bump
 layoutVersion + persist. Entering module view drops any active focus.
@@ -226,7 +234,8 @@ only -- it unmounts on pointerout, so a button there is unreachable.
 - `packages/app/src/stores/persistenceStore.ts` — `ViewMode` type; `viewMode`
   added to `FolderState` (optional; defaults to `"module"` for old states).
 - `packages/app/src/canvas/Canvas.tsx` — derives effective layout inputs and
-  focus visibility/expansion; feeds them to `PixiRenderer.updateGraph`.
+  focus visibility/expansion; feeds them to `PixiRenderer.updateGraph` /
+  `updateEdges` / `updateVisibility` under the store's trigger counters.
 - `packages/app/src/canvas/FocusBreadcrumb.tsx` — the breadcrumb trail: root
   "All" chip + one chip per frame (truncated node name, or "A → B" for an edge
   frame), with the current frame's depth selector, direction toggle and X.
