@@ -18,11 +18,13 @@ import {
   type Point,
 } from "./edgeGeometry";
 import { getNodeSize } from "../utils/graphUtils";
+import {
+  LAYOUT_EDGE_ROUTING_EDGE_LIMIT,
+  LAYOUT_EDGE_ROUTING_NODE_LIMIT,
+  shouldSkipLayoutEdgeRouting,
+} from "../renderers/edgeRoutingBudget";
 
 const elk = new ELK({ workerFactory: () => new ElkWorker() });
-
-/** Above this many rendered nodes, ELK edge routing is skipped for performance. */
-const EDGE_ROUTING_NODE_LIMIT = 1500;
 
 const ALL_EDGE_KINDS: EdgeKind[] = [
   "Import",
@@ -223,12 +225,15 @@ export async function layoutGraph(
   }
 
   // Layout guard: for very large views, skip ELK orthogonal edge routing and let
-  // extractLayout produce straight-line fallback edges. Routing thousands of
-  // edges is prohibitively slow.
-  const skipEdgeRouting = elkNodeIds.size > EDGE_ROUTING_NODE_LIMIT;
+  // extractLayout produce straight-line fallback edges. Routing cost is driven
+  // by EDGES as much as nodes, so both counts gate it -- a 1400-node view
+  // carrying 20k edges is just as unroutable as a 5000-node one.
+  const skipEdgeRouting = shouldSkipLayoutEdgeRouting(elkNodeIds.size, viewEdges.length);
   if (skipEdgeRouting && import.meta.env.DEV) {
     useDebugStore.getState().addLog(
-      `Large view (${elkNodeIds.size} nodes > ${EDGE_ROUTING_NODE_LIMIT}): skipping edge routing. ` +
+      `Large view (${elkNodeIds.size} nodes / ${viewEdges.length} edges exceeds ` +
+        `${LAYOUT_EDGE_ROUTING_NODE_LIMIT} nodes or ${LAYOUT_EDGE_ROUTING_EDGE_LIMIT} edges): ` +
+        `skipping edge routing. ` +
         `Consider Module view or collapsing containers for cleaner routing.`
     );
   }
