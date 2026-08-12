@@ -1,0 +1,122 @@
+# Performance benchmarks -- INFORMATIONAL ONLY.
+#
+# This workflow never fails on a timing. There are deliberately no thresholds,
+# no regression gates and no "must not be slower than" comparisons, because
+# GitHub's shared runners cannot support one: the CPU model varies between jobs,
+# the host is shared with other tenants, and run-to-run noise on the same commit
+# routinely reaches tens of percent. A gate built on that would either fire
+# constantly on noise or be set so loose it catches nothing, and either way the
+# first thing anyone would do is start ignoring it.
+#
+# What it IS for: producing a benchmark artifact on demand, from a known commit,
+# with a known input, so a human can download two of them and compare. When a
+# number matters, run `benchmarks/run_all.sh` on one machine against both
+# branches back to back -- see docs/features/benchmarking.md.
+
+name: bench
+
+on:
+  workflow_dispatch:
+    inputs:
+      preset:
+        description: "Synthetic repo size for the harness"
+        required: false
+        default: medium
+        type: choice
+        options: [small, medium, large]
+  pull_request:
+    types: [labeled, synchronize]
+
+permissions:
+  contents: read
+
+jobs:
+  bench:
+    # On a PR, only when it carries the `bench` label; always on manual dispatch.
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      contains(github.event.pull_request.labels.*.name, 'bench')
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: ". -> target"
+
+      - name: Build harness
+        run: cargo build --release --example perf_harness -p cc-core
+
+      - name: Generate synthetic repo
+        env:
+          PRESET: ${{ github.event.inputs.preset || 'medium' }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/bench-repos"
+          python3 benchmarks/gen_repo.py \
+            --preset "$PRESET" \
+            --out "$RUNNER_TEMP/bench-repos/cc-$PRESET" \
+            --force
+
+      - name: Run end-to-end harness
+        env:
+          PRESET: ${{ github.event.inputs.preset || 'medium' }}
+        run: |
+          mkdir -p bench-results
+          ./target/release/examples/perf_harness \
+            --repo "$RUNNER_TEMP/bench-repos/cc-$PRESET" \
+            --label "${GITHUB_REF_NAME}/${PRESET}" \
+            --out bench-results/harness-synthetic.json
+
+      - name: Run end-to-end harness on this repo
+        run: |
+          ./target/release/examples/perf_harness \
+            --repo . \
+            --label "${GITHUB_REF_NAME}/self" \
+            --out bench-results/harness-self.json
+
+      # Reduced sampling: enough to see an order of magnitude, cheap enough to
+      # finish inside the job timeout. Not enough for a small-percentage claim --
+      # which is fine, because this workflow does not make one.
+      - name: Run criterion
+        run: |
+          cargo bench -p cc-core -- \
+            --warm-up-time 1 --measurement-time 2 --sample-size 10 \
+            | tee bench-results/criterion.txt
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Install frontend deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Run edge-routing benchmark
+        working-directory: packages/app
+        run: |
+          node benchmarks/edgeRouting.bench.ts \
+            --label "${GITHUB_REF_NAME}" \
+            --sizes 300x200,800x500 \
+            --reps 3 \
+            --json ../../bench-results/edge-routing.json
+
+      - name: Collect criterion raw estimates
+        if: always()
+        run: |
+          if [ -d target/criterion ]; then
+            tar -czf bench-results/criterion-raw.tar.gz target/criterion
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-${{ github.sha }}
+          path: bench-results/
+          retention-days: 30
