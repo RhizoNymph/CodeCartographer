@@ -269,9 +269,12 @@ export function Sidebar() {
             (e.currentTarget.style.borderColor = "#334155")
           }
         />
+        {/* Offered once a cheap update (hiding nodes, filtering edges) kept the
+            existing node positions: this re-solves them for the current state. */}
         {needsRelayout && (
           <button
             onClick={requestRelayout}
+            title="Re-solve node positions for the current filters"
             style={{
               marginTop: 8,
               width: "100%",

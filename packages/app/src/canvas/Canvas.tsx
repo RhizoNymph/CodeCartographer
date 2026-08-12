@@ -34,6 +34,7 @@ export function Canvas() {
     focusNeighborhood,
     focusEdgeDetail,
     layoutVersion,
+    edgeVersion,
   } = useGraphStore(
     useShallow((s) => ({
       graph: s.graph,
@@ -51,6 +52,7 @@ export function Canvas() {
       focusNeighborhood: s.focusNeighborhood,
       focusEdgeDetail: s.focusEdgeDetail,
       layoutVersion: s.layoutVersion,
+      edgeVersion: s.edgeVersion,
     }))
   );
   const [error, setError] = useState<string | null>(null);
@@ -116,32 +118,77 @@ export function Canvas() {
     };
   }, []);
 
-  // Only relayout when layoutVersion changes (triggered by setGraph or requestRelayout)
+  // The latest derived layout inputs. The layout effects deliberately do NOT
+  // depend on these: every store write produces fresh Set identities, so
+  // depending on them would run a full ELK layout for changes that cannot move a
+  // node. The store's trigger versions decide what runs (stores/relayoutPolicy);
+  // the effects then read whatever the newest inputs are.
+  const layoutInputsRef = useRef({
+    graph,
+    layoutExpandedNodes,
+    displayVisibleNodes,
+    layoutEdgeKinds,
+    layoutHideAmbiguous,
+  });
+  layoutInputsRef.current = {
+    graph,
+    layoutExpandedNodes,
+    displayVisibleNodes,
+    layoutEdgeKinds,
+    layoutHideAmbiguous,
+  };
+
+  // The visible set already handed to the renderer, so the cheap visibility
+  // effect below does not repeat work a layout request has just covered.
+  const appliedVisibleRef = useRef<Set<string> | null>(null);
+
+  // POSITIONS phase: a full ELK layout, only when layoutVersion says the node
+  // set or containment tree changed (fresh graph, expand/collapse, view mode,
+  // focus, hide-unconnected, or the explicit Apply Layout Changes button).
   useEffect(() => {
-    const codeBlocks = graph ? Object.values(graph.nodes).filter(n => n.type === "CodeBlock").length : 0;
-    const addLog = useDebugStore.getState().addLog;
-    addLog(`Canvas: edges=${graph?.edgeCount ?? 0}, codeBlocks=${codeBlocks}, hasRenderer=${!!rendererRef.current}, layoutVersion=${layoutVersion}`);
-    console.log("Canvas layout effect triggered:", {
-      hasRenderer: !!rendererRef.current,
-      hasGraph: !!graph,
-      edges: graph?.edgeCount ?? 0,
-      codeBlocks,
-      layoutVersion,
-    });
-    if (rendererRef.current && graph) {
-      rendererRef.current.updateGraph(
-        graph,
-        layoutExpandedNodes,
-        displayVisibleNodes,
-        layoutEdgeKinds,
-        layoutHideAmbiguous
+    const renderer = rendererRef.current;
+    const inputs = layoutInputsRef.current;
+
+    if (import.meta.env.DEV) {
+      const codeBlocks = inputs.graph
+        ? Object.values(inputs.graph.nodes).filter((n) => n.type === "CodeBlock").length
+        : 0;
+      useDebugStore
+        .getState()
+        .addLog(
+          `Canvas: edges=${inputs.graph?.edgeCount ?? 0}, codeBlocks=${codeBlocks}, hasRenderer=${!!renderer}, layoutVersion=${layoutVersion}`
+        );
+    }
+
+    if (renderer && inputs.graph) {
+      appliedVisibleRef.current = inputs.displayVisibleNodes;
+      renderer.updateGraph(
+        inputs.graph,
+        inputs.layoutExpandedNodes,
+        inputs.displayVisibleNodes,
+        inputs.layoutEdgeKinds,
+        inputs.layoutHideAmbiguous
       );
     }
-  }, [graph, layoutVersion, layoutEdgeKinds, layoutHideAmbiguous, layoutExpandedNodes, displayVisibleNodes]);
+  }, [graph, layoutVersion]);
 
-  // Update visibility immediately when nodes are checked/unchecked (without full relayout)
+  // EDGES phase: which edges show changed (edge-kind toggle, hide-ambiguous).
+  // Re-fetches and redraws against the cached node positions -- no ELK run.
+  useEffect(() => {
+    if (edgeVersion === 0) return;
+    const renderer = rendererRef.current;
+    const inputs = layoutInputsRef.current;
+    if (renderer && inputs.graph) {
+      renderer.updateEdges(inputs.layoutEdgeKinds, inputs.layoutHideAmbiguous);
+    }
+  }, [edgeVersion]);
+
+  // Cheapest path: nodes were hidden (sidebar checkbox), so flip the existing
+  // displays instead of laying anything out.
   useEffect(() => {
     if (rendererRef.current && graph) {
+      if (appliedVisibleRef.current === displayVisibleNodes) return;
+      appliedVisibleRef.current = displayVisibleNodes;
       rendererRef.current.updateVisibility(displayVisibleNodes);
     }
   }, [graph, displayVisibleNodes]);

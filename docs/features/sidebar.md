@@ -25,7 +25,15 @@ and expand/collapse controls. It enables users to navigate and control which nod
 4. Root children are filtered by `matchingNodeIds.has(childId)` before rendering `TreeItem`.
 5. Each `TreeItem` receives the `matchingNodeIds` set by reference. `React.memo` custom comparator checks reference equality, so the set only triggers re-renders when the `useMemo` produces a new instance.
 6. TreeItem reads store selectors for `expandedNodes`, `visibleNodes`, `selectedNodeId` to render state.
-7. User interactions (click, checkbox, chevron) dispatch to `graphStore` actions.
+7. User interactions (click, checkbox, chevron) dispatch to `graphStore` actions,
+   which classify the change with `relayoutPolicy` (graph-layout.md): a chevron
+   (expand/collapse) relayouts immediately, un-checking a node takes the canvas's
+   cheap visibility path, and checking one back on relayouts (it may reveal nodes
+   that never had positions).
+8. The "Apply Layout Changes" button appears while `needsRelayout` is set -- i.e.
+   after a change that deliberately kept the existing node positions -- and
+   re-solves them for the current state. It is a hint only; nothing queues a
+   layout behind it.
 
 ## Files
 - `packages/app/src/sidebar/Sidebar.tsx` -- Main Sidebar component and memoized TreeItem

@@ -1,7 +1,14 @@
 import { Application, Container } from "pixi.js";
 import { Viewport } from "pixi-viewport";
 import type { CodeGraph, CodeNode, EdgeKind } from "../../api/types";
-import { layoutGraph, type LayoutResult, type LayoutNodePosition } from "../layout/elkLayout";
+import { layoutGraph } from "../layout/elkLayout";
+import { layoutEdgePhase } from "../layout/edgePhase";
+import type { LayoutResult, LayoutNodePosition } from "../layout/layoutTypes";
+import {
+  mergeLayoutRequests,
+  type LayoutRequest,
+} from "../layout/layoutRequest";
+import { CoalescingScheduler } from "../layout/layoutScheduler";
 import { useGraphStore } from "../../stores/graphStore";
 import {
   EMPTY_SELECTION,
@@ -59,7 +66,15 @@ export class PixiRenderer {
   private currentLOD: LODLevel = "detail";
   private lastLayout: LayoutResult | null = null;
   private currentGraph: CodeGraph | null = null;
+  /** The visible set currently applied to the node displays. */
   private currentVisibleNodes: Set<string> = new Set();
+  /**
+   * The newest visible set handed to the renderer (by a layout request or a
+   * visibility update). A layout that started before a later visibility change
+   * re-applies this on completion, so a slow layout can never resurrect nodes
+   * the user has since hidden.
+   */
+  private latestVisibleNodes: Set<string> = new Set();
   private _viewportDirty = false;
   private _viewportRafId: number | null = null;
   private _layoutRequestId = 0;
@@ -68,11 +83,22 @@ export class PixiRenderer {
   private lastEdgeTapKey: string | null = null;
   private lastEdgeTapTime = 0;
 
-  private pendingUpdate: {
-    graph: CodeGraph;
-    expanded: Set<string>;
-    visible: Set<string>;
-  } | null = null;
+  /**
+   * Run-latest layout queue. elkjs cannot be aborted mid-run, so a burst of
+   * interactions collapses into ONE rerun with the latest inputs instead of a
+   * serial pile of full layouts (see `layoutScheduler`). Requests scheduled
+   * before Pixi finishes initialising simply wait on `initPromise`.
+   */
+  private layoutQueue = new CoalescingScheduler<LayoutRequest>({
+    run: (request) => this.runLayoutRequest(request),
+    merge: mergeLayoutRequests,
+    onError: (err) => {
+      console.error("layout request failed:", err);
+      if (import.meta.env.DEV) {
+        useDebugStore.getState().addLog(`layout request FAILED: ${err}`);
+      }
+    },
+  });
 
   private initPromise: Promise<void>;
   private destroyed = false;
@@ -242,13 +268,6 @@ export class PixiRenderer {
     });
 
     this.initialized = true;
-
-    // Process any pending update
-    if (this.pendingUpdate) {
-      const { graph, expanded, visible } = this.pendingUpdate;
-      this.pendingUpdate = null;
-      this.updateGraph(graph, expanded, visible);
-    }
   }
 
   private onViewportChanged() {
@@ -282,11 +301,13 @@ export class PixiRenderer {
   }
 
   private updateLODVisibility() {
-    for (const [_nodeId, display] of this.nodeDisplays) {
+    for (const [nodeId, display] of this.nodeDisplays) {
       const node = display.nodeData;
 
-      // Always show all nodes - just adjust label visibility for performance
-      display.container.visible = true;
+      // Show every node the current visibility set keeps -- LOD only adjusts
+      // label visibility. (Re-asserting it here is what stops a later LOD change
+      // from resurrecting nodes hidden via the cheap visibility path.)
+      display.container.visible = this.currentVisibleNodes.has(nodeId);
 
       if (node.type === "CodeBlock") {
         display.label.visible = this.currentLOD === "detail";
@@ -301,12 +322,18 @@ export class PixiRenderer {
     this.triggerEdgeRedraw();
   }
 
+  /**
+   * Request the POSITIONS phase: a full ELK layout of the node tree plus the
+   * view edges for the resulting render set. Only for changes that actually move
+   * nodes (see `stores/relayoutPolicy`). Coalesced -- calling this repeatedly
+   * costs one layout, with the newest inputs.
+   */
   updateGraph(
     graph: CodeGraph,
     expandedNodes: Set<string>,
     visibleNodes: Set<string>,
-    enabledEdgeKinds?: Set<EdgeKind>,
-    hideAmbiguousEdges = false
+    enabledEdgeKinds: Set<EdgeKind>,
+    hideAmbiguousEdges: boolean
   ) {
     if (import.meta.env.DEV) {
       const codeBlocks = Object.values(graph.nodes).filter(n => n.type === "CodeBlock").length;
@@ -315,28 +342,29 @@ export class PixiRenderer {
       );
     }
 
-    if (!this.initialized) {
-      this.pendingUpdate = { graph, expanded: expandedNodes, visible: visibleNodes };
-      if (import.meta.env.DEV) {
-        useDebugStore.getState().addLog("Pixi not initialized, queuing update");
-      }
-      return;
-    }
+    this.latestVisibleNodes = visibleNodes;
+    this.layoutQueue.schedule({
+      phase: "full",
+      graph,
+      expandedNodes,
+      visibleNodes,
+      enabledEdgeKinds,
+      hideAmbiguousEdges,
+    });
+  }
 
-    this.currentGraph = graph;
-    this.currentVisibleNodes = visibleNodes;
-    this.currentEnabledEdgeKinds = enabledEdgeKinds ?? null;
-    this.parentByNodeId = buildParentMap(graph);
-
-    // Run layout with edge kind filtering (with cancellation token for stale results)
-    const requestId = ++this._layoutRequestId;
-    layoutGraph(graph, expandedNodes, visibleNodes, enabledEdgeKinds, hideAmbiguousEdges).then((layout) => {
-      if (requestId !== this._layoutRequestId) return; // stale -- discard
-      this.lastLayout = layout;
-      // Publish per-kind view counts for the legend only once the layout is
-      // known to be current, so a superseded fetch cannot clobber fresh counts.
-      useEdgeLegendStore.getState().setCounts(layout.edgeKindCounts);
-      this.renderFromLayout(graph, layout, expandedNodes, visibleNodes);
+  /**
+   * Request the EDGES phase: re-fetch the view edges for the last laid-out
+   * render set and redraw them on the cached node positions. Used by edge-kind
+   * and hide-ambiguous toggles, which change which edges show but not where the
+   * nodes are. No-op until a full layout has produced positions -- a full layout
+   * is either queued behind this (and absorbs it) or has not been asked for.
+   */
+  updateEdges(enabledEdgeKinds: Set<EdgeKind>, hideAmbiguousEdges: boolean) {
+    this.layoutQueue.schedule({
+      phase: "edges",
+      enabledEdgeKinds,
+      hideAmbiguousEdges,
     });
   }
 
@@ -344,12 +372,85 @@ export class PixiRenderer {
    * Update visibility of nodes and edges without full relayout.
    */
   updateVisibility(visibleNodes: Set<string>) {
+    this.latestVisibleNodes = visibleNodes;
+    if (this.currentVisibleNodes === visibleNodes) return;
     this.currentVisibleNodes = visibleNodes;
 
     for (const [nodeId, display] of this.nodeDisplays) {
       display.container.visible = visibleNodes.has(nodeId);
     }
 
+    this.triggerEdgeRedraw();
+  }
+
+  /**
+   * Perform one queued layout request. Serialised by `layoutQueue`, and its
+   * result still guarded by `_layoutRequestId` so a superseded pass can never
+   * publish its edge-kind counts or overwrite a newer layout.
+   */
+  private async runLayoutRequest(request: LayoutRequest): Promise<void> {
+    await this.initPromise;
+    if (this.destroyed || !this.initialized) return;
+
+    const requestId = ++this._layoutRequestId;
+
+    if (request.phase === "edges") {
+      const previous = this.lastLayout;
+      if (!previous) return;
+      const layout = await layoutEdgePhase(
+        previous,
+        request.enabledEdgeKinds,
+        request.hideAmbiguousEdges
+      );
+      if (requestId !== this._layoutRequestId || this.destroyed) return; // stale -- discard
+      this.currentEnabledEdgeKinds = request.enabledEdgeKinds;
+      this.lastLayout = layout;
+      useEdgeLegendStore.getState().setCounts(layout.edgeKindCounts);
+      this.rebuildEdgeDisplays(layout);
+      return;
+    }
+
+    const { graph, expandedNodes, visibleNodes } = request;
+    this.currentGraph = graph;
+    this.currentEnabledEdgeKinds = request.enabledEdgeKinds;
+    this.parentByNodeId = buildParentMap(graph);
+
+    const layout = await layoutGraph(
+      graph,
+      expandedNodes,
+      visibleNodes,
+      request.enabledEdgeKinds,
+      request.hideAmbiguousEdges
+    );
+    if (requestId !== this._layoutRequestId || this.destroyed) return; // stale -- discard
+
+    // Adopt the request's visible set only now, so a visibility toggle made
+    // while this layout ran keeps applying to the displays on screen.
+    this.currentVisibleNodes = visibleNodes;
+    this.lastLayout = layout;
+    // Publish per-kind view counts for the legend only once the layout is
+    // known to be current, so a superseded fetch cannot clobber fresh counts.
+    useEdgeLegendStore.getState().setCounts(layout.edgeKindCounts);
+    this.renderFromLayout(graph, layout, expandedNodes, visibleNodes);
+
+    // A visibility toggle that landed while this layout was running is applied
+    // on top of the fresh displays.
+    if (this.latestVisibleNodes !== visibleNodes) {
+      this.updateVisibility(this.latestVisibleNodes);
+    }
+  }
+
+  /**
+   * Rebuild the edge displays (and the pinned/hovered highlight) from a layout
+   * whose node positions are already on screen. The viewport is deliberately
+   * left alone: filtering edges must not move the camera.
+   */
+  private rebuildEdgeDisplays(layout: LayoutResult) {
+    this.edgeManager.destroyEdgeGraphics();
+    this.edgeManager.buildEdgeData(layout);
+    this.rebuildHighlightedEdgeIndices(
+      resolveHighlightSource(this.hoveredNodeId, this.selection)
+    );
     this.triggerEdgeRedraw();
   }
 
@@ -781,6 +882,7 @@ export class PixiRenderer {
 
   destroy() {
     this.destroyed = true;
+    this.layoutQueue.clearPending();
     this.edgeManager.destroyEdgeGraphics();
     if (this._viewportRafId !== null) {
       cancelAnimationFrame(this._viewportRafId);
