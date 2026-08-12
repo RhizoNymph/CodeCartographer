@@ -21,12 +21,17 @@ The pipeline has two phases and one trigger policy:
 ### In scope
 - The ELK graph construction, the render set (`renderIds`), edge routing,
   extraction, and the straight-line fallbacks.
+- The layout-time edge-routing guard (when ELK routing is skipped in favour of
+  straight-line fallback edges) and the whole-layout fallback used when ELK
+  throws.
 - The per-view `get_subgraph` fetch and its derived `edgeKindCounts`.
 - Coalescing concurrent layout requests and discarding stale results.
 - The relayout trigger policy and the store's trigger counters.
 
 ### Not in scope
-- What the edges *look like* once positioned (see canvas-rendering).
+- What the edges *look like* once positioned, including the client-side
+  obstacle-avoidance re-routing pass and its draw-time budget (see
+  canvas-rendering).
 - Which nodes are visible/expanded in the first place (see zoom-views,
   visibilityFilter).
 - Server-side subgraph/aggregation semantics (see server_side_graph_state).
@@ -107,7 +112,8 @@ elkLayout.layoutGraph
   buildElkNode tree from (visible ∩ expanded-ancestors)  -> renderIds
   fetchViewEdges(renderIds, kinds, hideAmbiguous)        [layout/viewEdges.ts]
     -> get_subgraph -> direct + aggregated ViewEdges, deriveEdgeKindCounts
-  ELK layered layout (routing skipped above 1500 nodes)
+  ELK layered layout (routing skipped above the node/edge limits, see
+    "Routing guard" below)
   extractLayout -> positions + routed polylines (straightLineEdges as fallback)
 
 edgePhase.layoutEdgePhase(previous, kinds, hideAmbiguous)
@@ -116,6 +122,43 @@ edgePhase.layoutEdgePhase(previous, kinds, hideAmbiguous)
     (source, target, kind); straight-line connector for edges appearing anew
   -> LayoutResult with previous.nodes and previous.renderIds unchanged
 ```
+
+### Positions phase in detail
+
+1. `buildElkNode` walks the node tree from the graph root, emitting an `ElkNode`
+   per visible node. An expanded node with visible children gets `children` +
+   container padding and lets ELK size it; otherwise it carries `getNodeSize`'s
+   width/height.
+2. `collectElkNodeIds` collects the resulting render set (`elkNodeIds`) -- the
+   ids actually laid out, i.e. visible nodes whose ancestors are all expanded.
+3. `fetchViewEdges(renderIds, enabledKinds)` (`get_subgraph` over Tauri IPC)
+   returns the view's direct edges (each with a `Resolution`) and aggregated
+   edges (each with a `count`). These become `ViewEdge[]`; ambiguous direct
+   edges are dropped here when the toolbar toggle asks for it. The same payload
+   derives the legend's per-kind counts (`deriveEdgeKindCounts`).
+4. **Routing guard.** `shouldSkipLayoutEdgeRouting(elkNodeIds.size, viewEdges.length)`
+   (from `renderers/edgeRoutingBudget.ts`) decides whether ELK is given any edges
+   at all. Routing cost is driven by EDGES as much as by nodes, so BOTH counts
+   gate it:
+   - `LAYOUT_EDGE_ROUTING_NODE_LIMIT` = 1500 rendered nodes
+   - `LAYOUT_EDGE_ROUTING_EDGE_LIMIT` = 3000 view edges
+
+   Over either limit, `elkEdges` is empty: ELK positions nodes only, and
+   `extractLayout` synthesises straight-line fallback edges instead.
+5. Each ELK edge id encodes its `viewEdges` INDEX (`elkEdgeId` / `elkEdgeIndex`),
+   so extraction maps a routed edge back to exactly the view edge it came from --
+   parallel same-pair edges (one aggregate per kind) keep their own
+   kind/colour/count.
+6. `elk.layout(elkGraph)` runs in a web worker (`elkjs/lib/elk-api` +
+   `elk-worker.min.js?worker`), so layout never blocks the UI thread.
+7. `extractLayout` walks the result, accumulating parent offsets into absolute
+   positions, converts each edge's sections into a `Point[]`, infers source and
+   target anchors (`inferEdgeAnchor`) and normalises the polyline through
+   `anchorEdgePolyline`. If no routed edges came back (ELK produced none, or
+   routing was skipped) it emits a straight-line edge per view edge whose
+   endpoints are present.
+8. If `elk.layout` throws, `fallbackLayout` lays the visible nodes out on a plain
+   grid with no edges, so the canvas still renders something.
 
 ### Why the edges phase reuses routed geometry
 
@@ -138,7 +181,8 @@ back on) get a straight connector until the next full layout — the sidebar's
 - `packages/app/src/canvas/Canvas.tsx` — derives the effective layout inputs,
   keeps them in a ref, and runs one effect per trigger counter.
 - `packages/app/src/canvas/layout/elkLayout.ts` — positions phase
-  (`layoutGraph`), ELK options, extraction, ELK-failure fallback layout.
+  (`layoutGraph`), ELK options, the routing guard call, extraction,
+  ELK-failure fallback layout.
 - `packages/app/src/canvas/layout/edgePhase.ts` — edges phase
   (`layoutEdgePhase`, `rebuildEdges`).
 - `packages/app/src/canvas/layout/viewEdges.ts` — `fetchViewEdges` (the
@@ -151,11 +195,30 @@ back on) get a straight connector until the next full layout — the sidebar's
   `mergeLayoutRequests`; PURE, unit-tested.
 - `packages/app/src/canvas/layout/layoutScheduler.ts` — `CoalescingScheduler`,
   the generic run-latest queue; PURE, unit-tested.
+- `packages/app/src/canvas/layout/elkEdgeId.ts` — encodes/decodes the viewEdges
+  index in an ELK edge id (`elkEdgeId`, `elkEdgeIndex`).
+- `packages/app/src/canvas/layout/edgeGeometry.ts` — orthogonal polyline
+  geometry: anchors, normalisation, obstacle detours (`anchorEdgePolyline`,
+  `routePolylineAroundObstacles`, `boundingBox`, `pointToPolylineDistance`).
+- `packages/app/src/canvas/renderers/edgeRoutingBudget.ts` — ALL routing
+  thresholds, layout-time and draw-time (`shouldSkipLayoutEdgeRouting`,
+  `LAYOUT_EDGE_ROUTING_NODE_LIMIT`, `LAYOUT_EDGE_ROUTING_EDGE_LIMIT`).
+- `packages/app/src/canvas/utils/graphUtils.ts` — node sizing / parent map
+  shared with the renderer (`getNodeSize`, `buildParentMap`).
 - `packages/app/src/canvas/renderers/PixiRenderer.ts` — owns the queue,
   `updateGraph` / `updateEdges` / `updateVisibility`, the `_layoutRequestId`
   stale guard and the edge-legend publish.
-- `packages/app/tests/relayoutPolicy.test.ts`,
-  `packages/app/tests/layoutScheduler.test.ts` — node:test coverage.
+
+## Test Files
+
+| File | What it tests |
+|------|---------------|
+| `packages/app/tests/relayoutPolicy.test.ts` | The trigger policy table |
+| `packages/app/tests/layoutScheduler.test.ts` | Run-latest coalescing, error draining |
+| `packages/app/tests/elkEdgeId.test.ts` | Edge-id round-tripping and rejection of foreign ids |
+| `packages/app/tests/edgeGeometry.test.ts` | Anchor inference, orthogonal rerouting, obstacle detours |
+| `packages/app/tests/edgeGeometryBounds.test.ts` | `boundingBox` over empty, overlapping and very large inputs |
+| `packages/app/tests/edgeRoutingBudget.test.ts` | The layout-time routing guard (and the draw-time budget) |
 
 ## Invariants
 
@@ -171,6 +234,18 @@ back on) get a straight connector until the next full layout — the sidebar's
 - The edges phase never moves the camera; only a full layout refits the viewport.
 - A layout that started before a later visibility change re-applies the newest
   visible set when it lands, so a slow layout cannot resurrect hidden nodes.
+- Only nodes in `visibleNodes` reach ELK, and a node's children reach it only if
+  the node is expanded. `elkNodeIds` is therefore exactly the render set, and it
+  is also what is sent to `get_subgraph`.
+- A routed edge is mapped back to its view edge by INDEX, never by endpoint pair:
+  several edges can join the same pair.
+- The routing guard is a pure function of two counts and is the ONLY thing that
+  decides whether ELK receives edges. Node positions are always computed.
+- Every `LayoutEdge` has at least 2 points and endpoints that lie on its source
+  and target boxes (`anchorEdgePolyline`), so downstream code may assume a
+  drawable, anchored polyline.
+- `layoutGraph` never rejects: IPC failure yields an empty edge set, and an ELK
+  failure yields `fallbackLayout`.
 - `relayoutPolicy.ts`, `layoutScheduler.ts` and `layoutRequest.ts` must stay free
   of runtime imports from other `src` modules (type-only imports are fine) so the
   node:test runner can load them.

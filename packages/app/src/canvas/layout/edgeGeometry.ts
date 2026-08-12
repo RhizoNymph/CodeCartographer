@@ -444,11 +444,30 @@ function findFirstObstacleCrossing(
   return null;
 }
 
-function boundingBox(boxes: NodeBox[]): NodeBox {
-  const left = Math.min(...boxes.map((box) => box.x));
-  const top = Math.min(...boxes.map((box) => box.y));
-  const right = Math.max(...boxes.map((box) => box.x + box.width));
-  const bottom = Math.max(...boxes.map((box) => box.y + box.height));
+/**
+ * Smallest box covering every input box.
+ *
+ * Deliberately loop-based: the spread form (`Math.min(...boxes.map(...))`)
+ * allocates four throwaway arrays and overflows the call stack once the
+ * obstacle list reaches a few tens of thousands of entries, which a large view
+ * easily does. An empty input yields an empty box at the origin.
+ */
+export function boundingBox(boxes: readonly NodeBox[]): NodeBox {
+  if (boxes.length === 0) {
+    return { x: 0, y: 0, width: 0, height: 0 };
+  }
+
+  let left = Infinity;
+  let top = Infinity;
+  let right = -Infinity;
+  let bottom = -Infinity;
+
+  for (const box of boxes) {
+    if (box.x < left) left = box.x;
+    if (box.y < top) top = box.y;
+    if (box.x + box.width > right) right = box.x + box.width;
+    if (box.y + box.height > bottom) bottom = box.y + box.height;
+  }
 
   return {
     x: left,

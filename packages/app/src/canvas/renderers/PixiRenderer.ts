@@ -78,6 +78,8 @@ export class PixiRenderer {
   private _viewportDirty = false;
   private _viewportRafId: number | null = null;
   private _layoutRequestId = 0;
+  /** True between requesting a layout and applying it; suppresses stale redraws. */
+  private _layoutPending = false;
   private _edgeHoverRafId: number | null = null;
   /** Identity + time of the last tap that landed on an edge (double-click pairing). */
   private lastEdgeTapKey: string | null = null;
@@ -93,6 +95,8 @@ export class PixiRenderer {
     run: (request) => this.runLayoutRequest(request),
     merge: mergeLayoutRequests,
     onError: (err) => {
+      // Never leave the pending flag stuck: it gates the visibility redraw.
+      this._layoutPending = false;
       console.error("layout request failed:", err);
       if (import.meta.env.DEV) {
         useDebugStore.getState().addLog(`layout request FAILED: ${err}`);
@@ -271,22 +275,13 @@ export class PixiRenderer {
   }
 
   private onViewportChanged() {
-    const bounds = this.viewport.getVisibleBounds();
-    const scale = this.viewport.scale.x;
+    const lodChanged = this.syncViewportState();
 
-    useViewportStore.getState().updateViewport(
-      bounds.x,
-      bounds.y,
-      bounds.width,
-      bounds.height,
-      scale
-    );
-
-    // Update LOD
-    const newLOD = useViewportStore.getState().lodLevel;
-    if (newLOD !== this.currentLOD) {
-      this.currentLOD = newLOD;
-      this.updateLODVisibility();
+    // A LOD *change* while the user zooms must restyle edges (opacity/width and
+    // which kinds show at all). A viewport move that leaves the LOD alone must
+    // not: a full edge rebuild is the most expensive thing the renderer does.
+    if (lodChanged) {
+      this.updateLODVisibility(true);
     }
 
     // Update minimap
@@ -300,7 +295,41 @@ export class PixiRenderer {
     );
   }
 
-  private updateLODVisibility() {
+  /**
+   * Publish the viewport bounds/scale to the store and adopt the resulting LOD.
+   * Returns whether the LOD actually changed. Draws nothing -- callers decide
+   * what (if anything) to rebuild, which is what keeps a layout application
+   * from cascading into extra edge rebuilds.
+   */
+  private syncViewportState(): boolean {
+    const bounds = this.viewport.getVisibleBounds();
+    const scale = this.viewport.scale.x;
+
+    useViewportStore.getState().updateViewport(
+      bounds.x,
+      bounds.y,
+      bounds.width,
+      bounds.height,
+      scale
+    );
+
+    const newLOD = useViewportStore.getState().lodLevel;
+    if (newLOD === this.currentLOD) {
+      return false;
+    }
+
+    this.currentLOD = newLOD;
+    return true;
+  }
+
+  /**
+   * Apply the current LOD to node label visibility.
+   *
+   * `redrawEdges` is false when the caller is about to rebuild the edge layers
+   * itself (layout application), and true when the LOD changed under the user's
+   * zoom and the existing edges need restyling.
+   */
+  private updateLODVisibility(redrawEdges: boolean) {
     for (const [nodeId, display] of this.nodeDisplays) {
       const node = display.nodeData;
 
@@ -318,8 +347,9 @@ export class PixiRenderer {
       }
     }
 
-    // Redraw edges with new LOD opacity/width
-    this.triggerEdgeRedraw();
+    if (redrawEdges) {
+      this.triggerEdgeRedraw();
+    }
   }
 
   /**
@@ -343,6 +373,9 @@ export class PixiRenderer {
     }
 
     this.latestVisibleNodes = visibleNodes;
+    // Gates the cheap visibility redraw until this layout lands (or fails):
+    // routing the new visible set against the outgoing layout is wasted work.
+    this._layoutPending = true;
     this.layoutQueue.schedule({
       phase: "full",
       graph,
@@ -370,6 +403,11 @@ export class PixiRenderer {
 
   /**
    * Update visibility of nodes and edges without full relayout.
+   *
+   * When a layout is already in flight the edge rebuild is skipped: it would
+   * route the NEW visible set against the OLD (stale) layout, only to be thrown
+   * away moments later by `renderFromLayout`. Callers commonly change
+   * visibility and layout inputs in the same tick, so this is the normal case.
    */
   updateVisibility(visibleNodes: Set<string>) {
     this.latestVisibleNodes = visibleNodes;
@@ -379,6 +417,8 @@ export class PixiRenderer {
     for (const [nodeId, display] of this.nodeDisplays) {
       display.container.visible = visibleNodes.has(nodeId);
     }
+
+    if (this._layoutPending) return;
 
     this.triggerEdgeRedraw();
   }
@@ -432,6 +472,9 @@ export class PixiRenderer {
     // known to be current, so a superseded fetch cannot clobber fresh counts.
     useEdgeLegendStore.getState().setCounts(layout.edgeKindCounts);
     this.renderFromLayout(graph, layout, expandedNodes, visibleNodes);
+    // Cleared before the late-visibility re-apply below so that redraw is not
+    // gated by the very layout it follows.
+    this._layoutPending = false;
 
     // A visibility toggle that landed while this layout was running is applied
     // on top of the fresh displays.
@@ -481,6 +524,15 @@ export class PixiRenderer {
       this.addNodeDisplay(nodeId, node, pos, expandedNodes.has(nodeId));
     }
 
+    // Order matters, and it is the whole point of this sequence: fit the
+    // viewport FIRST, adopt the LOD that fit implies, apply it to labels, and
+    // only then build the edges. That way a layout application performs exactly
+    // ONE full edge rebuild -- the zoom's own "moved" event will find the LOD
+    // already current and rebuild nothing.
+    this.fitViewportToLayout(layout);
+    this.syncViewportState();
+    this.updateLODVisibility(false);
+
     // Draw edges. Recomputing the highlight here is what re-applies a pinned
     // selection after a layout/visibility rebuild.
     this.edgeManager.buildEdgeData(layout);
@@ -488,33 +540,32 @@ export class PixiRenderer {
       resolveHighlightSource(this.hoveredNodeId, this.selection)
     );
     this.triggerEdgeRedraw();
+  }
 
-    // Initial LOD update
-    this.updateLODVisibility();
+  /** Centre and zoom the viewport so the whole laid-out graph is on screen. */
+  private fitViewportToLayout(layout: LayoutResult) {
+    if (this.nodeDisplays.size === 0) return;
 
-    // Fit viewport to content
-    if (this.nodeDisplays.size > 0) {
-      let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-      for (const pos of Object.values(layout.nodes)) {
-        minX = Math.min(minX, pos.x);
-        minY = Math.min(minY, pos.y);
-        maxX = Math.max(maxX, pos.x + pos.width);
-        maxY = Math.max(maxY, pos.y + pos.height);
-      }
-
-      const padding = 50;
-      this.viewport.moveCenter(
-        (minX + maxX) / 2,
-        (minY + maxY) / 2
-      );
-
-      const contentW = maxX - minX + padding * 2;
-      const contentH = maxY - minY + padding * 2;
-      const scaleX = this.viewport.screenWidth / contentW;
-      const scaleY = this.viewport.screenHeight / contentH;
-      const fitScale = Math.min(scaleX, scaleY, 1);
-      this.viewport.setZoom(fitScale, true);
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const pos of Object.values(layout.nodes)) {
+      minX = Math.min(minX, pos.x);
+      minY = Math.min(minY, pos.y);
+      maxX = Math.max(maxX, pos.x + pos.width);
+      maxY = Math.max(maxY, pos.y + pos.height);
     }
+
+    const padding = 50;
+    this.viewport.moveCenter(
+      (minX + maxX) / 2,
+      (minY + maxY) / 2
+    );
+
+    const contentW = maxX - minX + padding * 2;
+    const contentH = maxY - minY + padding * 2;
+    const scaleX = this.viewport.screenWidth / contentW;
+    const scaleY = this.viewport.screenHeight / contentH;
+    const fitScale = Math.min(scaleX, scaleY, 1);
+    this.viewport.setZoom(fitScale, true);
   }
 
   /**

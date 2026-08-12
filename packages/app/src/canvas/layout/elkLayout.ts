@@ -21,6 +21,11 @@ import type {
   LayoutNodePosition,
   LayoutResult,
 } from "./layoutTypes";
+import {
+  LAYOUT_EDGE_ROUTING_EDGE_LIMIT,
+  LAYOUT_EDGE_ROUTING_NODE_LIMIT,
+  shouldSkipLayoutEdgeRouting,
+} from "../renderers/edgeRoutingBudget";
 
 /**
  * The POSITIONS phase of the layout pipeline: build the ELK containment tree for
@@ -30,13 +35,11 @@ import type {
  * This is the expensive phase and the only one that produces node positions, so
  * it runs only when the node-position problem actually changed -- see
  * `stores/relayoutPolicy` for the trigger policy and `edgePhase.ts` for the
- * cheap edge-only rerun.
+ * cheap edge-only rerun. ELK edge routing is additionally skipped above the
+ * node/edge limits in `edgeRoutingBudget` (straight-line fallback).
  */
 
 const elk = new ELK({ workerFactory: () => new ElkWorker() });
-
-/** Above this many rendered nodes, ELK edge routing is skipped for performance. */
-const EDGE_ROUTING_NODE_LIMIT = 1500;
 
 export type { LayoutEdge, LayoutNodePosition, LayoutResult } from "./layoutTypes";
 
@@ -143,12 +146,15 @@ export async function layoutGraph(
   );
 
   // Layout guard: for very large views, skip ELK orthogonal edge routing and let
-  // extractLayout produce straight-line fallback edges. Routing thousands of
-  // edges is prohibitively slow.
-  const skipEdgeRouting = elkNodeIds.size > EDGE_ROUTING_NODE_LIMIT;
+  // extractLayout produce straight-line fallback edges. Routing cost is driven
+  // by EDGES as much as nodes, so both counts gate it -- a 1400-node view
+  // carrying 20k edges is just as unroutable as a 5000-node one.
+  const skipEdgeRouting = shouldSkipLayoutEdgeRouting(elkNodeIds.size, viewEdges.length);
   if (skipEdgeRouting && import.meta.env.DEV) {
     useDebugStore.getState().addLog(
-      `Large view (${elkNodeIds.size} nodes > ${EDGE_ROUTING_NODE_LIMIT}): skipping edge routing. ` +
+      `Large view (${elkNodeIds.size} nodes / ${viewEdges.length} edges exceeds ` +
+        `${LAYOUT_EDGE_ROUTING_NODE_LIMIT} nodes or ${LAYOUT_EDGE_ROUTING_EDGE_LIMIT} edges): ` +
+        `skipping edge routing. ` +
         `Consider Module view or collapsing containers for cleaner routing.`
     );
   }
