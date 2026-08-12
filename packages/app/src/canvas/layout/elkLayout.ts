@@ -1,11 +1,8 @@
 import ELK, { type ElkNode, type ElkExtendedEdge } from "elkjs/lib/elk-api";
 import ElkWorker from "elkjs/lib/elk-worker.min.js?worker";
-import type { CodeGraph, CodeNode, EdgeKind, Resolution } from "../../api/types";
-import { EDGE_COLORS } from "../../api/types";
-import { getSubgraph } from "../../api/commands";
+import type { CodeGraph, CodeNode, EdgeKind } from "../../api/types";
 import { useDebugStore } from "../../stores/debugStore";
 import {
-  deriveEdgeKindCounts,
   unknownEdgeKindCounts,
   type EdgeKindCounts,
 } from "../legend/edgeLegendModel";
@@ -14,75 +11,37 @@ import {
   anchorEdgePolyline,
   dedupePolylinePoints,
   inferEdgeAnchor,
-  type EdgeAnchor,
   type Point,
 } from "./edgeGeometry";
 import { getNodeSize } from "../utils/graphUtils";
+import { fetchViewEdges, type ViewEdge } from "./viewEdges";
+import { straightLineEdges } from "./straightEdges";
+import type {
+  LayoutEdge,
+  LayoutNodePosition,
+  LayoutResult,
+} from "./layoutTypes";
+import {
+  LAYOUT_EDGE_ROUTING_EDGE_LIMIT,
+  LAYOUT_EDGE_ROUTING_NODE_LIMIT,
+  shouldSkipLayoutEdgeRouting,
+} from "../renderers/edgeRoutingBudget";
+
+/**
+ * The POSITIONS phase of the layout pipeline: build the ELK containment tree for
+ * the current node set, fetch the view edges for that render set, and let ELK
+ * solve node placement + orthogonal edge routing in its web worker.
+ *
+ * This is the expensive phase and the only one that produces node positions, so
+ * it runs only when the node-position problem actually changed -- see
+ * `stores/relayoutPolicy` for the trigger policy and `edgePhase.ts` for the
+ * cheap edge-only rerun. ELK edge routing is additionally skipped above the
+ * node/edge limits in `edgeRoutingBudget` (straight-line fallback).
+ */
 
 const elk = new ELK({ workerFactory: () => new ElkWorker() });
 
-/** Above this many rendered nodes, ELK edge routing is skipped for performance. */
-const EDGE_ROUTING_NODE_LIMIT = 1500;
-
-const ALL_EDGE_KINDS: EdgeKind[] = [
-  "Import",
-  "FunctionCall",
-  "MethodCall",
-  "TypeReference",
-  "Inheritance",
-  "TraitImpl",
-  "VariableUsage",
-];
-
-/**
- * A view edge with resolved display info, ready to feed to ELK and extractLayout.
- * `kind` is null-safe: aggregated edges carry their exact kind (the backend
- * emits one aggregate per kind and pair, so parallel same-pair view edges of
- * different kinds are expected); `count` drives tooltip counts and edge-width
- * scaling. `resolution` is
- * null for aggregated edges (no single confidence) and carries the direct
- * edge's confidence otherwise (drives ambiguous styling).
- */
-interface ViewEdge {
-  source: string;
-  target: string;
-  color: string;
-  kind: EdgeKind | null;
-  count: number;
-  resolution: Resolution | null;
-}
-
-export interface LayoutNodePosition {
-  x: number;
-  y: number;
-  width: number;
-  height: number;
-}
-
-export interface LayoutEdge {
-  source: string;
-  target: string;
-  color: string;
-  kind: EdgeKind | null; // null when the underlying kind is unknown
-  /** Number of underlying edges (1 for direct, N for aggregated). Drives tooltip count + width. */
-  count: number;
-  /** Resolution confidence for direct edges; null for aggregated edges. */
-  resolution: Resolution | null;
-  points: Point[];
-  sourceAnchor: EdgeAnchor;
-  targetAnchor: EdgeAnchor;
-}
-
-export interface LayoutResult {
-  nodes: Record<string, LayoutNodePosition>;
-  edges: LayoutEdge[];
-  /**
-   * Underlying edge counts per kind for this view, derived from the fetched
-   * `SubGraph`. Kinds that were not requested are `null` (unknown). Published to
-   * `edgeLegendStore` by the renderer once the layout is known to be current.
-   */
-  edgeKindCounts: EdgeKindCounts;
-}
+export type { LayoutEdge, LayoutNodePosition, LayoutResult } from "./layoutTypes";
 
 function buildElkNode(
   nodeId: string,
@@ -145,7 +104,7 @@ export async function layoutGraph(
 ): Promise<LayoutResult> {
   const rootNode = graph.nodes[graph.root];
   if (!rootNode) {
-    return { nodes: {}, edges: [], edgeKindCounts: unknownEdgeKindCounts() };
+    return emptyLayout();
   }
 
   // Build ELK graph
@@ -180,55 +139,22 @@ export async function layoutGraph(
 
   // Fetch per-view edges (direct + aggregated) from server-side graph state.
   const renderIds = Array.from(elkNodeIds);
-  const enabledKinds = enabledEdgeKinds
-    ? Array.from(enabledEdgeKinds)
-    : ALL_EDGE_KINDS;
-
-  let viewEdges: ViewEdge[] = [];
-  // Per-kind counts for the legend, derived from the same payload the layout
-  // uses. Kinds outside `enabledKinds` were never fetched and stay unknown.
-  let edgeKindCounts: EdgeKindCounts = unknownEdgeKindCounts();
-  try {
-    const sub = await getSubgraph(renderIds, enabledKinds);
-    edgeKindCounts = deriveEdgeKindCounts(sub, enabledKinds, hideAmbiguousEdges);
-    for (const e of sub.edges) {
-      // Ambiguous direct edges can be hidden client-side (imports are exact so
-      // this only ever affects reference edges).
-      if (hideAmbiguousEdges && e.resolution === "Ambiguous") continue;
-      viewEdges.push({
-        source: e.source,
-        target: e.target,
-        color: EDGE_COLORS[e.kind] || "#64748b",
-        kind: e.kind,
-        count: e.weight,
-        resolution: e.resolution,
-      });
-    }
-    for (const ae of sub.aggregated_edges) {
-      viewEdges.push({
-        source: ae.source,
-        target: ae.target,
-        color: EDGE_COLORS[ae.kind] || "#64748b",
-        kind: ae.kind,
-        count: ae.count,
-        resolution: null,
-      });
-    }
-  } catch (err) {
-    console.error("getSubgraph failed:", err);
-    if (import.meta.env.DEV) {
-      useDebugStore.getState().addLog(`getSubgraph FAILED: ${err}`);
-    }
-    viewEdges = [];
-  }
+  const { viewEdges, edgeKindCounts } = await fetchViewEdges(
+    renderIds,
+    enabledEdgeKinds,
+    hideAmbiguousEdges
+  );
 
   // Layout guard: for very large views, skip ELK orthogonal edge routing and let
-  // extractLayout produce straight-line fallback edges. Routing thousands of
-  // edges is prohibitively slow.
-  const skipEdgeRouting = elkNodeIds.size > EDGE_ROUTING_NODE_LIMIT;
+  // extractLayout produce straight-line fallback edges. Routing cost is driven
+  // by EDGES as much as nodes, so both counts gate it -- a 1400-node view
+  // carrying 20k edges is just as unroutable as a 5000-node one.
+  const skipEdgeRouting = shouldSkipLayoutEdgeRouting(elkNodeIds.size, viewEdges.length);
   if (skipEdgeRouting && import.meta.env.DEV) {
     useDebugStore.getState().addLog(
-      `Large view (${elkNodeIds.size} nodes > ${EDGE_ROUTING_NODE_LIMIT}): skipping edge routing. ` +
+      `Large view (${elkNodeIds.size} nodes / ${viewEdges.length} edges exceeds ` +
+        `${LAYOUT_EDGE_ROUTING_NODE_LIMIT} nodes or ${LAYOUT_EDGE_ROUTING_EDGE_LIMIT} edges): ` +
+        `skipping edge routing. ` +
         `Consider Module view or collapsing containers for cleaner routing.`
     );
   }
@@ -275,7 +201,7 @@ export async function layoutGraph(
     if (import.meta.env.DEV) {
       useDebugStore.getState().addLog(`ELK layout done, extracting...`);
     }
-    const result = extractLayout(laidOut, viewEdges, edgeKindCounts);
+    const result = extractLayout(laidOut, viewEdges, edgeKindCounts, renderIds);
     if (import.meta.env.DEV) {
       useDebugStore.getState().addLog(`ELK extracted ${result.edges.length} edges`);
 
@@ -293,7 +219,7 @@ export async function layoutGraph(
         edgesWithSections: result.edges.length, // approximate
         edgesWithoutSections: elkEdges.length - result.edges.length,
         sampleGraphEdge: JSON.stringify(viewEdges[0]),
-        sampleElkNodeId: Array.from(elkNodeIds)[0] ?? "none",
+        sampleElkNodeId: renderIds[0] ?? "none",
         codeBlocksInGraph,
         filesWithChildren,
         expandedFiles,
@@ -306,16 +232,26 @@ export async function layoutGraph(
     if (import.meta.env.DEV) {
       useDebugStore.getState().addLog(`ELK FAILED: ${err}`);
     }
-    return fallbackLayout(graph, visibleNodes, edgeKindCounts);
+    return fallbackLayout(graph, visibleNodes, edgeKindCounts, renderIds);
   }
+}
+
+function emptyLayout(): LayoutResult {
+  return {
+    nodes: {},
+    edges: [],
+    edgeKindCounts: unknownEdgeKindCounts(),
+    renderIds: [],
+  };
 }
 
 function extractLayout(
   elkNode: ElkNode,
   viewEdges: ViewEdge[],
-  edgeKindCounts: EdgeKindCounts
+  edgeKindCounts: EdgeKindCounts,
+  renderIds: string[]
 ): LayoutResult {
-  const result: LayoutResult = { nodes: {}, edges: [], edgeKindCounts };
+  const result: LayoutResult = { nodes: {}, edges: [], edgeKindCounts, renderIds };
 
   let edgesWithSections = 0;
   let edgesWithoutSections = 0;
@@ -451,86 +387,9 @@ function extractLayout(
       useDebugStore.getState().addLog("ELK provided no routed edges, generating straight-line fallback edges");
     }
 
-    // Helper to create fallback edge
-    const createFallbackEdge = (
-      source: string,
-      target: string,
-      color: string,
-      kind: EdgeKind | null,
-      count: number,
-      resolution: Resolution | null
-    ): LayoutEdge | null => {
-      const sourcePos = result.nodes[source];
-      const targetPos = result.nodes[target];
-      if (!sourcePos || !targetPos) return null;
-
-      const sourceCx = sourcePos.x + sourcePos.width / 2;
-      const sourceCy = sourcePos.y + sourcePos.height / 2;
-      const targetCx = targetPos.x + targetPos.width / 2;
-      const targetCy = targetPos.y + targetPos.height / 2;
-
-      const dx = targetCx - sourceCx;
-      const dy = targetCy - sourceCy;
-
-      let startPoint: Point;
-      let endPoint: Point;
-
-      if (Math.abs(dx) > Math.abs(dy)) {
-        startPoint = {
-          x: dx > 0 ? sourcePos.x + sourcePos.width : sourcePos.x,
-          y: sourceCy,
-        };
-        endPoint = {
-          x: dx > 0 ? targetPos.x : targetPos.x + targetPos.width,
-          y: targetCy,
-        };
-      } else {
-        startPoint = {
-          x: sourceCx,
-          y: dy > 0 ? sourcePos.y + sourcePos.height : sourcePos.y,
-        };
-        endPoint = {
-          x: targetCx,
-          y: dy > 0 ? targetPos.y : targetPos.y + targetPos.height,
-        };
-      }
-
-      const sourceAnchor = inferEdgeAnchor(sourcePos, startPoint, endPoint);
-      const targetAnchor = inferEdgeAnchor(targetPos, endPoint, startPoint);
-
-      return {
-        source,
-        target,
-        color,
-        kind,
-        count,
-        resolution,
-        points: anchorEdgePolyline(
-          [startPoint, endPoint],
-          sourcePos,
-          targetPos,
-          sourceAnchor,
-          targetAnchor
-        ),
-        sourceAnchor,
-        targetAnchor,
-      };
-    };
-
-    // Generate straight-line fallback for every view edge whose endpoints are
-    // present in the layout.
-    for (const ve of viewEdges) {
-      const fallbackEdge = createFallbackEdge(
-        ve.source,
-        ve.target,
-        ve.color,
-        ve.kind,
-        ve.count,
-        ve.resolution
-      );
-      if (fallbackEdge) {
-        result.edges.push(fallbackEdge);
-      }
+    const fallbackEdges: LayoutEdge[] = straightLineEdges(result.nodes, viewEdges);
+    for (const edge of fallbackEdges) {
+      result.edges.push(edge);
     }
 
     if (import.meta.env.DEV) {
@@ -544,9 +403,10 @@ function extractLayout(
 function fallbackLayout(
   graph: CodeGraph,
   visibleNodes: Set<string>,
-  edgeKindCounts: EdgeKindCounts
+  edgeKindCounts: EdgeKindCounts,
+  renderIds: string[]
 ): LayoutResult {
-  const result: LayoutResult = { nodes: {}, edges: [], edgeKindCounts };
+  const nodes: Record<string, LayoutNodePosition> = {};
   let x = 20;
   let y = 20;
   const colWidth = 220;
@@ -559,7 +419,7 @@ function fallbackLayout(
     if (!node) continue;
 
     const size = getNodeSize(node);
-    result.nodes[nodeId] = {
+    nodes[nodeId] = {
       x: x + col * colWidth,
       y,
       width: size.width,
@@ -573,5 +433,5 @@ function fallbackLayout(
     }
   }
 
-  return result;
+  return { nodes, edges: [], edgeKindCounts, renderIds };
 }

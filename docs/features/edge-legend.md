@@ -11,8 +11,10 @@ edge-kind toggle UI (it replaced the toolbar's edge-kind toggle row).
   `EDGE_COLORS`), human-readable plural name, and the number of underlying edges
   of that kind **in the current view**.
 - Clicking an interactive row toggles that kind via `graphStore.toggleEdgeKind`
-  (the same action the old toolbar buttons used), which bumps `layoutVersion`
-  and triggers a relayout.
+  (the same action the old toolbar buttons used), which bumps `edgeVersion` and
+  runs the cheap EDGE phase only -- the node positions stay put (see
+  graph-layout.md). The one exception is `hideUnconnectedNodes`, which makes the
+  node set depend on the enabled kinds and therefore forces a full layout.
 - Toggled-off rows render dimmed and struck through; rows whose kind provably has
   zero edges in the view render dimmed and inert.
 - Module view shows only the Import row, non-interactive, with an accurate count.
@@ -28,9 +30,10 @@ edge-kind toggle UI (it replaced the toolbar's edge-kind toggle row).
 ## Data / Control Flow
 
 ```
-Canvas -> PixiRenderer.updateGraph(graph, expanded, visible,
-                                   layoutEdgeKinds, layoutHideAmbiguous)
-  -> elkLayout.layoutGraph(...)
+Canvas -> PixiRenderer.updateGraph(...)   // full layout  (layoutVersion)
+       -> PixiRenderer.updateEdges(layoutEdgeKinds, layoutHideAmbiguous)
+                                          // edges only   (edgeVersion)
+  -> both phases go through layout/viewEdges.fetchViewEdges:
        enabledKinds = Array.from(layoutEdgeKinds)      // module -> ["Import"]
        sub = await getSubgraph(renderIds, enabledKinds)
        edgeKindCounts = deriveEdgeKindCounts(sub, enabledKinds, hideAmbiguous)
@@ -43,7 +46,7 @@ EdgeLegend (React):
   enabledEdgeKinds  <- graphStore
   viewMode          <- graphStore
   rows = buildLegendRows({ counts, enabledEdgeKinds, viewMode })
-  row click -> graphStore.toggleEdgeKind(kind) -> layoutVersion++ -> relayout
+  row click -> graphStore.toggleEdgeKind(kind) -> edgeVersion++ -> edge phase
                -> new counts published
 ```
 

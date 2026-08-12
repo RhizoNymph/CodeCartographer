@@ -1,12 +1,12 @@
 use std::collections::HashSet;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use cc_core::model::{
-    CodeGraph, CodeNode, EdgeDetail, EdgeKind, FocusDirection, Language, Neighborhood, NodeId,
-    ParseResult,
-    SubGraph,
+    CodeGraph, CodeNode, EdgeDetail, EdgeKind, FocusDirection, Language, Neighborhood, NodeDetails,
+    NodeId, ParseResponse, SubGraph,
 };
-use cc_core::parser::{Extractor, ParseEvent};
+use cc_core::parser::{Extractor, ParseEvent, ParseFileError};
 use cc_core::resolver::{ImportResolver, SymbolTable};
 use rayon::prelude::*;
 use tauri::command;
@@ -14,24 +14,21 @@ use tauri::ipc::Channel;
 
 use crate::GraphState;
 
+/// Flush a progress batch at least this often, so a slow repo still animates.
+const PROGRESS_INTERVAL: Duration = Duration::from_millis(50);
+/// ...and at most every this many files, so a fast repo does not flood the UI.
+const PROGRESS_BATCH_FILES: usize = 100;
+
 #[command]
 pub async fn parse_repo(
     path: String,
     on_event: Channel<ParseEvent>,
     state: tauri::State<'_, GraphState>,
-) -> Result<ParseResult, String> {
+) -> Result<ParseResponse, String> {
     let root = PathBuf::from(&path);
 
     // Take the graph from server-side state
-    let mut graph = {
-        let mut guard = state
-            .0
-            .lock()
-            .map_err(|e| format!("Lock poisoned: {}", e))?;
-        guard
-            .take()
-            .ok_or_else(|| "No graph in state. Run scan_repo first.".to_string())?
-    };
+    let mut graph = state.take_for_mutation()?;
 
     // Re-parse guard: strip any state left by a previous parse so that parsing
     // the same repo twice is idempotent. Remove all CodeBlock nodes, drop block
@@ -76,11 +73,17 @@ pub async fn parse_repo(
         })
         .collect();
 
-    // Phase 2: Merge results and send progress events sequentially
+    // Phase 2: Merge results, batching progress events (see PROGRESS_INTERVAL /
+    // PROGRESS_BATCH_FILES): one message per batch instead of two per file.
+    let total_file_count = file_nodes.len();
+    let mut batch_errors: Vec<ParseFileError> = Vec::new();
+    let mut files_since_flush = 0usize;
+    let mut last_flush = Instant::now();
+    let mut last_file = String::new();
+
     for (file_id, rel_path, result) in parse_results {
-        let _ = on_event.send(ParseEvent::FileStart {
-            path: rel_path.clone(),
-        });
+        last_file.clear();
+        last_file.push_str(&rel_path);
         match result {
             Ok((nodes, refs)) => {
                 let block_count = nodes.len();
@@ -102,19 +105,40 @@ pub async fn parse_repo(
                     }
                 }
                 all_refs.extend(refs);
-                let _ = on_event.send(ParseEvent::FileDone {
-                    path: rel_path,
-                    blocks: block_count,
-                });
             }
             Err(e) => {
-                let _ = on_event.send(ParseEvent::Error {
+                batch_errors.push(ParseFileError {
                     path: rel_path,
                     message: e,
                 });
             }
         }
         total_files += 1;
+        files_since_flush += 1;
+
+        if files_since_flush >= PROGRESS_BATCH_FILES || last_flush.elapsed() >= PROGRESS_INTERVAL {
+            let _ = on_event.send(ParseEvent::Progress {
+                parsed_files: total_files,
+                total_files: total_file_count,
+                total_blocks,
+                current_file: last_file.clone(),
+                errors: std::mem::take(&mut batch_errors),
+            });
+            files_since_flush = 0;
+            last_flush = Instant::now();
+        }
+    }
+
+    // Final partial batch: whatever the loop ended on, so the counts (and any
+    // trailing errors) are complete before resolution starts.
+    if files_since_flush > 0 || !batch_errors.is_empty() {
+        let _ = on_event.send(ParseEvent::Progress {
+            parsed_files: total_files,
+            total_files: total_file_count,
+            total_blocks,
+            current_file: last_file.clone(),
+            errors: std::mem::take(&mut batch_errors),
+        });
     }
 
     // Resolve references into edges
@@ -141,8 +165,8 @@ pub async fn parse_repo(
     // as the "imported" tier of its precision ladder.
     let (import_edges, import_map) = ImportResolver::resolve(&graph, &all_refs);
     tracing::info!("Resolved {} file-level import edges", import_edges.len());
-    for edge in &import_edges {
-        graph.add_edge(edge.clone());
+    for edge in import_edges {
+        graph.add_edge(edge);
     }
     tracing::info!("Graph now has {} edges after adding", graph.edges.len());
 
@@ -155,8 +179,8 @@ pub async fn parse_repo(
         edges.len(),
         symbol_table.symbols.len()
     );
-    for edge in &edges {
-        graph.add_edge(edge.clone());
+    for edge in edges {
+        graph.add_edge(edge);
     }
 
     tracing::info!("Graph now has {} edges after adding", graph.edges.len());
@@ -168,18 +192,10 @@ pub async fn parse_repo(
         tracing::warn!(error = %e, "Failed to send parse event");
     }
 
-    // Build the edge-less response from the graph, then hand ownership of the
-    // graph to server-side state (no extra clone of the full graph).
-    let result = ParseResult::from_graph(&graph);
-    {
-        let mut guard = state
-            .0
-            .lock()
-            .map_err(|e| format!("Lock poisoned: {}", e))?;
-        *guard = Some(graph);
-    }
-
-    Ok(result)
+    // Hand the graph to server-side state and answer with a handle to the very
+    // same allocation: the response serializes straight out of the live node map
+    // (slim nodes, no signatures), copying nothing.
+    Ok(ParseResponse(state.store(graph)?))
 }
 
 /// Remove all parse-derived state from the graph so that re-parsing is
@@ -223,18 +239,24 @@ pub async fn get_subgraph(
     edge_kinds: Vec<String>,
     state: tauri::State<'_, GraphState>,
 ) -> Result<SubGraph, String> {
-    let guard = state
-        .0
-        .lock()
-        .map_err(|e| format!("Lock poisoned: {}", e))?;
-    let graph = guard
-        .as_ref()
-        .ok_or_else(|| "No graph in state. Run scan_repo first.".to_string())?;
-
+    let graph = state.snapshot()?;
     let render: Vec<NodeId> = render_ids.into_iter().map(NodeId).collect();
     let kinds = parse_edge_kinds(edge_kinds)?;
 
-    Ok(SubGraph::from_graph(graph, &render, &kinds))
+    // Pure CPU work over a shared snapshot: off the async workers, and with no
+    // lock held, so concurrent queries actually run concurrently.
+    blocking(move || SubGraph::from_graph(&graph, &render, &kinds)).await
+}
+
+/// Run a CPU-bound graph query on the blocking pool.
+async fn blocking<T, F>(work: F) -> Result<T, String>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    tauri::async_runtime::spawn_blocking(work)
+        .await
+        .map_err(|e| format!("Graph query failed: {}", e))
 }
 
 /// Parse a list of edge-kind names into a set of `EdgeKind`, erroring on any
@@ -269,20 +291,28 @@ pub async fn get_neighborhood(
     direction: FocusDirection,
     state: tauri::State<'_, GraphState>,
 ) -> Result<Neighborhood, String> {
-    let guard = state
-        .0
-        .lock()
-        .map_err(|e| format!("Lock poisoned: {}", e))?;
-    let graph = guard
-        .as_ref()
-        .ok_or_else(|| "No graph in state. Run scan_repo first.".to_string())?;
-
+    let graph = state.snapshot()?;
     let kinds = parse_edge_kinds(edge_kinds)?;
     let focus = NodeId(node_id);
 
-    graph
-        .neighborhood(&focus, depth, &kinds, direction)
-        .ok_or_else(|| format!("Unknown node: {}", focus))
+    blocking(move || {
+        graph
+            .neighborhood(&focus, depth, &kinds, direction)
+            .ok_or_else(|| format!("Unknown node: {}", focus))
+    })
+    .await?
+}
+
+/// Fetch the per-node facts the bulk parse payload leaves out (the block's
+/// signature), for the one node the details panel / tooltip is showing.
+#[command]
+pub async fn get_node_details(
+    node_id: String,
+    state: tauri::State<'_, GraphState>,
+) -> Result<NodeDetails, String> {
+    let graph = state.snapshot()?;
+    let id = NodeId(node_id);
+    NodeDetails::from_graph(&graph, &id).ok_or_else(|| format!("Unknown node: {}", id))
 }
 
 /// Expand one aggregated `source_id -> target_id` view edge into the underlying
@@ -298,21 +328,17 @@ pub async fn get_edge_detail(
     edge_kinds: Vec<String>,
     state: tauri::State<'_, GraphState>,
 ) -> Result<EdgeDetail, String> {
-    let guard = state
-        .0
-        .lock()
-        .map_err(|e| format!("Lock poisoned: {}", e))?;
-    let graph = guard
-        .as_ref()
-        .ok_or_else(|| "No graph in state. Run scan_repo first.".to_string())?;
-
+    let graph = state.snapshot()?;
     let kinds = parse_edge_kinds(edge_kinds)?;
     let source = NodeId(source_id);
     let target = NodeId(target_id);
 
-    graph
-        .edge_detail(&source, &target, &kinds)
-        .ok_or_else(|| format!("Unknown edge endpoints: {} -> {}", source, target))
+    blocking(move || {
+        graph
+            .edge_detail(&source, &target, &kinds)
+            .ok_or_else(|| format!("Unknown edge endpoints: {} -> {}", source, target))
+    })
+    .await?
 }
 
 #[cfg(test)]

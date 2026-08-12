@@ -27,7 +27,11 @@ settings for edge visibility.
 2. `openAndScan` calls `scanRepo` then `parseRepo` via Tauri IPC.
 3. Results are stored in `graphStore` via `setGraph`.
 4. The view-mode control dispatches `setViewMode`; the filter checkboxes dispatch
-   `setHideUnconnectedNodes` / `setHideAmbiguousEdges`. All increment `layoutVersion`.
+   `setHideUnconnectedNodes` / `setHideAmbiguousEdges`. Each is classified by
+   `relayoutPolicy` (graph-layout.md): view mode and hide-unconnected change the
+   node set and increment `layoutVersion` (full ELK layout), while
+   hide-ambiguous is a pure edge filter and increments `edgeVersion` (edge phase
+   only, positions kept).
 5. LOD settings dispatch `setEdgeLODSettings` to `viewportStore`, which debounces localStorage writes (500ms).
 
 ## Files

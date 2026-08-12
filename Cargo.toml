@@ -23,8 +23,36 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 criterion = { version = "0.5", features = ["html_reports"] }
 
+# Dev builds stay at opt-level 1 for the workspace at large so that the
+# frontend-driven `cargo tauri dev` edit/rebuild loop stays cheap.
 [profile.dev]
 opt-level = 1
 
+# Third-party deps (tree-sitter, rayon, ignore, ...) are built once and cached,
+# so there is no reason not to optimize them fully.
 [profile.dev.package."*"]
 opt-level = 3
+
+# The hot loops live in our own crates: tree-sitter extraction, symbol-table
+# construction, import resolution, graph merge and subgraph extraction. Build
+# them at opt-level 3 so dev-loop timings track release behaviour instead of
+# being an artefact of the profile. Measured on benches/graph_bench: ~5% faster
+# than opt-level 1, at the cost of ~4s (vs ~1s) for an incremental rebuild after
+# a cc-core edit. Frontend-only edits do not rebuild either crate.
+#
+# debug-assertions and overflow-checks are deliberately left ON here. They are
+# the bulk of the remaining dev-vs-release gap (release is a further ~20% faster
+# on graph_bench), but they are also the correctness net for the dev loop.
+[profile.dev.package.cc-core]
+opt-level = 3
+
+[profile.dev.package.cc-tauri]
+opt-level = 3
+
+# `panic` is deliberately left at the default (`unwind`): rayon relies on
+# unwinding to catch a panic on a worker thread and re-raise it on the thread
+# that joined it, so `panic = "abort"` would turn a tree-sitter panic on one
+# malformed file into a hard abort of the whole app.
+[profile.release]
+lto = "thin"
+codegen-units = 1

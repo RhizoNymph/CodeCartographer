@@ -1,14 +1,98 @@
 use std::collections::{HashMap, HashSet};
+use std::ops::{Deref, DerefMut};
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 
 use super::edge_index::EdgeIndex;
 use super::{AggregatedEdge, CodeEdge, CodeNode, EdgeKind, NodeId};
 
+/// The graph's node map plus its lazily-built child -> parent index.
+///
+/// The parent map is derived purely from the nodes' `children` arrays, and every
+/// interactive query (`get_subgraph`, `neighborhood`, `edge_detail`) needs it, so
+/// rebuilding it per call costs two `String` clones per child edge on every user
+/// interaction. Caching it is only safe if no mutation can leave it stale, which
+/// is what `DerefMut` guarantees here: `Deref` hands out the `HashMap` for reads,
+/// `DerefMut` drops the cache before handing out `&mut`, so ANY mutating access
+/// -- `insert`, `get_mut`, `retain`, `values_mut`, a `children_mut()` push
+/// through a `get_mut` -- invalidates it. There is no way to mutate the nodes
+/// without going through `DerefMut`, so the cache cannot go stale.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct NodeMap {
+    nodes: HashMap<NodeId, CodeNode>,
+    #[serde(skip)]
+    parent_map: OnceLock<HashMap<NodeId, NodeId>>,
+}
+
+impl NodeMap {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// The child -> parent map built from every node's `children` array, built
+    /// on first use and reused until the nodes are mutated.
+    ///
+    /// After the parsing phase populates the `children` hierarchy, this is the
+    /// authoritative parent map used for lifting edge endpoints to ancestors.
+    pub fn parent_map(&self) -> &HashMap<NodeId, NodeId> {
+        self.parent_map.get_or_init(|| {
+            let mut parent_map = HashMap::new();
+            for (node_id, node) in self.nodes.iter() {
+                for child_id in node.children() {
+                    parent_map.insert(child_id.clone(), node_id.clone());
+                }
+            }
+            parent_map
+        })
+    }
+
+    /// True when the parent map is currently cached (test/diagnostic hook).
+    pub fn parent_map_is_cached(&self) -> bool {
+        self.parent_map.get().is_some()
+    }
+}
+
+impl Deref for NodeMap {
+    type Target = HashMap<NodeId, CodeNode>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.nodes
+    }
+}
+
+impl DerefMut for NodeMap {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        // Any mutable access can change the containment hierarchy: drop the
+        // derived index rather than try to guess whether it did.
+        self.parent_map = OnceLock::new();
+        &mut self.nodes
+    }
+}
+
+impl<'a> IntoIterator for &'a NodeMap {
+    type Item = (&'a NodeId, &'a CodeNode);
+    type IntoIter = std::collections::hash_map::Iter<'a, NodeId, CodeNode>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.nodes.iter()
+    }
+}
+
+impl From<HashMap<NodeId, CodeNode>> for NodeMap {
+    fn from(nodes: HashMap<NodeId, CodeNode>) -> Self {
+        Self {
+            nodes,
+            parent_map: OnceLock::new(),
+        }
+    }
+}
+
 /// The full code graph for a repository.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CodeGraph {
-    pub nodes: HashMap<NodeId, CodeNode>,
+    pub nodes: NodeMap,
     pub edges: Vec<CodeEdge>,
     pub root: NodeId,
     /// Forward adjacency: source -> [(target, edge_index)]
@@ -25,7 +109,7 @@ pub struct CodeGraph {
 impl CodeGraph {
     pub fn new(root_id: NodeId) -> Self {
         Self {
-            nodes: HashMap::new(),
+            nodes: NodeMap::new(),
             edges: Vec::new(),
             root: root_id,
             forward_adj: HashMap::new(),
@@ -93,20 +177,11 @@ impl CodeGraph {
         }
         self.edge_index.rebuild(&self.edges);
     }
-}
 
-/// Build a child -> parent map from every node's `children` array.
-///
-/// After the parsing phase populates the `children` hierarchy, this yields the
-/// authoritative parent map used for lifting edge endpoints to ancestors.
-pub fn build_parent_map(graph: &CodeGraph) -> HashMap<NodeId, NodeId> {
-    let mut parent_map = HashMap::new();
-    for (node_id, node) in graph.nodes.iter() {
-        for child_id in node.children() {
-            parent_map.insert(child_id.clone(), node_id.clone());
-        }
+    /// The cached child -> parent map (see [`NodeMap::parent_map`]).
+    pub fn parent_map(&self) -> &HashMap<NodeId, NodeId> {
+        self.nodes.parent_map()
     }
-    parent_map
 }
 
 /// Walk up the parent chain from `node_id` until a node in `render_set` is
@@ -180,7 +255,7 @@ impl SubGraph {
         enabled_edge_kinds: &HashSet<EdgeKind>,
     ) -> Self {
         let render_set: HashSet<&NodeId> = render_ids.iter().collect();
-        let parent_map = build_parent_map(graph);
+        let parent_map = graph.parent_map();
 
         let mut edges: Vec<CodeEdge> = Vec::new();
         // Preserve insertion order of aggregated edges for stable output.
@@ -220,12 +295,12 @@ impl SubGraph {
 
             // At least one endpoint is hidden -- lift to nearest rendered ancestor.
             let lifted_source =
-                match find_render_ancestor(&edge.source, &render_set, &parent_map) {
+                match find_render_ancestor(&edge.source, &render_set, parent_map) {
                     Some(id) => id,
                     None => continue,
                 };
             let lifted_target =
-                match find_render_ancestor(&edge.target, &render_set, &parent_map) {
+                match find_render_ancestor(&edge.target, &render_set, parent_map) {
                     Some(id) => id,
                     None => continue,
                 };
@@ -237,8 +312,8 @@ impl SubGraph {
 
             // Skip when one lifted endpoint is an ancestor of the other -- an
             // edge from a node into its own containing box is misleading.
-            if is_ancestor_of(lifted_source, lifted_target, &parent_map)
-                || is_ancestor_of(lifted_target, lifted_source, &parent_map)
+            if is_ancestor_of(lifted_source, lifted_target, parent_map)
+                || is_ancestor_of(lifted_target, lifted_source, parent_map)
             {
                 continue;
             }
@@ -412,7 +487,7 @@ impl CodeGraph {
 
         // Include the container chain (parents up to root) of every discovered
         // node so the frontend can build the containment tree.
-        let parent_map = build_parent_map(self);
+        let parent_map = self.parent_map();
         let mut node_set: HashSet<NodeId> = discovered.clone();
         for node in discovered.iter() {
             let mut current = node.clone();
@@ -482,15 +557,15 @@ impl CodeGraph {
         if !self.nodes.contains_key(source) || !self.nodes.contains_key(target) {
             return None;
         }
-        let parent_map = build_parent_map(self);
+        let parent_map = self.parent_map();
 
         let edges: Vec<CodeEdge> = self
             .edges
             .iter()
             .filter(|e| {
                 enabled_edge_kinds.contains(&e.kind)
-                    && is_self_or_descendant(&e.source, source, &parent_map)
-                    && is_self_or_descendant(&e.target, target, &parent_map)
+                    && is_self_or_descendant(&e.source, source, parent_map)
+                    && is_self_or_descendant(&e.target, target, parent_map)
             })
             .cloned()
             .collect();
@@ -529,9 +604,15 @@ impl CodeGraph {
 /// The full graph (nodes + edges) stays in server-side state; the frontend
 /// receives the node tree once plus a compact connectivity map so it can run
 /// the `hideUnconnectedNodes` filter synchronously without holding edges.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ParseResult {
-    pub nodes: HashMap<NodeId, CodeNode>,
+///
+/// It BORROWS the live node map: serialization streams straight out of the
+/// graph, so handing this to the frontend costs no copy of the node map at all.
+/// Nodes go over the wire in their slim form (see [`SlimNode`]) -- the panel-only
+/// `signature` is fetched per node via [`NodeDetails`].
+#[derive(Debug, Serialize)]
+pub struct ParseResult<'a> {
+    #[serde(serialize_with = "serialize_slim_nodes")]
+    pub nodes: &'a NodeMap,
     pub root: NodeId,
     pub edge_count: usize,
     /// For each node touched by at least one edge, the distinct edge kinds that
@@ -539,15 +620,153 @@ pub struct ParseResult {
     pub node_edge_kinds: HashMap<NodeId, Vec<EdgeKind>>,
 }
 
-impl ParseResult {
-    /// Build an edge-less parse result from a fully-parsed graph.
-    pub fn from_graph(graph: &CodeGraph) -> Self {
+impl<'a> ParseResult<'a> {
+    /// Build an edge-less parse result borrowing a fully-parsed graph.
+    pub fn from_graph(graph: &'a CodeGraph) -> Self {
         ParseResult {
-            nodes: graph.nodes.clone(),
+            nodes: &graph.nodes,
             root: graph.root.clone(),
             edge_count: graph.edges.len(),
             node_edge_kinds: build_node_edge_kinds(graph),
         }
+    }
+}
+
+/// An owned handle to the graph a parse/scan produced, serialized as a
+/// [`ParseResult`].
+///
+/// A Tauri command's return value must outlive the borrow of the state it was
+/// built from, which is why the borrowing `ParseResult` cannot be returned
+/// directly. Sharing the graph through an `Arc` gets both: the command hands the
+/// same allocation to server-side state and to the response, and serialization
+/// still streams out of the live node map with no copy.
+#[derive(Debug, Clone)]
+pub struct ParseResponse(pub std::sync::Arc<CodeGraph>);
+
+impl Serialize for ParseResponse {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        ParseResult::from_graph(&self.0).serialize(serializer)
+    }
+}
+
+/// A node as it goes over the wire in the bulk parse payload: everything the
+/// canvas, sidebar and containment tree need, and nothing else.
+///
+/// Borrowed field-by-field from a [`CodeNode`], so building one is free. The
+/// only omitted field is `signature` -- the whole first line of every function,
+/// the single largest contributor to the payload, and read by exactly one
+/// surface (the details panel / hover tooltip), which fetches it on demand via
+/// [`NodeDetails`].
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+pub enum SlimNode<'a> {
+    Directory {
+        id: &'a NodeId,
+        name: &'a str,
+        path: &'a str,
+        children: &'a [NodeId],
+    },
+    File {
+        id: &'a NodeId,
+        name: &'a str,
+        path: &'a str,
+        language: Option<&'a super::Language>,
+        children: &'a [NodeId],
+    },
+    CodeBlock {
+        id: &'a NodeId,
+        name: &'a str,
+        kind: &'a super::BlockKind,
+        span: &'a super::Span,
+        visibility: Option<&'a super::Visibility>,
+        parent: &'a NodeId,
+        children: &'a [NodeId],
+    },
+}
+
+impl<'a> From<&'a CodeNode> for SlimNode<'a> {
+    fn from(node: &'a CodeNode) -> Self {
+        match node {
+            CodeNode::Directory {
+                id,
+                name,
+                path,
+                children,
+            } => SlimNode::Directory {
+                id,
+                name,
+                path,
+                children,
+            },
+            CodeNode::File {
+                id,
+                name,
+                path,
+                language,
+                children,
+            } => SlimNode::File {
+                id,
+                name,
+                path,
+                language: language.as_ref(),
+                children,
+            },
+            CodeNode::CodeBlock {
+                id,
+                name,
+                kind,
+                span,
+                signature: _,
+                visibility,
+                parent,
+                children,
+            } => SlimNode::CodeBlock {
+                id,
+                name,
+                kind,
+                span,
+                visibility: visibility.as_ref(),
+                parent,
+                children,
+            },
+        }
+    }
+}
+
+fn serialize_slim_nodes<S: serde::Serializer>(
+    nodes: &NodeMap,
+    serializer: S,
+) -> Result<S::Ok, S::Error> {
+    use serde::ser::SerializeMap;
+    let mut map = serializer.serialize_map(Some(nodes.len()))?;
+    for (id, node) in nodes {
+        map.serialize_entry(id, &SlimNode::from(node))?;
+    }
+    map.end()
+}
+
+/// The per-node facts the bulk payload leaves out, fetched on demand for the
+/// one node a user is looking at.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NodeDetails {
+    pub id: NodeId,
+    /// The block's declaration line; `None` for files, directories, and blocks
+    /// whose language support extracts no signature.
+    pub signature: Option<String>,
+}
+
+impl NodeDetails {
+    /// The on-demand facts for `id`, or `None` when the node is unknown.
+    pub fn from_graph(graph: &CodeGraph, id: &NodeId) -> Option<Self> {
+        let node = graph.node(id)?;
+        let signature = match node {
+            CodeNode::CodeBlock { signature, .. } => signature.clone(),
+            _ => None,
+        };
+        Some(NodeDetails {
+            id: id.clone(),
+            signature,
+        })
     }
 }
 
@@ -1620,4 +1839,273 @@ mod tests {
         assert!(d.node_ids.is_empty());
     }
 
+    // --- Cached parent map: consistency across every mutation path ---
+
+    fn parents(g: &CodeGraph) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = g
+            .parent_map()
+            .iter()
+            .map(|(child, parent)| (child.0.clone(), parent.0.clone()))
+            .collect();
+        pairs.sort();
+        pairs
+    }
+
+    /// The cached map must equal one built from scratch off the same nodes.
+    fn assert_parent_map_matches_rebuild(g: &CodeGraph) {
+        let mut expected: Vec<(String, String)> = Vec::new();
+        for (node_id, node) in g.nodes.iter() {
+            for child in node.children() {
+                expected.push((child.0.clone(), node_id.0.clone()));
+            }
+        }
+        expected.sort();
+        assert_eq!(parents(g), expected);
+    }
+
+    #[test]
+    fn parent_map_is_cached_after_first_use() {
+        let g = sample_graph();
+        assert!(!g.nodes.parent_map_is_cached(), "not built until asked for");
+        let first = g.parent_map() as *const _;
+        assert!(g.nodes.parent_map_is_cached());
+        let second = g.parent_map() as *const _;
+        assert_eq!(first, second, "second call reuses the cached map");
+    }
+
+    #[test]
+    fn parent_map_cache_survives_edge_additions() {
+        let mut g = sample_graph();
+        let before = parents(&g);
+        g.add_edge(edge("fnA1", "fnB1", EdgeKind::FunctionCall));
+        assert!(
+            g.nodes.parent_map_is_cached(),
+            "edges do not touch the containment hierarchy"
+        );
+        assert_eq!(parents(&g), before);
+    }
+
+    #[test]
+    fn parent_map_cache_invalidated_by_node_addition() {
+        let mut g = sample_graph();
+        let _ = g.parent_map(); // prime the cache
+        g.add_node(block("fnB2", "fileB"));
+        g.add_node(file("fileC", vec!["fnC1"]));
+        g.add_node(block("fnC1", "fileC"));
+
+        assert_eq!(
+            g.parent_map().get(&NodeId("fnC1".into())),
+            Some(&NodeId("fileC".into())),
+            "a node added after the cache was built is in the map"
+        );
+        assert_parent_map_matches_rebuild(&g);
+    }
+
+    #[test]
+    fn parent_map_cache_invalidated_by_children_mutation() {
+        let mut g = sample_graph();
+        let _ = g.parent_map(); // prime the cache
+        g.add_node(block("fnA3", "fileA"));
+        // The parse merge loop pushes block ids onto the file's children through
+        // a `get_mut` -- the mutation path that must invalidate the cache.
+        g.nodes
+            .get_mut(&NodeId("fileA".into()))
+            .unwrap()
+            .children_mut()
+            .push(NodeId("fnA3".into()));
+
+        assert_eq!(
+            g.parent_map().get(&NodeId("fnA3".into())),
+            Some(&NodeId("fileA".into()))
+        );
+        assert_parent_map_matches_rebuild(&g);
+    }
+
+    #[test]
+    fn parent_map_cache_invalidated_by_node_removal() {
+        let mut g = sample_graph();
+        let _ = g.parent_map(); // prime the cache
+        // The re-parse strip: drop every code block, then drop their ids from
+        // the files' children arrays.
+        g.nodes.retain(|_, node| !node.is_code_block());
+        for node in g.nodes.values_mut() {
+            node.children_mut().retain(|child| !child.0.starts_with("fn"));
+        }
+
+        assert!(
+            g.parent_map().get(&NodeId("fnA1".into())).is_none(),
+            "a removed node has no parent entry"
+        );
+        assert_parent_map_matches_rebuild(&g);
+    }
+
+    #[test]
+    fn subgraph_is_unchanged_by_the_parent_map_cache() {
+        let mut g = sample_graph();
+        g.add_edge(edge("fnA1", "fnB1", EdgeKind::FunctionCall));
+        let render: Vec<NodeId> = ["fileA", "fileB"]
+            .iter()
+            .map(|s| NodeId(s.to_string()))
+            .collect();
+
+        // Same graph, three calls: the cache must not drift.
+        let first = format!("{:?}", SubGraph::from_graph(&g, &render, &all_kinds()));
+        let second = format!("{:?}", SubGraph::from_graph(&g, &render, &all_kinds()));
+        assert_eq!(first, second);
+
+        // Mutate after the cache was built, then compare against a graph built
+        // in the mutated shape from scratch (which never had a stale cache).
+        g.add_node(block("fnB2", "fileB"));
+        g.nodes
+            .get_mut(&NodeId("fileB".into()))
+            .unwrap()
+            .children_mut()
+            .push(NodeId("fnB2".into()));
+        g.add_edge(edge("fnA2", "fnB2", EdgeKind::FunctionCall));
+
+        let mut fresh = CodeGraph::new(NodeId("root".into()));
+        fresh.add_node(dir("root", vec!["fileA", "fileB"]));
+        fresh.add_node(file("fileA", vec!["fnA1", "fnA2"]));
+        fresh.add_node(file("fileB", vec!["fnB1", "fnB2"]));
+        fresh.add_node(block("fnA1", "fileA"));
+        fresh.add_node(block("fnA2", "fileA"));
+        fresh.add_node(block("fnB1", "fileB"));
+        fresh.add_node(block("fnB2", "fileB"));
+        fresh.add_edge(edge("fnA1", "fnB1", EdgeKind::FunctionCall));
+        fresh.add_edge(edge("fnA2", "fnB2", EdgeKind::FunctionCall));
+
+        assert_eq!(
+            format!("{:?}", SubGraph::from_graph(&g, &render, &all_kinds())),
+            format!("{:?}", SubGraph::from_graph(&fresh, &render, &all_kinds())),
+        );
+    }
+
+    #[test]
+    fn neighborhood_and_edge_detail_see_post_mutation_containment() {
+        let mut g = sample_graph();
+        g.add_edge(edge("fnA1", "fnB1", EdgeKind::FunctionCall));
+        // Prime the cache through a real query.
+        let _ = g.neighborhood(&NodeId("fnA1".into()), 1, &all_kinds(), FocusDirection::Both);
+
+        // Re-parent fnB1 under a new file that did not exist when the cache was built.
+        g.add_node(file("fileC", vec!["fnB1"]));
+        g.nodes
+            .get_mut(&NodeId("fileB".into()))
+            .unwrap()
+            .children_mut()
+            .clear();
+
+        let n = g
+            .neighborhood(&NodeId("fnA1".into()), 1, &all_kinds(), FocusDirection::Both)
+            .unwrap();
+        let ids: HashSet<&str> = n.node_ids.iter().map(|id| id.0.as_str()).collect();
+        assert!(ids.contains("fileC"), "container chain follows the new parent");
+        assert!(!ids.contains("fileB"), "the old parent is no longer a container");
+
+        let d = detail(&g, "fileA", "fileC");
+        assert_eq!(edge_pairs(&d), [("fnA1", "fnB1")].into_iter().collect());
+    }
+
+    // --- Slim wire format + on-demand node details ---
+
+    fn slim_block_json(g: &CodeGraph, id: &str) -> serde_json::Value {
+        let result = ParseResult::from_graph(g);
+        let value = serde_json::to_value(&result).expect("ParseResult serializes");
+        value["nodes"][id].clone()
+    }
+
+    #[test]
+    fn parse_result_omits_signature_from_blocks() {
+        let mut g = sample_graph();
+        g.add_node(CodeNode::CodeBlock {
+            id: NodeId("fnA1".into()),
+            name: "fnA1".into(),
+            kind: BlockKind::Function,
+            span: Span {
+                start_line: 3,
+                start_col: 0,
+                end_line: 9,
+                end_col: 1,
+            },
+            signature: Some("def fnA1(self, a, b, c):".into()),
+            visibility: Some(Visibility::Public),
+            parent: NodeId("fileA".into()),
+            children: Vec::new(),
+        });
+
+        let block = slim_block_json(&g, "fnA1");
+        assert!(
+            block.get("signature").is_none(),
+            "signature is panel-only and must not ship in the bulk payload"
+        );
+        // Everything the canvas/sidebar/containment tree reads is still there.
+        assert_eq!(block["type"], "CodeBlock");
+        assert_eq!(block["id"], "fnA1");
+        assert_eq!(block["name"], "fnA1");
+        assert_eq!(block["kind"], "Function");
+        assert_eq!(block["visibility"], "Public");
+        assert_eq!(block["parent"], "fileA");
+        assert_eq!(block["span"]["start_line"], 3);
+        assert_eq!(block["span"]["end_line"], 9);
+        assert!(block["children"].is_array());
+    }
+
+    #[test]
+    fn parse_result_keeps_directory_and_file_shape() {
+        let g = sample_graph();
+        let value = serde_json::to_value(ParseResult::from_graph(&g)).unwrap();
+
+        assert_eq!(value["root"], "root");
+        assert_eq!(value["edge_count"], 0);
+        let dir = &value["nodes"]["root"];
+        assert_eq!(dir["type"], "Directory");
+        assert_eq!(dir["path"], "root");
+        assert_eq!(dir["children"][0], "fileA");
+        let file = &value["nodes"]["fileA"];
+        assert_eq!(file["type"], "File");
+        assert_eq!(file["language"], "Python");
+        assert_eq!(file["path"], "fileA");
+    }
+
+    #[test]
+    fn parse_response_serializes_identically_to_parse_result() {
+        let mut g = sample_graph();
+        g.add_edge(edge("fnA1", "fnB1", EdgeKind::FunctionCall));
+        let expected = serde_json::to_value(ParseResult::from_graph(&g)).unwrap();
+        let response = ParseResponse(std::sync::Arc::new(g));
+        assert_eq!(serde_json::to_value(&response).unwrap(), expected);
+    }
+
+    #[test]
+    fn node_details_carries_the_signature_left_out_of_the_payload() {
+        let mut g = sample_graph();
+        g.add_node(CodeNode::CodeBlock {
+            id: NodeId("fnA1".into()),
+            name: "fnA1".into(),
+            kind: BlockKind::Function,
+            span: Span {
+                start_line: 1,
+                start_col: 0,
+                end_line: 1,
+                end_col: 0,
+            },
+            signature: Some("def fnA1():".into()),
+            visibility: Some(Visibility::Public),
+            parent: NodeId("fileA".into()),
+            children: Vec::new(),
+        });
+
+        let details = NodeDetails::from_graph(&g, &NodeId("fnA1".into())).unwrap();
+        assert_eq!(details.id, NodeId("fnA1".into()));
+        assert_eq!(details.signature.as_deref(), Some("def fnA1():"));
+
+        // Files and directories carry no signature; unknown ids have no details.
+        assert_eq!(
+            NodeDetails::from_graph(&g, &NodeId("fileA".into()))
+                .unwrap()
+                .signature,
+            None
+        );
+        assert!(NodeDetails::from_graph(&g, &NodeId("nope".into())).is_none());
+    }
 }

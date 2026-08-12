@@ -11,6 +11,11 @@ import {
   type NodeBox,
   type Point,
 } from "../layout/edgeGeometry";
+import {
+  ObstacleIndex,
+  obstacleEntry,
+  type ObstacleEntry,
+} from "../layout/obstacleIndex";
 import type { LayoutResult } from "../layout/elkLayout";
 import { useViewportStore, type LODLevel } from "../../stores/viewportStore";
 import {
@@ -19,6 +24,11 @@ import {
   type EdgeDatum,
   type NodeDisplayRef,
 } from "./types";
+import {
+  resolveEdgeRoutingMode,
+  routesAroundObstacles,
+  scoresEdgeCrossings,
+} from "./edgeRoutingBudget";
 import {
   buildEdgeCountChipLayer,
   polylineArcMidpoint,
@@ -29,13 +39,35 @@ import {
 // Re-export types for backwards compatibility with existing imports
 export type { EdgeDatum, NodeDisplayRef } from "./types";
 
+/**
+ * How far beyond an edge's own bounding box obstacles are still considered.
+ *
+ * The router may leave the corridor between the endpoints: a detour clears an
+ * obstacle inflated by `NODE_OBSTACLE_MARGIN` (14) and can be pushed a further
+ * `DETOUR_GUTTER` (28) outside the boxes it goes around, on top of a node's own
+ * height. 160 layout units covers that with room to spare while keeping each
+ * query to a handful of boxes instead of the whole graph.
+ */
+const OBSTACLE_QUERY_MARGIN = 160;
+
+/** Shared empty reference list, so the no-scoring path allocates nothing. */
+const NO_REFERENCE_POLYLINES: Point[][] = [];
+
 interface ResolvedEdgeDraw {
   index: number;
   edge: EdgeDatum;
   points: Point[];
   sourceBox: NodeBox;
   targetBox: NodeBox;
-  obstacles: NodeBox[];
+}
+
+/**
+ * "#64748b" -> 0x64748b. Done once per edge per LAYOUT (in `buildEdgeData`)
+ * rather than once per edge per REDRAW, which is where it used to sit.
+ */
+function parseEdgeColor(color: string): number {
+  const parsed = parseInt(color.replace("#", ""), 16);
+  return Number.isNaN(parsed) ? 0x64748b : parsed;
 }
 
 function getBoxCenter(box: NodeBox): Point {
@@ -250,17 +282,95 @@ function inferAnchorsFromPolyline(
 }
 
 /**
+ * Snapshot every visible node's display ref ONCE per redraw.
+ *
+ * This used to happen per edge (`getNodeDisplayRef` inside the obstacle loop),
+ * which allocated one fresh 12-field object per node PER EDGE -- O(E x N)
+ * allocations. Now each node is read exactly once and every edge shares the
+ * result.
+ */
+function snapshotNodeRefs(
+  visibleNodes: Set<string>,
+  getNodeDisplayRef: (nodeId: string) => NodeDisplayRef | null
+): Map<string, NodeDisplayRef> {
+  const refs = new Map<string, NodeDisplayRef>();
+
+  for (const nodeId of visibleNodes) {
+    const ref = getNodeDisplayRef(nodeId);
+    if (ref) {
+      refs.set(nodeId, ref);
+    }
+  }
+
+  return refs;
+}
+
+/**
+ * Index every obstacle box (node body + label) for one redraw.
+ *
+ * Boxes are tagged with their node id so an edge can drop the ones belonging to
+ * its own endpoints in a single query.
+ */
+function buildObstacleIndex(refs: ReadonlyMap<string, NodeDisplayRef>): ObstacleIndex {
+  const entries: ObstacleEntry[] = [];
+
+  for (const [nodeId, ref] of refs) {
+    const labelObstacle = nodeRefToLabelObstacle(ref);
+    if (labelObstacle) {
+      entries.push(obstacleEntry(nodeId, labelObstacle));
+    }
+    entries.push(obstacleEntry(nodeId, nodeRefToBox(ref)));
+  }
+
+  return new ObstacleIndex(entries);
+}
+
+/**
+ * Obstacles one edge actually has to care about: the boxes near its polyline,
+ * minus its own endpoints' boxes and minus any box that swallows an endpoint
+ * centre (a collapsed container holding one of the endpoints -- routing around
+ * it is impossible, and trying produces long useless detours).
+ */
+function obstaclesForEdge(index: ObstacleIndex, draw: ResolvedEdgeDraw): NodeBox[] {
+  const candidates = index.queryForPolyline(
+    draw.points,
+    OBSTACLE_QUERY_MARGIN,
+    draw.edge.source,
+    draw.edge.target
+  );
+
+  if (candidates.length === 0) {
+    return candidates;
+  }
+
+  const sourceCenter = getBoxCenter(draw.sourceBox);
+  const targetCenter = getBoxCenter(draw.targetBox);
+  const obstacles: NodeBox[] = [];
+
+  for (const box of candidates) {
+    if (boxContainsPoint(box, sourceCenter) || boxContainsPoint(box, targetCenter)) {
+      continue;
+    }
+    obstacles.push(box);
+  }
+
+  return obstacles;
+}
+
+/**
  * Resolves edge routing points for a single edge given current node positions.
  * Extracted so both base and highlight layers can share this logic.
+ *
+ * Obstacle avoidance is NOT done here -- it is a separate, budget-gated pass
+ * over the resolved draws (see `redrawEdgesWithHighlight`).
  */
 function resolveEdgeDraw(
   index: number,
   edge: EdgeDatum,
-  visibleNodes: Set<string>,
-  getNodeDisplayRef: (nodeId: string) => NodeDisplayRef | null
+  refs: ReadonlyMap<string, NodeDisplayRef>
 ): ResolvedEdgeDraw | null {
-  const sourceRef = getNodeDisplayRef(edge.source);
-  const targetRef = getNodeDisplayRef(edge.target);
+  const sourceRef = refs.get(edge.source);
+  const targetRef = refs.get(edge.target);
 
   if (!sourceRef || !targetRef || edge.originalPoints.length < 2) return null;
 
@@ -282,34 +392,6 @@ function resolveEdgeDraw(
   const targetDy = targetRef.containerY - targetRef.layoutY;
   const sourceMoved = Math.abs(sourceDx) > 1 || Math.abs(sourceDy) > 1;
   const targetMoved = Math.abs(targetDx) > 1 || Math.abs(targetDy) > 1;
-  const sourceCenter = getBoxCenter(sourceBox);
-  const targetCenter = getBoxCenter(targetBox);
-  const obstacles: NodeBox[] = [];
-
-  for (const nodeId of visibleNodes) {
-    if (nodeId === edge.source || nodeId === edge.target) {
-      continue;
-    }
-
-    const ref = getNodeDisplayRef(nodeId);
-    if (!ref) {
-      continue;
-    }
-
-    const labelObstacle = nodeRefToLabelObstacle(ref);
-    if (
-      labelObstacle &&
-      !boxContainsPoint(labelObstacle, sourceCenter) &&
-      !boxContainsPoint(labelObstacle, targetCenter)
-    ) {
-      obstacles.push(labelObstacle);
-    }
-
-    const box = nodeRefToBox(ref);
-    if (!boxContainsPoint(box, sourceCenter) && !boxContainsPoint(box, targetCenter)) {
-      obstacles.push(box);
-    }
-  }
 
   let points: Point[];
   if (!sourceMoved && !targetMoved) {
@@ -351,7 +433,7 @@ function resolveEdgeDraw(
   }
 
   return points.length >= 2
-    ? { index, edge, points, sourceBox, targetBox, obstacles }
+    ? { index, edge, points, sourceBox, targetBox }
     : null;
 }
 
@@ -446,7 +528,8 @@ export class EdgeDrawingManager {
   private _lastEdgeLayer: Container | null = null;
   private _lastLOD: LODLevel = "detail";
   private _lastVisibleNodes: Set<string> = new Set();
-  private _lastGetRef: ((nodeId: string) => NodeDisplayRef | null) | null = null;
+  /** Node refs snapshotted by the last full redraw; reused by highlight-only rebuilds. */
+  private _lastNodeRefs: Map<string, NodeDisplayRef> = new Map();
   /** Whether a highlight source (hover or pin) is currently driving the layers. */
   private _highlightActive = false;
   private resolvedPointsByEdgeIndex = new Map<number, Point[]>();
@@ -471,6 +554,8 @@ export class EdgeDrawingManager {
         source: e.source,
         target: e.target,
         color: e.color,
+        // Parsed once per layout instead of once per edge per redraw.
+        colorInt: parseEdgeColor(e.color),
         kind: e.kind,
         resolution: e.resolution,
         originalPoints: e.points.map((p) => ({ x: p.x, y: p.y })),
@@ -497,7 +582,6 @@ export class EdgeDrawingManager {
     this._lastEdgeLayer = edgeLayer;
     this._lastLOD = currentLOD;
     this._lastVisibleNodes = currentVisibleNodes;
-    this._lastGetRef = getNodeDisplayRef;
     this._highlightActive = highlightActive;
 
     // Destroy old layers
@@ -505,7 +589,14 @@ export class EdgeDrawingManager {
     this.destroyHighlightLayer();
     this.resolvedPointsByEdgeIndex.clear();
 
-    if (this.edgeData.length === 0) return;
+    if (this.edgeData.length === 0) {
+      this._lastNodeRefs = new Map();
+      return;
+    }
+
+    // ONE scan of the visible nodes for the whole redraw.
+    const nodeRefs = snapshotNodeRefs(currentVisibleNodes, getNodeDisplayRef);
+    this._lastNodeRefs = nodeRefs;
 
     const resolvedDraws: ResolvedEdgeDraw[] = [];
 
@@ -520,7 +611,7 @@ export class EdgeDrawingManager {
         continue;
       }
 
-      const draw = resolveEdgeDraw(idx, edge, currentVisibleNodes, getNodeDisplayRef);
+      const draw = resolveEdgeDraw(idx, edge, nodeRefs);
       if (!draw) continue;
 
       resolvedDraws.push(draw);
@@ -528,29 +619,46 @@ export class EdgeDrawingManager {
 
     spreadEndpointLanes(resolvedDraws, true);
     spreadEndpointLanes(resolvedDraws, false);
-    const routedPolylines: Point[][] = [];
-    for (const draw of resolvedDraws) {
-      draw.points = routePolylineAroundObstacles(
-        draw.points,
-        draw.obstacles,
-        routedPolylines
-      );
-      routedPolylines.push(draw.points);
+
+    const lodOpacityMultiplier = getLODEdgeOpacity(currentLOD);
+
+    // Budget gate: how much routing this redraw can afford. Above the
+    // thresholds the ELK/straight polyline is drawn as-is instead of running an
+    // effectively unbounded detour search per edge.
+    const routingMode = resolveEdgeRoutingMode({
+      renderedEdges: resolvedDraws.length,
+      visibleNodes: nodeRefs.size,
+      edgesVisible: lodOpacityMultiplier > 0,
+    });
+
+    if (routesAroundObstacles(routingMode)) {
+      const obstacleIndex = buildObstacleIndex(nodeRefs);
+      const scoreCrossings = scoresEdgeCrossings(routingMode);
+      const routedPolylines: Point[][] = [];
+
+      for (const draw of resolvedDraws) {
+        draw.points = routePolylineAroundObstacles(
+          draw.points,
+          obstaclesForEdge(obstacleIndex, draw),
+          scoreCrossings ? routedPolylines : NO_REFERENCE_POLYLINES
+        );
+        if (scoreCrossings) {
+          routedPolylines.push(draw.points);
+        }
+      }
     }
 
     const gfx = new Graphics();
-    const lodOpacityMultiplier = getLODEdgeOpacity(currentLOD);
     const chipSpecs: EdgeCountChipSpec[] = [];
 
     for (const draw of resolvedDraws) {
       const { edge, points } = draw;
-      this.resolvedPointsByEdgeIndex.set(
-        draw.index,
-        points.map((point) => ({ ...point }))
-      );
+      // `points` is freshly built by the resolve/route pass and never mutated
+      // in place afterwards, so the highlight layer can share the same array.
+      this.resolvedPointsByEdgeIndex.set(draw.index, points);
 
       const style = edge.kind ? EDGE_STYLES[edge.kind] : DEFAULT_EDGE_STYLE;
-      const color = parseInt(edge.color.replace("#", ""), 16);
+      const color = edge.colorInt;
       const ambiguous = edge.resolution === "Ambiguous";
       const alpha =
         style.baseAlpha *
@@ -635,16 +743,12 @@ export class EdgeDrawingManager {
    * Uses the stashed state from the last full redraw.
    */
   private rebuildHighlightLayer(): void {
-    if (
-      !this._lastEdgeLayer ||
-      !this._lastGetRef ||
-      this.highlightedEdgeIndices.size === 0
-    ) {
+    if (!this._lastEdgeLayer || this.highlightedEdgeIndices.size === 0) {
       return;
     }
 
     const gfx = new Graphics();
-    const getRef = this._lastGetRef;
+    const nodeRefs = this._lastNodeRefs;
     const currentLOD = this._lastLOD;
     const visibleNodes = this._lastVisibleNodes;
     const chipSpecs: EdgeCountChipSpec[] = [];
@@ -658,11 +762,11 @@ export class EdgeDrawingManager {
       }
 
       const points = this.resolvedPointsByEdgeIndex.get(idx) ??
-        resolveEdgeDraw(idx, edge, visibleNodes, getRef)?.points;
+        resolveEdgeDraw(idx, edge, nodeRefs)?.points;
       if (!points) continue;
 
       const style = edge.kind ? EDGE_STYLES[edge.kind] : DEFAULT_EDGE_STYLE;
-      const color = parseInt(edge.color.replace("#", ""), 16);
+      const color = edge.colorInt;
       const ambiguous = edge.resolution === "Ambiguous";
       const alpha = 1.0;
       const width = style.width + 1;
@@ -722,8 +826,9 @@ export class EdgeDrawingManager {
     }
     this.destroyBaseLayer();
     this.destroyHighlightLayer();
+    this.resolvedPointsByEdgeIndex.clear();
     this._lastEdgeLayer = null;
-    this._lastGetRef = null;
+    this._lastNodeRefs = new Map();
   }
 
   private destroyBaseLayer(): void {

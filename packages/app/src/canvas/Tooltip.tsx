@@ -1,4 +1,5 @@
 import { useGraphStore } from "../stores/graphStore";
+import { useNodeDetails } from "../api/useNodeDetails";
 import { BLOCK_COLORS, EDGE_COLORS, type EdgeKind } from "../api/types";
 
 const tooltipStyle: React.CSSProperties = {
@@ -38,6 +39,19 @@ export function Tooltip() {
   const hoveredNodeId = useGraphStore((s) => s.hoveredNodeId);
   const hoveredEdgeInfo = useGraphStore((s) => s.hoveredEdgeInfo);
 
+  const hoveredNode =
+    graph && hoveredNodeId ? graph.nodes[hoveredNodeId] : undefined;
+  // Signatures are not in the bulk payload; fetch the hovered block's on demand.
+  // Debounced, so a pointer sweeping across nodes issues no requests.
+  const details = useNodeDetails(
+    hoveredNode && hoveredNode.type === "CodeBlock" ? hoveredNode.id : null
+  );
+  const signature =
+    hoveredNode && hoveredNode.type === "CodeBlock"
+      ? (details && details.id === hoveredNode.id ? details.signature : null) ??
+        hoveredNode.signature
+      : null;
+
   // Edge tooltip (shown when hovering an edge and NOT hovering a node)
   if (!hoveredNodeId && hoveredEdgeInfo) {
     return (
@@ -57,7 +71,7 @@ export function Tooltip() {
 
   if (!graph || !hoveredNodeId) return null;
 
-  const node = graph.nodes[hoveredNodeId];
+  const node = hoveredNode;
   if (!node) return null;
 
   return (
@@ -78,7 +92,7 @@ export function Tooltip() {
         </span>
       )}
       <span style={{ fontWeight: 600 }}>{node.name}</span>
-      {node.type === "CodeBlock" && node.signature && (
+      {node.type === "CodeBlock" && signature && (
         <span
           style={{
             color: "#64748b",
@@ -89,7 +103,7 @@ export function Tooltip() {
             whiteSpace: "nowrap",
           }}
         >
-          {node.signature}
+          {signature}
         </span>
       )}
       {node.type === "File" && (

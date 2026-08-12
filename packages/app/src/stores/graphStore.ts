@@ -26,6 +26,12 @@ import {
 } from "./graphViewModel";
 import { useDebugStore } from "./debugStore";
 import {
+  applyLayoutWork,
+  layoutWorkFor,
+  type GraphChange,
+  type LayoutTriggers,
+} from "./relayoutPolicy";
+import {
   EMPTY_SELECTION,
   invalidateSelection,
   reduceSelection,
@@ -127,9 +133,20 @@ interface GraphState {
   focusNeighborhood: Neighborhood | null;
   focusEdgeDetail: EdgeDetail | null;
 
-  // Layout state - manual relayout
+  /**
+   * Layout triggers. Every state change is classified by `relayoutPolicy` into
+   * the cheapest sufficient work, and at most ONE of these versions is bumped
+   * per user action:
+   *   - `layoutVersion` -> full ELK layout (node positions changed);
+   *   - `edgeVersion`   -> edge-only phase (which edges show changed);
+   *   - neither         -> the canvas's cheap visibility path, or nothing.
+   * `needsRelayout` is a hint, not a queue: it means the positions on screen
+   * were kept across a cheaper change, so the sidebar offers an explicit
+   * "Apply Layout Changes" re-run. It never causes a layout by itself.
+   */
   needsRelayout: boolean;
-  layoutVersion: number; // Incremented when relayout should happen
+  layoutVersion: number;
+  edgeVersion: number;
 
   // Actions
   setRepoPath: (path: string) => void;
@@ -236,7 +253,7 @@ async function applyFocusState(
       focusStack: [],
       focusNeighborhood: null,
       focusEdgeDetail: null,
-      layoutVersion: cur.layoutVersion + 1,
+      ...layoutTriggers(cur, { kind: "focus" }),
     });
     return;
   }
@@ -257,7 +274,7 @@ async function applyFocusState(
           ? reduceSelection(EMPTY_SELECTION, { kind: "replace", nodeId: top.nodeId })
           : EMPTY_SELECTION
       ),
-      layoutVersion: get().layoutVersion + 1,
+      ...layoutTriggers(get(), { kind: "focus" }),
     });
   } catch (err) {
     console.error("focus frame fetch failed:", err);
@@ -265,6 +282,39 @@ async function applyFocusState(
       useDebugStore.getState().addLog(`focus frame fetch FAILED: ${err}`);
     }
   }
+}
+
+/**
+ * Classify a state change with the relayout policy and fold the answer into the
+ * store's trigger counters. This is the ONE place that decides whether a user
+ * action costs a full ELK layout, an edge-only pass, or nothing at all.
+ */
+function layoutTriggers(state: GraphState, change: GraphChange): LayoutTriggers {
+  const work = layoutWorkFor(change, {
+    viewMode: state.viewMode,
+    focusActive: state.focusStack.length > 0,
+    hideUnconnectedNodes: state.hideUnconnectedNodes,
+  });
+  return applyLayoutWork(work, {
+    layoutVersion: state.layoutVersion,
+    edgeVersion: state.edgeVersion,
+    needsRelayout: state.needsRelayout,
+  });
+}
+
+/** Hovered-edge identity, so repeated pointer events do not wake subscribers. */
+function sameHoveredEdge(
+  a: HoveredEdgeInfo | null,
+  b: HoveredEdgeInfo | null
+): boolean {
+  if (a === b) return true;
+  if (a === null || b === null) return false;
+  return (
+    a.kind === b.kind &&
+    a.sourceId === b.sourceId &&
+    a.targetId === b.targetId &&
+    a.count === b.count
+  );
 }
 
 const ALL_EDGE_KINDS: EdgeKind[] = [
@@ -296,6 +346,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   focusEdgeDetail: null,
   needsRelayout: false,
   layoutVersion: 0,
+  edgeVersion: 0,
 
   setRepoPath: (path) => set({ repoPath: path }),
 
@@ -358,8 +409,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       (id) => graph.nodes[id] !== undefined
     );
 
-    // Increment layoutVersion to trigger relayout. A fresh graph clears any
-    // active focus.
+    // A fresh graph is a full layout (and clears any active focus).
     set({
       graph,
       expandedNodes: expanded,
@@ -369,8 +419,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       ...selectionToStore(selection),
       focusNeighborhood: null,
       focusEdgeDetail: null,
-      needsRelayout: false,
-      layoutVersion: get().layoutVersion + 1,
+      ...layoutTriggers(cur, { kind: "graph-replaced" }),
     });
   },
 
@@ -388,33 +437,30 @@ export const useGraphStore = create<GraphState>((set, get) => ({
         : null,
     }),
 
+  /**
+   * Apply one BATCHED progress event: exactly one store broadcast per batch
+   * (~100 files or ~50ms of parsing) rather than one per file per phase, so
+   * ingesting a large repo no longer re-renders every subscriber thousands of
+   * times. The counts are cumulative and authoritative -- they are assigned, not
+   * accumulated, so a dropped or duplicated batch cannot skew the progress bar.
+   */
   handleParseEvent: (event) => {
     const progress = get().parseProgress;
     if (!progress) return;
 
     switch (event.type) {
-      case "FileStart":
-        set({
-          parseProgress: { ...progress, currentFile: event.path },
-        });
-        break;
-      case "FileDone":
+      case "Progress":
         set({
           parseProgress: {
             ...progress,
-            parsedFiles: progress.parsedFiles + 1,
-            totalBlocks: progress.totalBlocks + event.blocks,
-          },
-        });
-        break;
-      case "Error":
-        set({
-          parseProgress: {
-            ...progress,
-            errors: [
-              ...progress.errors,
-              { path: event.path, message: event.message },
-            ],
+            parsedFiles: event.parsed_files,
+            totalFiles: event.total_files,
+            totalBlocks: event.total_blocks,
+            currentFile: event.current_file,
+            errors:
+              event.errors.length > 0
+                ? [...progress.errors, ...event.errors]
+                : progress.errors,
           },
         });
         break;
@@ -432,23 +478,39 @@ export const useGraphStore = create<GraphState>((set, get) => ({
   },
 
   toggleExpanded: (nodeId) => {
-    const expanded = new Set(get().expandedNodes);
+    const cur = get();
+    const expanded = new Set(cur.expandedNodes);
     if (expanded.has(nodeId)) {
       expanded.delete(nodeId);
     } else {
       expanded.add(nodeId);
     }
-    set({ expandedNodes: expanded, needsRelayout: true });
+    // Expansion changes the containment tree, so it relayouts immediately --
+    // except where the view derives expansion itself (module view files, focus).
+    set({
+      expandedNodes: expanded,
+      ...layoutTriggers(cur, {
+        kind: "expansion",
+        nodeType: cur.graph?.nodes[nodeId]?.type ?? null,
+      }),
+    });
   },
 
   setExpanded: (nodeId, isExpanded) => {
-    const expanded = new Set(get().expandedNodes);
+    const cur = get();
+    const expanded = new Set(cur.expandedNodes);
     if (isExpanded) {
       expanded.add(nodeId);
     } else {
       expanded.delete(nodeId);
     }
-    set({ expandedNodes: expanded, needsRelayout: true });
+    set({
+      expandedNodes: expanded,
+      ...layoutTriggers(cur, {
+        kind: "expansion",
+        nodeType: cur.graph?.nodes[nodeId]?.type ?? null,
+      }),
+    });
   },
 
   toggleVisible: (nodeId) => {
@@ -472,7 +534,13 @@ export const useGraphStore = create<GraphState>((set, get) => ({
 
     const shouldShow = !visible.has(nodeId);
     toggleRecursive(nodeId, shouldShow);
-    set({ visibleNodes: visible, needsRelayout: true });
+    // Hiding only removes nodes that are already laid out (cheap canvas path);
+    // showing can reveal nodes that were never given a position, which needs a
+    // real layout.
+    set({
+      visibleNodes: visible,
+      ...layoutTriggers(get(), { kind: "visibility", showing: shouldShow }),
+    });
   },
 
   selectNode: (nodeId, additive = false) =>
@@ -491,36 +559,50 @@ export const useGraphStore = create<GraphState>((set, get) => ({
 
   clearSelection: () => get().applySelectionAction({ kind: "clear" }),
 
-  setHoveredNode: (nodeId) => set({ hoveredNodeId: nodeId }),
-  setHoveredEdge: (info) => set({ hoveredEdgeInfo: info }),
+  // Pixi fires hover events continuously (including repeated nulls); an equality
+  // guard keeps every store subscriber asleep unless the hover really changed.
+  setHoveredNode: (nodeId) => {
+    if (get().hoveredNodeId === nodeId) return;
+    set({ hoveredNodeId: nodeId });
+  },
+
+  setHoveredEdge: (info) => {
+    if (sameHoveredEdge(get().hoveredEdgeInfo, info)) return;
+    set({ hoveredEdgeInfo: info });
+  },
 
   toggleEdgeKind: (kind) => {
-    const kinds = new Set(get().enabledEdgeKinds);
+    const cur = get();
+    const kinds = new Set(cur.enabledEdgeKinds);
     if (kinds.has(kind)) {
       kinds.delete(kind);
     } else {
       kinds.add(kind);
     }
-    // Trigger relayout since edge filtering affects layout
+    // Which edges show, not where the nodes are: the edge phase suffices unless
+    // the unconnected filter makes the node set depend on the kinds.
     set({
       enabledEdgeKinds: kinds,
-      layoutVersion: get().layoutVersion + 1,
+      ...layoutTriggers(cur, { kind: "edge-kinds" }),
     });
   },
 
   setHideUnconnectedNodes: (hide) => {
-    if (get().hideUnconnectedNodes === hide) return;
+    const cur = get();
+    if (cur.hideUnconnectedNodes === hide) return;
     set({
       hideUnconnectedNodes: hide,
-      layoutVersion: get().layoutVersion + 1,
+      ...layoutTriggers(cur, { kind: "hide-unconnected" }),
     });
   },
 
   setHideAmbiguousEdges: (hide) => {
-    if (get().hideAmbiguousEdges === hide) return;
+    const cur = get();
+    if (cur.hideAmbiguousEdges === hide) return;
+    // A pure client-side edge filter -- never a reason to move nodes.
     set({
       hideAmbiguousEdges: hide,
-      layoutVersion: get().layoutVersion + 1,
+      ...layoutTriggers(cur, { kind: "hide-ambiguous" }),
     });
   },
 
@@ -540,7 +622,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       focusStack: reduced.focusStack,
       focusNeighborhood: keepPayload ? cur.focusNeighborhood : null,
       focusEdgeDetail: keepPayload ? cur.focusEdgeDetail : null,
-      layoutVersion: cur.layoutVersion + 1,
+      ...layoutTriggers(cur, { kind: "view-mode" }),
     });
     const state = get();
     if (state.repoPath) {
@@ -646,7 +728,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       focusStack: reduced.focusStack,
       focusNeighborhood: null,
       focusEdgeDetail: null,
-      layoutVersion: cur.layoutVersion + 1,
+      ...layoutTriggers(cur, { kind: "focus" }),
     });
   },
 
@@ -654,9 +736,14 @@ export const useGraphStore = create<GraphState>((set, get) => ({
     return Array.from(get().visibleNodes);
   },
 
+  /**
+   * The explicit "Apply Layout Changes" button: re-solve the node positions for
+   * whatever the state is now. This is the ONLY unconditional full layout -- the
+   * cheaper paths above never queue one behind themselves, so a user action can
+   * never cost two layouts.
+   */
   requestRelayout: () => {
     const state = get();
-    if (!state.needsRelayout) return;
 
     // Save current state before relayout
     if (state.repoPath) {
@@ -668,11 +755,7 @@ export const useGraphStore = create<GraphState>((set, get) => ({
       );
     }
 
-    // Increment layoutVersion to trigger relayout in Canvas
-    set({
-      needsRelayout: false,
-      layoutVersion: state.layoutVersion + 1,
-    });
+    set(layoutTriggers(state, { kind: "relayout-requested" }));
   },
 
   saveCurrentState: () => {

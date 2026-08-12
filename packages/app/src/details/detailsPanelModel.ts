@@ -3,6 +3,7 @@ import type {
   CodeNode,
   EdgeKind,
   Neighborhood,
+  NodeDetails,
   Span,
 } from "../api/types";
 
@@ -39,8 +40,10 @@ export interface EndpointRow {
   /** Endpoint's display name; derived from the id when the node is unknown. */
   name: string;
   /**
-   * Secondary text: path for files/directories, signature for code blocks,
-   * `null` when the node is unknown or carries neither.
+   * Secondary text: path for files/directories, signature for code blocks when
+   * one is loaded, `null` when the node is unknown or carries neither. Endpoint
+   * signatures are not part of the bulk payload (only the SELECTED node's is
+   * fetched), so block endpoints normally have none.
    */
   detail: string | null;
   /** Block kind when the endpoint is a code block, for the badge colour. */
@@ -222,7 +225,7 @@ function endpointDetail(node: CodeNode): string | null {
     case "File":
       return node.path;
     case "CodeBlock":
-      return node.signature;
+      return node.signature ?? null;
   }
 }
 
@@ -254,8 +257,18 @@ export interface NodeSummary {
   facts: NodeFact[];
 }
 
-/** Describe the selected node: badge plus the facts worth showing for its type. */
-export function buildNodeSummary(node: CodeNode): NodeSummary {
+/**
+ * Describe the selected node: badge plus the facts worth showing for its type.
+ *
+ * `details` carries the fields the bulk parse payload omits (the signature),
+ * fetched on demand for this one node; when it is absent or still in flight the
+ * node's own value is used, so a node that already carries a signature (tests,
+ * or a future payload change) renders identically without a fetch.
+ */
+export function buildNodeSummary(
+  node: CodeNode,
+  details?: NodeDetails | null
+): NodeSummary {
   const base = { id: node.id, name: node.name };
 
   switch (node.type) {
@@ -282,8 +295,11 @@ export function buildNodeSummary(node: CodeNode): NodeSummary {
       };
     case "CodeBlock": {
       const facts: NodeFact[] = [];
-      if (node.signature) {
-        facts.push({ label: "Signature", value: node.signature, mono: true });
+      const signature =
+        (details && details.id === node.id ? details.signature : null) ??
+        node.signature;
+      if (signature) {
+        facts.push({ label: "Signature", value: signature, mono: true });
       }
       if (node.visibility) {
         facts.push({ label: "Visibility", value: node.visibility });

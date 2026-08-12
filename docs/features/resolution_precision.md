@@ -50,8 +50,8 @@ Resolution runs inside `parse_repo` (`crates/cc-tauri/src/commands/parse.rs`) af
 
 - `CodeEdge.resolution` (types.ts) flows through `elkLayout.ts` (`LayoutEdge.resolution`) into `EdgeDatum.resolution` (renderers/types.ts) in `EdgeDrawingManager.buildEdgeData`.
 - `edgeDrawing.ts` renders edges with `resolution === "Ambiguous"` using `drawDashedPolyline` and a reduced alpha (`AMBIGUOUS_ALPHA_MULTIPLIER`).
-- `graphStore.hideAmbiguousEdges` (default `false`) + `setHideAmbiguousEdges` bump `layoutVersion` (mirroring `setHideUnconnectedNodes`). The Toolbar exposes a "Hide ambiguous" checkbox next to "Hide unconnected".
-- The flag threads `Canvas.tsx -> PixiRenderer.updateGraph -> layoutGraph(..., hideAmbiguousEdges)`, where both the direct-edge filter (`kindFilteredEdges`) and the aggregated-edge filter (`computeAggregatedEdges`) drop `resolution === "Ambiguous"` edges.
+- `graphStore.hideAmbiguousEdges` (default `false`) + `setHideAmbiguousEdges` bump `edgeVersion`, not `layoutVersion`: hiding ambiguous edges is a pure client-side edge filter, so it re-runs only the edge phase and leaves the node positions alone (unlike `setHideUnconnectedNodes`, which changes the node set). The Toolbar exposes a "Hide ambiguous" checkbox next to "Hide unconnected".
+- The flag threads `Canvas.tsx -> PixiRenderer.updateGraph / updateEdges -> fetchViewEdges(..., hideAmbiguousEdges)`, where both the direct-edge filter (`kindFilteredEdges`) and the aggregated-edge filter (`computeAggregatedEdges`) drop `resolution === "Ambiguous"` edges.
 
 ### The path index
 

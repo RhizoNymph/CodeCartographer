@@ -21,6 +21,7 @@ pub fn run() {
             commands::get_subgraph,
             commands::get_neighborhood,
             commands::get_edge_detail,
+            commands::get_node_details,
             commands::clone_github_repo,
             check_norestore,
         ])

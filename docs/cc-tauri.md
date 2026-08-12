@@ -60,9 +60,15 @@ using rayon, and stores the updated graph back in state.
 **Streaming Events:**
 ```rust
 enum ParseEvent {
-    FileStart { path: String },
-    FileDone { path: String, blocks: usize },
-    Error { path: String, message: String },
+    /// One BATCH of merged files (~100 files or ~50ms), carrying cumulative
+    /// counts, the file the batch ended on, and any failures since the last one.
+    Progress {
+        parsed_files: usize,
+        total_files: usize,
+        total_blocks: usize,
+        current_file: String,
+        errors: Vec<ParseFileError>, // { path, message }
+    },
     Complete { total_files: usize, total_blocks: usize },
 }
 ```
@@ -128,9 +134,8 @@ Frontend
     │     ├─ Read source file
     │     ├─ Extractor::extract_file()
     │   Merge results sequentially:
-    │     ├─ Send FileStart
     │     ├─ Add nodes to graph
-    │     ├─ Send FileDone
+    │     ├─ Send one batched Progress per ~100 files / ~50ms
     │       ↓
     │   SymbolTable::build_from_graph()
     │   SymbolTable::resolve_references()
@@ -173,7 +178,7 @@ All commands return `Result<T, String>`:
 - Success: serialized value
 - Error: human-readable message
 
-Per-file errors during `parse_repo` are streamed as `ParseEvent::Error` and processing continues.
+Per-file errors during `parse_repo` ride in the next `ParseEvent::Progress` batch's `errors` vec and processing continues.
 
 ## Frontend Integration
 
