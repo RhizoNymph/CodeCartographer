@@ -1,8 +1,8 @@
 import type { EdgeKind } from "../../api/types";
 import { useDebugStore } from "../../stores/debugStore";
-import type { LayoutEdge, LayoutResult } from "./layoutTypes";
-import { straightLineEdge } from "./straightEdges";
-import { fetchViewEdges, type ViewEdge } from "./viewEdges";
+import type { LayoutResult } from "./layoutTypes";
+import { rebuildEdges } from "./edgeRebuild.ts";
+import { fetchViewEdges } from "./viewEdges";
 
 /**
  * The edge-only layout phase.
@@ -19,59 +19,7 @@ import { fetchViewEdges, type ViewEdge } from "./viewEdges";
  * full layout re-routes them.
  */
 
-function edgeKey(source: string, target: string, kind: EdgeKind | null): string {
-  return `${source}\u0000${target}\u0000${kind ?? ""}`;
-}
-
-/**
- * Index the previous layout's edges by identity. Parallel same-key edges are
- * kept in order and consumed one at a time, so each keeps its own route.
- */
-function indexRoutedEdges(edges: LayoutEdge[]): Map<string, LayoutEdge[]> {
-  const byKey = new Map<string, LayoutEdge[]>();
-  for (const edge of edges) {
-    const key = edgeKey(edge.source, edge.target, edge.kind);
-    const bucket = byKey.get(key);
-    if (bucket) {
-      bucket.push(edge);
-    } else {
-      byKey.set(key, [edge]);
-    }
-  }
-  return byKey;
-}
-
-/**
- * Rebuild the view edges on the previous layout's node positions. Exported for
- * clarity of the phase seam; `layoutEdgePhase` is the entry point.
- */
-export function rebuildEdges(
-  previous: LayoutResult,
-  viewEdges: ViewEdge[]
-): LayoutEdge[] {
-  const routed = indexRoutedEdges(previous.edges);
-  const edges: LayoutEdge[] = [];
-
-  for (const ve of viewEdges) {
-    const bucket = routed.get(edgeKey(ve.source, ve.target, ve.kind));
-    const cached = bucket?.shift();
-    if (cached) {
-      // Same endpoints and kind: keep the routed polyline, take the fresh
-      // count/resolution (aggregation can change with the fetched kind set).
-      edges.push({
-        ...cached,
-        color: ve.color,
-        count: ve.count,
-        resolution: ve.resolution,
-      });
-      continue;
-    }
-    const fallback = straightLineEdge(previous.nodes, ve);
-    if (fallback) edges.push(fallback);
-  }
-
-  return edges;
-}
+export { rebuildEdges } from "./edgeRebuild.ts";
 
 /**
  * Re-fetch and rebuild the view edges for the last laid-out render set, keeping

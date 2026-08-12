@@ -184,7 +184,12 @@ back on) get a straight connector until the next full layout — the sidebar's
   (`layoutGraph`), ELK options, the routing guard call, extraction,
   ELK-failure fallback layout.
 - `packages/app/src/canvas/layout/edgePhase.ts` — edges phase
-  (`layoutEdgePhase`, `rebuildEdges`).
+  (`layoutEdgePhase`; re-exports `rebuildEdges`).
+- `packages/app/src/canvas/layout/edgeRebuild.ts` — the pure core of the edges
+  phase (`rebuildEdges`): routed-polyline reuse + straight-line fallback.
+  Loadable under node:test via explicit `.ts` runtime specifiers (its
+  `straightEdges` -> `edgeGeometry` chain likewise); seam-tested against the
+  drawing pass's anchored-polyline contract.
 - `packages/app/src/canvas/layout/viewEdges.ts` — `fetchViewEdges` (the
   `get_subgraph` call), `ViewEdge`, `ALL_EDGE_KINDS`; shared by both phases.
 - `packages/app/src/canvas/layout/straightEdges.ts` — `straightLineEdge(s)`
@@ -215,6 +220,7 @@ back on) get a straight connector until the next full layout — the sidebar's
 |------|---------------|
 | `packages/app/tests/relayoutPolicy.test.ts` | The trigger policy table |
 | `packages/app/tests/layoutScheduler.test.ts` | Run-latest coalescing, error draining |
+| `packages/app/tests/edgeRebuild.test.ts` | Edge-phase rebuild: polyline reuse + the drawing pass's anchored-polyline contract (seam test) |
 | `packages/app/tests/elkEdgeId.test.ts` | Edge-id round-tripping and rejection of foreign ids |
 | `packages/app/tests/edgeGeometry.test.ts` | Anchor inference, orthogonal rerouting, obstacle detours |
 | `packages/app/tests/edgeGeometryBounds.test.ts` | `boundingBox` over empty, overlapping and very large inputs |

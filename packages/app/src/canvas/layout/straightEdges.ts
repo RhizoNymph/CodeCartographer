@@ -1,8 +1,10 @@
+// Explicit .ts specifier keeps this module loadable under `node --test`
+// (see edgeRebuild.ts and its seam test).
 import {
   anchorEdgePolyline,
   inferEdgeAnchor,
   type Point,
-} from "./edgeGeometry";
+} from "./edgeGeometry.ts";
 import type { LayoutEdge, LayoutNodePosition } from "./layoutTypes";
 import type { ViewEdge } from "./viewEdges";
 
