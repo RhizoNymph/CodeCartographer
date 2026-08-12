@@ -368,10 +368,157 @@ fn bench_full_pipeline(c: &mut Criterion) {
     group.finish();
 }
 
+// ---------------------------------------------------------------------------
+// Symbol resolution under hub-name ambiguity
+// ---------------------------------------------------------------------------
+
+/// Names a real repo defines in hundreds of files. Every reference to one of
+/// these matches every definition, which is what drives resolution into its
+/// ambiguous tiers.
+const HUB_NAMES: &[&str] = &["__init__", "new", "get", "run", "handle"];
+
+/// Build a graph where `definers` files each define every hub name, plus a set
+/// of caller files that reference those names.
+///
+/// The callers deliberately define NOTHING, so their references cannot resolve
+/// same-file (tier 1) or via an import (tier 3) and fall all the way through to
+/// the global tiers. With `definers` well above the 5-candidate cap, every one
+/// of those references lands in tier 6 -- matched by hundreds of symbols and
+/// then dropped. That tier is pure waste by construction, and how cheaply the
+/// resolver reaches the decision to drop is exactly what this measures.
+///
+/// `unique` swaps the hub names for per-file unique ones, giving the tier-4
+/// (single global match) control: same number of references, same table size,
+/// no ambiguity.
+fn hub_ambiguity_fixture(
+    definers: usize,
+    callers: usize,
+    refs_per_caller: usize,
+    unique: bool,
+) -> (cc_core::model::CodeGraph, Vec<cc_core::parser::RawReference>) {
+    use cc_core::model::{BlockKind, CodeGraph, CodeNode, Language, NodeId, Span};
+    use cc_core::parser::{RawRefKind, RawReference};
+
+    let span = |line: usize| Span {
+        start_line: line,
+        start_col: 0,
+        end_line: line + 8,
+        end_col: 1,
+    };
+
+    let mut graph = CodeGraph::new(NodeId("root".into()));
+
+    for f in 0..definers {
+        let path = format!("pkg_{}/mod_{f}.py", f % 32);
+        let file_id = NodeId::file(&path);
+        let mut children = Vec::new();
+        for (i, base) in HUB_NAMES.iter().enumerate() {
+            let name = if unique {
+                format!("{base}_{f}")
+            } else {
+                (*base).to_string()
+            };
+            let block_id = NodeId::code_block(&path, &name, i * 20);
+            graph.add_node(CodeNode::CodeBlock {
+                id: block_id.clone(),
+                name,
+                kind: BlockKind::Function,
+                span: span(i * 20),
+                signature: Some("def f(self):".to_string()),
+                visibility: None,
+                parent: file_id.clone(),
+                children: Vec::new(),
+            });
+            children.push(block_id);
+        }
+        graph.add_node(CodeNode::File {
+            id: file_id,
+            name: format!("mod_{f}.py"),
+            path,
+            language: Some(Language::Python),
+            children,
+        });
+    }
+
+    let mut refs = Vec::with_capacity(callers * refs_per_caller);
+    for c in 0..callers {
+        let path = format!("callers/caller_{c}.py");
+        let file_id = NodeId::file(&path);
+        graph.add_node(CodeNode::File {
+            id: file_id.clone(),
+            name: format!("caller_{c}.py"),
+            path,
+            language: Some(Language::Python),
+            children: Vec::new(),
+        });
+        for r in 0..refs_per_caller {
+            let base = HUB_NAMES[r % HUB_NAMES.len()];
+            let name = if unique {
+                // Point at a definer that exists, so the control resolves to
+                // exactly one symbol instead of missing entirely.
+                format!("{base}_{}", r % definers.max(1))
+            } else {
+                base.to_string()
+            };
+            refs.push(RawReference {
+                from_node: file_id.clone(),
+                kind: RawRefKind::FunctionCall,
+                name,
+                span: span(r * 3),
+            });
+        }
+    }
+
+    (graph, refs)
+}
+
+/// Symbol-table build + reference resolution on repos full of hub names.
+///
+/// `ambiguous` is the case the early-bail change targets: hundreds of candidates
+/// per name, all discarded. `unique_control` is the same volume of work with one
+/// candidate per name; the gap between them is the price of ambiguity.
+fn bench_resolve_hub_ambiguity(c: &mut Criterion) {
+    use cc_core::resolver::{ImportMap, SymbolTable};
+
+    let mut group = c.benchmark_group("resolve_hub_ambiguity");
+    group.sample_size(10);
+    group.warm_up_time(std::time::Duration::from_millis(500));
+    group.measurement_time(std::time::Duration::from_secs(4));
+
+    for definers in [500usize, 1000] {
+        let callers = definers / 2;
+        let refs_per_caller = 20;
+
+        for (label, unique) in [("ambiguous", false), ("unique_control", true)] {
+            let (graph, refs) = hub_ambiguity_fixture(definers, callers, refs_per_caller, unique);
+            let table = SymbolTable::build_from_graph(&graph);
+            let imports = ImportMap::new();
+
+            group.bench_with_input(
+                BenchmarkId::new(format!("{label}_resolve"), definers),
+                &(&table, &refs),
+                |b, &(table, refs)| {
+                    b.iter(|| black_box(table.resolve_references(refs, &imports)));
+                },
+            );
+
+            group.bench_with_input(
+                BenchmarkId::new(format!("{label}_build_table"), definers),
+                &graph,
+                |b, graph| {
+                    b.iter(|| black_box(SymbolTable::build_from_graph(graph)));
+                },
+            );
+        }
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_extract_file,
     bench_extract_many_files,
     bench_full_pipeline,
+    bench_resolve_hub_ambiguity,
 );
 criterion_main!(benches);
