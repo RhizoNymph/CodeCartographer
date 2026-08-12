@@ -6,6 +6,9 @@ In scope:
 - Pixi.js-based interactive graph rendering (nodes, edges, minimap)
 - Node creation, styling, and interaction (click, drag, hover, double-click)
 - Edge drawing with LOD-based opacity/width, hover/pinned highlighting, and orthogonal routing
+- The client-side edge re-routing pass and its cost controls: a per-redraw
+  spatial index of obstacle boxes, and a budget gate that degrades routing as
+  the view grows
 - Edge pointer interaction: distance-based hit testing for hover, and
   double-click on an aggregated edge to drill into it (the focus transition
   itself lives in zoom_views)
@@ -36,6 +39,14 @@ The PixiRenderer (orchestrator) delegates to focused sub-modules:
    - `setHoveredNode()`, `setSelection(nodeIds, primaryId)`, `zoomToNode()`
    - `applyHighlight()` / `rebuildHighlightedEdgeIndices(source)`: resolve and apply
      the hover-or-pin highlight (connected vs induced subgraph)
+   - `syncViewportState()`: publishes viewport bounds/scale to the store and adopts
+     the resulting LOD, returning whether the LOD changed. Draws nothing -- the
+     caller decides what to rebuild.
+   - `updateLODVisibility(redrawEdges)`: applies the current LOD to node labels;
+     rebuilds the edge layers only when asked to (true while the user zooms,
+     false when the caller is about to rebuild them anyway)
+   - `fitViewportToLayout(layout)`: centre + zoom-to-fit, extracted so a layout
+     application can fit BEFORE the edges are built
    - `hitTestEdge(globalPos)`: nearest rendered edge within a screen-space radius
      (`EDGE_HIT_RADIUS_PX`), via `pointToPolylineDistance` over the routed
      polylines. Edges are not Pixi interactive objects, so both edge hover and
@@ -57,8 +68,19 @@ The PixiRenderer (orchestrator) delegates to focused sub-modules:
    - `setHighlightActive(active)`: highlight-only update returning true if handled (no full redraw needed).
      The manager is deliberately ignorant of WHERE the highlight came from -- the caller resolves
      hover vs pinned selection vs induced subgraph, fills `highlightedEdgeIndices`, and passes a flag.
-   - `redrawEdgesWithHighlight(...)`: full base+highlight layer rebuild
-   - `buildEdgeData(layout)`: converts LayoutResult edges into EdgeDatum array
+   - `redrawEdgesWithHighlight(...)`: full base+highlight layer rebuild. Its pipeline is:
+     1. `snapshotNodeRefs(visibleNodes, getNodeDisplayRef)` -- ONE `NodeDisplayRef`
+        per visible node for the whole redraw (never per edge)
+     2. resolve each visible, LOD-passing edge to a polyline (`resolveEdgeDraw`), which
+        no longer collects obstacles
+     3. `spreadEndpointLanes` (both ends)
+     4. `resolveEdgeRoutingMode(...)` -> optional routing pass: `buildObstacleIndex`
+        once, then `obstaclesForEdge` (an rbush query over the edge's own inflated
+        bbox, `OBSTACLE_QUERY_MARGIN` = 160) + `routePolylineAroundObstacles` per edge
+     5. stroke, and collect "×N" chip specs at the arc-length midpoint of the
+        polyline that was actually drawn
+   - `buildEdgeData(layout)`: converts LayoutResult edges into EdgeDatum array,
+     pre-parsing each `color` into `colorInt` so no redraw ever re-parses a hex string
    - `scheduleEdgeRedraw()` / `flushEdgeRedraw()`: animation frame throttling
    - LOD helper functions: `getLODEdgeOpacity`, `shouldHideEdgeKindAtLOD`, `getLODEdgeWidthMultiplier`
    - Private drawing primitives: `drawEdgePath`, `drawEdgeStartCap`, `drawEdgeArrowhead`
@@ -83,9 +105,35 @@ The PixiRenderer (orchestrator) delegates to focused sub-modules:
      `Text.tint`, not a cloned style) so importing the module outside a DOM
      never touches Pixi's text machinery.
 
+2c. **edgeRoutingBudget.ts** (~130 lines, pure) - How much routing a view can afford
+   - `EdgeRoutingMode` = `"full" | "obstacles" | "none"`, resolved by
+     `resolveEdgeRoutingMode({ renderedEdges, visibleNodes, edgesVisible })`
+   - `CROSSING_AWARE_EDGE_LIMIT` (250): above this, detour candidates are no longer
+     scored against already-routed polylines (that scoring is O(E^2))
+   - `OBSTACLE_ROUTING_EDGE_LIMIT` (500) / `OBSTACLE_ROUTING_NODE_LIMIT` (2000):
+     above either, obstacle re-routing is skipped entirely and the ELK/straight
+     polyline is drawn as-is
+   - `routesAroundObstacles(mode)` / `scoresEdgeCrossings(mode)`: the two decisions
+     the redraw loop actually reads
+   - `shouldSkipLayoutEdgeRouting(nodeCount, edgeCount)` +
+     `LAYOUT_EDGE_ROUTING_NODE_LIMIT` (1500) / `LAYOUT_EDGE_ROUTING_EDGE_LIMIT` (3000):
+     the layout-time (ELK) guard, kept here so every routing threshold lives in one file
+     (consumed by `layout/elkLayout.ts` -- see graph-layout.md)
+   - Import-free so it loads under `node --test`
+
+2d. **layout/obstacleIndex.ts** (~150 lines) - R-tree over a redraw's obstacle boxes
+   - `ObstacleIndex`: bulk-loaded rbush; `query(bounds, excludeA, excludeB)` and
+     `queryForPolyline(points, margin, excludeA, excludeB)` return the `NodeBox`es
+     near a polyline, minus the boxes owned by the edge's own endpoints
+   - `obstacleEntry(ownerId, box)`: a node contributes its body box and (when
+     labelled) its label box under ONE owner id, so excluding an endpoint drops both
+   - `polylineBounds(points, margin)`: the query window; null for an empty polyline
+   - Only rbush is imported at runtime, so it loads under `node --test`
+
 3. **types.ts** (~70 lines) - Shared type definitions
    - `NodeDisplayRef`: lightweight position snapshot for edge routing
-   - `EdgeDatum`: normalized edge data built from layout
+   - `EdgeDatum`: normalized edge data built from layout, incl. `colorInt`
+     (the pre-parsed `color`)
    - `EdgeStyleConfig`, `EDGE_STYLES`, `DEFAULT_EDGE_STYLE`: per-kind styling constants
    - `NodePadding`: padding for parent nodes containing children
    - Re-exports `NodeDisplay` from nodeCreation
@@ -135,13 +183,24 @@ The PixiRenderer (orchestrator) delegates to focused sub-modules:
 2. On graph/expansion/visibility change, calls `pixiRenderer.updateGraph(graph, expanded, visible, edgeKinds)`
 3. PixiRenderer builds parent map, calls `layoutGraph()` (async)
    - `elkLayout.ts` runs ELK in a web worker (via `elkjs/lib/elk-api` with `workerFactory: () => new ElkWorker()`, where `ElkWorker` is imported from `elkjs/lib/elk-worker.min.js?worker`). Layout computation therefore happens off the main thread, so large graphs no longer freeze the UI. `layoutGraph()` is already async and PixiRenderer already discards stale results, so no other behavior changes.
-4. On layout result, `renderFromLayout()`:
+4. On layout result, `renderFromLayout()`. The ORDER is load-bearing -- it is what
+   keeps a layout application to exactly ONE full edge rebuild:
    a. Clears existing displays
    b. Creates NodeDisplay for each layout node via `createNodeDisplay()`
    c. Wires event handlers (pointerdown/move/up, pointertap, pointerover/out)
-   d. Calls `edgeManager.buildEdgeData(layout)` then `triggerEdgeRedraw()` (rebuilds base + highlight layers)
-   e. Fits viewport to content bounds
-5. On viewport move, `onViewportChanged()` updates LOD, redraws edges, updates minimap
+   d. `fitViewportToLayout(layout)` -- centre + zoom-to-fit FIRST
+   e. `syncViewportState()` -- adopt the LOD that fit implies (no drawing)
+   f. `updateLODVisibility(false)` -- label visibility only, no edge rebuild
+   g. `edgeManager.buildEdgeData(layout)`, recompute the highlight indices, then a
+      single `triggerEdgeRedraw()`
+   The zoom in (d) later fires the viewport's "moved" event; by then the LOD is
+   already current, so `onViewportChanged` rebuilds nothing.
+5. On viewport move, `onViewportChanged()` syncs the viewport state and updates the
+   minimap; it rebuilds edges ONLY when the LOD actually changed (user zooming
+   across an LOD boundary must restyle edges; panning must not).
+5b. `updateVisibility(visibleNodes)` skips its edge rebuild while a layout request
+   is in flight (`_layoutPending`): that rebuild would route the new visible set
+   against the stale layout and be discarded moments later anyway.
 6. On hover or selection change, `setHoveredNode()` / `setSelection()` both call `applyHighlight()`, which resolves the highlight source (hover > pinned selection > none; induced at 2+ selected), rebuilds the highlighted edge indices, and calls `edgeManager.setHighlightActive()` -- only the highlight layer is rebuilt, not the base layer
 7. On drag, globalpointermove updates node positions, resizes ancestors, schedules edge redraw
 
@@ -157,6 +216,32 @@ After: a highlight change calls `edgeManager.setHighlightActive(active)` which:
 Full base layer rebuilds only happen on layout/visibility/LOD/drag changes. Those
 rebuilds re-resolve the highlight source and pass `highlightActive` back in, which
 is what makes a pinned selection survive them.
+
+### Edge re-routing cost model
+
+The client-side re-routing pass (obstacle avoidance on top of ELK's routing) used
+to be unbounded: it built an obstacle list of EVERY visible node PER EDGE
+(O(E x N) iterations and ~10^8 short-lived objects on a 5k-node / 20k-edge view),
+then ran up to 32 detour passes per edge, each scoring candidates against every
+polyline routed so far (O(E^2)). A large view appeared hung for minutes.
+
+Three things bound it now:
+
+1. **Hoisted node scan.** `snapshotNodeRefs` reads each visible node's
+   `NodeDisplayRef` exactly once per redraw; every edge shares the snapshot.
+2. **Spatial index.** All obstacle boxes go into one `ObstacleIndex` (rbush) per
+   redraw, and each edge queries only the boxes intersecting its own polyline
+   bbox inflated by `OBSTACLE_QUERY_MARGIN` (160 -- comfortably more than the
+   obstacle inflation of 14 plus the detour gutter of 28). Per-edge cost is
+   O(log N + k) instead of O(N), and the routed result is unchanged: routing the
+   query result and routing the full obstacle list produce identical polylines.
+3. **Budget gate.** `resolveEdgeRoutingMode` picks `full` / `obstacles` / `none`
+   from the rendered-edge and visible-node counts before the routing loop runs
+   (see edgeRoutingBudget.ts above). `none` also covers "the LOD renders edges
+   fully transparent", where routing is pure waste.
+
+Below the thresholds nothing changed: small graphs still get fully routed,
+crossing-aware, obstacle-avoiding edges.
 
 ### Highlight source
 
@@ -189,6 +274,8 @@ only the symmetric difference of the endpoint set is touched per hover change.
 |------|------|-------------|
 | `packages/app/src/canvas/renderers/PixiRenderer.ts` | Orchestrator | `PixiRenderer` class |
 | `packages/app/src/canvas/renderers/edgeDrawing.ts` | Edge rendering (two-layer) | `EdgeDrawingManager`, `getLODEdgeOpacity`, etc. |
+| `packages/app/src/canvas/renderers/edgeRoutingBudget.ts` | Routing budget/thresholds (pure) | `EdgeRoutingMode`, `resolveEdgeRoutingMode`, `routesAroundObstacles`, `scoresEdgeCrossings`, `shouldSkipLayoutEdgeRouting` |
+| `packages/app/src/canvas/layout/obstacleIndex.ts` | Per-redraw R-tree of obstacle boxes | `ObstacleIndex`, `obstacleEntry`, `polylineBounds` |
 | `packages/app/src/canvas/renderers/edgeLabels.ts` | Aggregated-edge "×N" count chips | `polylineArcMidpoint`, `shouldShowCountChip`, `chipAlphaForEdge`, `buildEdgeCountChipLayer` |
 | `packages/app/src/canvas/renderers/types.ts` | Shared types | `EdgeDatum`, `NodeDisplayRef`, `EDGE_STYLES`, `NodePadding` |
 | `packages/app/src/canvas/renderers/minimapRenderer.ts` | Minimap | `MinimapRenderer` |
@@ -209,6 +296,9 @@ only the symmetric difference of the endpoint set is touched per hover change.
 | `packages/app/tests/edgeRenderer.test.ts` | Edge index building, highlight collection, two-layer invariants, EDGE_STYLES |
 | `packages/app/tests/nodeRenderer.test.ts` | Node labels, colors, blockKindPrefix, selected-node state machine, color constants |
 | `packages/app/tests/edgeGeometry.test.ts` | Edge routing geometry (anchorEdgePolyline, rerouteOrthogonalEdge) |
+| `packages/app/tests/edgeGeometryBounds.test.ts` | `boundingBox`: coverage, empty input, and 10k boxes without a spread-argument overflow |
+| `packages/app/tests/obstacleIndex.test.ts` | Query windows, owner exclusion (body + label), locality of results |
+| `packages/app/tests/edgeRoutingBudget.test.ts` | Routing-mode thresholds, monotonicity, layout-time routing guard |
 | `packages/app/tests/edgeLabels.test.ts` | Arc-length midpoint, count-chip LOD/count predicate, chip alpha clamping, label formatting |
 | `packages/app/tests/nodeEmphasis.test.ts` | Emphasis precedence (selected > edge-endpoint > none), border style table, hovered-edge endpoint ids, redraw diffing |
 | `packages/app/tests/selectionModel.test.ts` | Highlight-source precedence (hover > pin > none, induced at 2+), selection reducer, invalidation, Esc precedence (see `docs/features/selection.md`) |
@@ -228,6 +318,22 @@ only the symmetric difference of the endpoint set is touched per hover change.
 - `nodeCreation.ts` does NOT attach event handlers -- the orchestrator is responsible for wiring interactions.
 - All `console.log` calls have been replaced with `useDebugStore.getState().addLog()` behind `import.meta.env.DEV` guards. `console.warn` and `console.error` are preserved for genuine warnings/errors.
 - The base edge layer is only rebuilt on layout/visibility/LOD/drag changes. Highlight-only updates (hover or selection) only touch the highlight layer.
+- Applying a layout performs EXACTLY ONE full edge rebuild. `updateLODVisibility`
+  cannot rebuild edges unless its caller asks it to, `onViewportChanged` rebuilds
+  only on an actual LOD change, and `updateVisibility` stands down while a layout
+  is pending.
+- No per-edge scan of the node set exists anywhere in the redraw path. Node refs
+  are snapshotted once and obstacles are always reached through `ObstacleIndex`.
+- Routing degrades, it never blocks: past the budget thresholds edges are drawn
+  exactly as the layout produced them rather than routed slowly.
+- "×N" chips are placed at the arc-length midpoint of the polyline that was
+  ACTUALLY drawn, in every routing mode -- chip placement reads `points` after
+  the (possibly skipped) routing pass, not before.
+- `EdgeDatum.colorInt` is the single parsed form of `color`; the redraw loop
+  never parses a colour string.
+- The polyline arrays stored in `resolvedPointsByEdgeIndex` are the same arrays
+  the base layer drew (no defensive copy): routing always produces fresh arrays
+  and nothing mutates a resolved polyline in place.
 - Hover and pin share ONE dim path: both go through `setBaseLayerAlpha()`. No second dimming mechanism exists, so base edges and their count chips can never drift out of lockstep.
 - `EdgeDrawingManager` receives only `highlightActive: boolean` + `highlightedEdgeIndices`; it never learns whether the highlight came from hover, a pin, or an induced subgraph.
 - Count chips are built inside the same pass that strokes the edges, so they are rebuilt exactly when their layer is (including drag redraws) and add no per-frame work. Chips are world-space children of the edge layer, so they scale with zoom.
