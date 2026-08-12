@@ -3,11 +3,14 @@ import test from "node:test";
 
 import {
   CROSSING_AWARE_EDGE_LIMIT,
+  LAYOUT_EDGE_ROUTING_EDGE_LIMIT,
+  LAYOUT_EDGE_ROUTING_NODE_LIMIT,
   OBSTACLE_ROUTING_EDGE_LIMIT,
   OBSTACLE_ROUTING_NODE_LIMIT,
   resolveEdgeRoutingMode,
   routesAroundObstacles,
   scoresEdgeCrossings,
+  shouldSkipLayoutEdgeRouting,
   type EdgeRoutingMode,
 } from "../src/canvas/renderers/edgeRoutingBudget.ts";
 
@@ -102,6 +105,31 @@ test("the 5k node / 20k edge case routes nothing", () => {
     resolveEdgeRoutingMode({ renderedEdges: 20000, visibleNodes: 5000 }),
     "none"
   );
+});
+
+// ---------------------------------------------------------------------------
+// Layout-time (ELK) routing guard
+// ---------------------------------------------------------------------------
+
+test("layout routing runs for ordinary views", () => {
+  assert.equal(shouldSkipLayoutEdgeRouting(300, 900), false);
+  assert.equal(
+    shouldSkipLayoutEdgeRouting(
+      LAYOUT_EDGE_ROUTING_NODE_LIMIT,
+      LAYOUT_EDGE_ROUTING_EDGE_LIMIT
+    ),
+    false
+  );
+});
+
+test("layout routing is skipped past the node limit", () => {
+  assert.equal(shouldSkipLayoutEdgeRouting(LAYOUT_EDGE_ROUTING_NODE_LIMIT + 1, 10), true);
+});
+
+test("layout routing is skipped for edge-heavy views under the node limit", () => {
+  // The case the node-only guard missed: few enough nodes, far too many edges.
+  assert.equal(shouldSkipLayoutEdgeRouting(1400, 20000), true);
+  assert.equal(shouldSkipLayoutEdgeRouting(10, LAYOUT_EDGE_ROUTING_EDGE_LIMIT + 1), true);
 });
 
 test("the mode is monotonically non-increasing in both counts", () => {

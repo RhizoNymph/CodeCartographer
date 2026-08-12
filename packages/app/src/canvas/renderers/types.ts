@@ -38,6 +38,11 @@ export interface EdgeDatum {
   source: string;
   target: string;
   color: string;
+  /**
+   * `color` pre-parsed to the integer Pixi wants. Computed once in
+   * `buildEdgeData` so the redraw loop never re-parses a hex string per edge.
+   */
+  colorInt: number;
   kind: EdgeKind | null;
   /** Resolution confidence; "Ambiguous" edges are rendered dashed/dimmed. */
   resolution: Resolution | null;

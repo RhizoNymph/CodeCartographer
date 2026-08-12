@@ -87,6 +87,32 @@ export function resolveEdgeRoutingMode(input: EdgeRoutingBudgetInput): EdgeRouti
   return "full";
 }
 
+/**
+ * Above this many nodes in the render set, ELK's own orthogonal edge routing is
+ * skipped and straight-line fallback edges are used instead.
+ */
+export const LAYOUT_EDGE_ROUTING_NODE_LIMIT = 1500;
+
+/**
+ * Above this many view edges, ELK edge routing is skipped regardless of node
+ * count. Routing cost is driven by EDGES, not nodes: a 1400-node view carrying
+ * 20k edges used to sail past a node-only guard and then take minutes.
+ */
+export const LAYOUT_EDGE_ROUTING_EDGE_LIMIT = 3000;
+
+/**
+ * Whether the layout pass should skip ELK edge routing for a view of this size.
+ */
+export function shouldSkipLayoutEdgeRouting(
+  renderNodeCount: number,
+  viewEdgeCount: number
+): boolean {
+  return (
+    renderNodeCount > LAYOUT_EDGE_ROUTING_NODE_LIMIT ||
+    viewEdgeCount > LAYOUT_EDGE_ROUTING_EDGE_LIMIT
+  );
+}
+
 /** Whether this mode detours edges around node/label boxes at all. */
 export function routesAroundObstacles(mode: EdgeRoutingMode): boolean {
   return mode !== "none";
