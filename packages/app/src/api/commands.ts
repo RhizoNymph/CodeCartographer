@@ -4,6 +4,7 @@ import type {
   ParseResult,
   SubGraph,
   Neighborhood,
+  NodeDetails,
   FocusDirection,
   EdgeDetail,
 } from "./types";
@@ -75,6 +76,15 @@ export async function getEdgeDetail(
     targetId,
     edgeKinds,
   });
+}
+
+/**
+ * Fetch the facts the bulk parse payload leaves out for one node (its
+ * signature). Cheap and per-node: only the details panel and the hover tooltip
+ * need them, and only for the node the user is looking at.
+ */
+export async function getNodeDetails(nodeId: string): Promise<NodeDetails> {
+  return invoke<NodeDetails>("get_node_details", { nodeId });
 }
 
 export async function cloneGithubRepo(url: string): Promise<string> {

@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { getNeighborhood } from "../api/commands";
+import { useNodeDetails } from "../api/useNodeDetails";
 import { BLOCK_COLORS, EDGE_COLORS, type Neighborhood } from "../api/types";
 import { edgeKindLabel } from "../canvas/legend/edgeLegendModel";
 import { useGraphStore } from "../stores/graphStore";
@@ -92,9 +93,13 @@ export function DetailsPanel() {
 
   const node = selectedNodeId && graph ? graph.nodes[selectedNodeId] : undefined;
 
+  // The bulk payload carries no signatures: fetch the selected node's on demand
+  // (debounced + stale-guarded, like the neighborhood fetch above).
+  const details = useNodeDetails(selectedNodeId);
+
   const summary = useMemo<NodeSummary | null>(
-    () => (node ? buildNodeSummary(node) : null),
-    [node]
+    () => (node ? buildNodeSummary(node, details) : null),
+    [node, details]
   );
 
   const edges = useMemo(

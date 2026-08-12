@@ -14,7 +14,11 @@ hold buttons.
   name, clear-selection and collapse buttons.
 - Facts for the selected node: `Path` + `Language` + `Symbols` for files, `Path`
   + `Items` for directories, `Signature` + `Visibility` + `Lines` for code blocks
-  (absent signature/visibility are omitted, not rendered blank).
+  (absent signature/visibility are omitted, not rendered blank). The signature is
+  NOT in the bulk parse payload — it is fetched for the selected node alone via
+  `useNodeDetails` (`get_node_details`, debounced + stale-guarded) and appears a
+  beat after the rest of the header; `buildNodeSummary(node, details)` prefers
+  the fetched value and falls back to the node's own.
 - A prominent "Focus this node" button → `graphStore.enterFocus(selectedNodeId)`.
 - Incoming and outgoing edge sections, each grouped by edge kind with an
   `EDGE_COLORS` swatch, the legend's kind label, and a per-kind count.
