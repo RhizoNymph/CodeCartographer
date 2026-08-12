@@ -34,11 +34,15 @@ opt-level = 1
 opt-level = 3
 
 # The hot loops live in our own crates: tree-sitter extraction, symbol-table
-# construction, import resolution, graph merge and subgraph extraction. At
-# opt-level 1 these run roughly an order of magnitude slower than they need to.
-# Both crates are small enough (~11k and ~0.5k lines) that building them at
-# opt-level 3 costs a few seconds per rebuild, and neither is touched by a
-# frontend-only change.
+# construction, import resolution, graph merge and subgraph extraction. Build
+# them at opt-level 3 so dev-loop timings track release behaviour instead of
+# being an artefact of the profile. Measured on benches/graph_bench: ~5% faster
+# than opt-level 1, at the cost of ~4s (vs ~1s) for an incremental rebuild after
+# a cc-core edit. Frontend-only edits do not rebuild either crate.
+#
+# debug-assertions and overflow-checks are deliberately left ON here. They are
+# the bulk of the remaining dev-vs-release gap (release is a further ~20% faster
+# on graph_bench), but they are also the correctness net for the dev loop.
 [profile.dev.package.cc-core]
 opt-level = 3
 
