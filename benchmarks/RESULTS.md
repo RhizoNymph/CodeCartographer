@@ -327,3 +327,34 @@ the redraw pass itself, which is what these numbers measure.
 Raw output (harness JSON per size, criterion text for all three profiles,
 frontend JSON) is not committed -- rerun `benchmarks/run_all.sh` to regenerate
 it. The procedure is documented in `docs/features/benchmarking.md`.
+
+## Real repo: Megatron-LM (2026-08-11)
+
+The repo that originally motivated the performance work
+(https://github.com/nvidia/megatron-lm, shallow clone): 1,279 parsed Python
+files, 22,368 nodes, 59,056 edges, 149,219 raw references. `perf_harness`
+release builds on both branches, sequential runs on the same machine, seed
+20240611, **median of 3 runs per side**. Both sides produced byte-identical
+graph statistics (same node/edge/resolution counts).
+
+| Metric | main | feat/perf-integration | delta |
+| --- | --- | --- | --- |
+| Full pipeline (scan -> parse -> resolve) | 922 ms | 912 ms | -1.2% (noise band) |
+| Neighborhood battery (200 queries, depth 2) | 2,989 ms | 1,117 ms | **-62.6%** |
+| Edge-detail battery (50 drill-ins) | 1,343 ms | 828 ms | **-38.3%** |
+| Subgraph battery (24 render sets x 6 reps) | 1,831 ms | 1,531 ms | -16.4% |
+| ParseResult build (steady mean) | 35.0 ms | 19.6 ms | -43.9% |
+| ParseResult serialize (steady mean) | 18.7 ms | 26.8 ms | +43.0% |
+| Payload bytes | 13.75 MB | 12.65 MB | -8.0% |
+
+Run-to-run spread (min-max of 3): neighborhood main 2,936-3,081 ms vs branch
+1,047-1,124 ms (non-overlapping); full pipeline overlaps across sides
+(798-958 ms), hence "noise band".
+
+Reading: at this size ingestion was never the bottleneck (~0.9 s either way) --
+Megatron-LM's pain is interactive, and the per-interaction backend paths are
+16-63% faster. The serialize regression (finding 6) reproduces here; net
+build+serialize is still -14%. The larger felt improvement should come from the
+frontend changes this harness cannot measure (routing budget, one-rebuild
+layouts, trigger policy): at 59k edges, symbol-view redraws previously entered
+the unbounded O(E x N) routing regime measured in the frontend bench.
