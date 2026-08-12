@@ -459,12 +459,22 @@ impl SymbolTable {
             None => return,
         };
 
-        // Distinct, non-self candidates.
-        let mut candidates: Vec<NodeId> = Vec::new();
+        // Distinct, non-self candidates. Collected BY REFERENCE and abandoned as
+        // soon as the count passes the cap: a hub name (`new`, `get`,
+        // `__init__`) can have thousands of global definitions, all of which
+        // tier 6 drops, and cloning them first only to throw the lot away is the
+        // single hottest wasted allocation in resolution. The filters below
+        // (drop self, dedupe) are applied before the count is judged, so this
+        // bails on exactly the inputs the `_ => {}` arm used to.
+        let mut candidates: Vec<&NodeId> = Vec::new();
         let mut seen: HashSet<&NodeId> = HashSet::new();
         for target in global {
             if *target != raw_ref.from_node && seen.insert(target) {
-                candidates.push(target.clone());
+                candidates.push(target);
+                // Tier 6: more than MAX distinct candidates -> drop entirely.
+                if candidates.len() > MAX_AMBIGUOUS_CANDIDATES {
+                    return;
+                }
             }
         }
 
@@ -474,26 +484,24 @@ impl SymbolTable {
             1 => {
                 edges.push(CodeEdge {
                     source: raw_ref.from_node.clone(),
-                    target: candidates.into_iter().next().unwrap(),
+                    target: candidates[0].clone(),
                     kind: kind.clone(),
                     weight: 1,
                     resolution: Resolution::GlobalUnique,
                 });
             }
             // Tier 5: 2..=MAX ambiguous candidates -> flagged edge to each.
-            // Tier 6: more than MAX -> drop entirely.
-            n if n <= MAX_AMBIGUOUS_CANDIDATES => {
+            _ => {
                 for target in candidates {
                     edges.push(CodeEdge {
                         source: raw_ref.from_node.clone(),
-                        target,
+                        target: target.clone(),
                         kind: kind.clone(),
                         weight: 1,
                         resolution: Resolution::Ambiguous,
                     });
                 }
             }
-            _ => {}
         }
     }
 }
