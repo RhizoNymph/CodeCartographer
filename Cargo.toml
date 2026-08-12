@@ -23,8 +23,32 @@ tracing = "0.1"
 tracing-subscriber = "0.3"
 criterion = { version = "0.5", features = ["html_reports"] }
 
+# Dev builds stay at opt-level 1 for the workspace at large so that the
+# frontend-driven `cargo tauri dev` edit/rebuild loop stays cheap.
 [profile.dev]
 opt-level = 1
 
+# Third-party deps (tree-sitter, rayon, ignore, ...) are built once and cached,
+# so there is no reason not to optimize them fully.
 [profile.dev.package."*"]
 opt-level = 3
+
+# The hot loops live in our own crates: tree-sitter extraction, symbol-table
+# construction, import resolution, graph merge and subgraph extraction. At
+# opt-level 1 these run roughly an order of magnitude slower than they need to.
+# Both crates are small enough (~11k and ~0.5k lines) that building them at
+# opt-level 3 costs a few seconds per rebuild, and neither is touched by a
+# frontend-only change.
+[profile.dev.package.cc-core]
+opt-level = 3
+
+[profile.dev.package.cc-tauri]
+opt-level = 3
+
+# `panic` is deliberately left at the default (`unwind`): rayon relies on
+# unwinding to catch a panic on a worker thread and re-raise it on the thread
+# that joined it, so `panic = "abort"` would turn a tree-sitter panic on one
+# malformed file into a hard abort of the whole app.
+[profile.release]
+lto = "thin"
+codegen-units = 1
