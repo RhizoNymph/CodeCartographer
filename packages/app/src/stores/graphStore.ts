@@ -388,33 +388,30 @@ export const useGraphStore = create<GraphState>((set, get) => ({
         : null,
     }),
 
+  /**
+   * Apply one BATCHED progress event: exactly one store broadcast per batch
+   * (~100 files or ~50ms of parsing) rather than one per file per phase, so
+   * ingesting a large repo no longer re-renders every subscriber thousands of
+   * times. The counts are cumulative and authoritative -- they are assigned, not
+   * accumulated, so a dropped or duplicated batch cannot skew the progress bar.
+   */
   handleParseEvent: (event) => {
     const progress = get().parseProgress;
     if (!progress) return;
 
     switch (event.type) {
-      case "FileStart":
-        set({
-          parseProgress: { ...progress, currentFile: event.path },
-        });
-        break;
-      case "FileDone":
+      case "Progress":
         set({
           parseProgress: {
             ...progress,
-            parsedFiles: progress.parsedFiles + 1,
-            totalBlocks: progress.totalBlocks + event.blocks,
-          },
-        });
-        break;
-      case "Error":
-        set({
-          parseProgress: {
-            ...progress,
-            errors: [
-              ...progress.errors,
-              { path: event.path, message: event.message },
-            ],
+            parsedFiles: event.parsed_files,
+            totalFiles: event.total_files,
+            totalBlocks: event.total_blocks,
+            currentFile: event.current_file,
+            errors:
+              event.errors.length > 0
+                ? [...progress.errors, ...event.errors]
+                : progress.errors,
           },
         });
         break;

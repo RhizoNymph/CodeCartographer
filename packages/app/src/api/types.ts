@@ -66,7 +66,13 @@ export interface CodeBlockNode {
   name: string;
   kind: BlockKind;
   span: Span;
-  signature: string | null;
+  /**
+   * The declaration line. NOT part of the bulk parse payload -- it is the
+   * largest field on a node and only two surfaces read it (details panel, hover
+   * tooltip), so it is fetched per node via `get_node_details` and is
+   * `undefined` on nodes that came from `scan_repo` / `parse_repo`.
+   */
+  signature?: string | null;
   visibility: Visibility | null;
   parent: string;
   children: string[];
@@ -106,7 +112,8 @@ export interface CodeGraph {
 
 /**
  * Raw edge-less parse response from the `parse_repo` command. Converted into a
- * `CodeGraph` (with Map-based connectivity) by graphStore.
+ * `CodeGraph` (with Map-based connectivity) by graphStore. Nodes arrive SLIM --
+ * without `signature` (see `CodeBlockNode`).
  */
 export interface ParseResult {
   nodes: Record<string, CodeNode>;
@@ -161,10 +168,35 @@ export interface EdgeDetail {
   edges: CodeEdge[];
 }
 
+/**
+ * The per-node facts left out of the bulk payload, fetched on demand for the one
+ * node the user is looking at (`get_node_details`).
+ */
+export interface NodeDetails {
+  id: string;
+  signature: string | null;
+}
+
+/** One file that failed to parse, reported inside a `Progress` batch. */
+export interface ParseFileError {
+  path: string;
+  message: string;
+}
+
+/**
+ * Parse progress, BATCHED: one `Progress` event per ~100 files or ~50ms carries
+ * the running totals (all the progress UI renders), the file the batch ended on,
+ * and any failures since the previous batch -- instead of two events per file.
+ */
 export type ParseEvent =
-  | { type: "FileStart"; path: string }
-  | { type: "FileDone"; path: string; blocks: number }
-  | { type: "Error"; path: string; message: string }
+  | {
+      type: "Progress";
+      parsed_files: number;
+      total_files: number;
+      total_blocks: number;
+      current_file: string;
+      errors: ParseFileError[];
+    }
   | { type: "Complete"; total_files: number; total_blocks: number };
 
 /**
