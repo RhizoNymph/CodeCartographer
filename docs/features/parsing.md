@@ -35,6 +35,7 @@
    - Children are recursed with the current attribution id.
 6. A post-pass (`link_block_children()`) populates each block's `children` vec from the `parent` links: every block whose parent is another block in the same file is pushed into that parent's children. Blocks parented directly to the File are left for the caller.
 7. Returns `(Vec<CodeNode>, Vec<RawReference>)`. In `parse_repo`, only blocks whose parent is the File node are appended to the File node's children; `parse_repo` also strips prior parse state up front (removing CodeBlock nodes, clearing block ids from File children, clearing edges, and rebuilding adjacency) so re-parsing the same repo is idempotent.
+8. Progress is reported in BATCHES, not per file. The merge loop emits one `ParseEvent::Progress { parsed_files, total_files, total_blocks, current_file, errors }` per 100 merged files or per 50ms (whichever comes first), plus a final partial batch, then one `ParseEvent::Complete`. Failures are carried inside the batch that saw them (`errors`, usually empty) instead of their own event, so the whole merge phase costs O(files/100) IPC messages and O(files/100) frontend store updates rather than 2N of each. Counts in a `Progress` event are cumulative and authoritative — the frontend assigns them rather than accumulating.
 
 ## Architecture
 
@@ -194,7 +195,7 @@ so their refs attribute to the enclosing scope, not the decorated block.
 ### Shared Framework (`parser/extract.rs`)
 - `Extractor` struct with `extract_file()` public API (unchanged from original)
 - Helper functions: `child_text()`, `extract_signature()`, `node_span()`, `extract_function_name()` (all `pub(crate)`)
-- Data types: `RawReference`, `RawRefKind`, `ParseEvent`
+- Data types: `RawReference`, `RawRefKind`, `ParseEvent` (batched `Progress` + `Complete`), `ParseFileError`
 
 ### Extension Probing (`resolver/extension_probe.rs`)
 Consolidates extension probing logic used by the import resolver:
@@ -206,7 +207,7 @@ Consolidates extension probing logic used by the import resolver:
 | File | Purpose | Key Exports |
 |------|---------|-------------|
 | `crates/cc-core/src/parser/mod.rs` | Module declarations | Re-exports from `extract` |
-| `crates/cc-core/src/parser/extract.rs` | Shared extraction framework | `Extractor`, `RawReference`, `RawRefKind`, `ParseEvent` |
+| `crates/cc-core/src/parser/extract.rs` | Shared extraction framework | `Extractor`, `RawReference`, `RawRefKind`, `ParseEvent`, `ParseFileError` |
 | `crates/cc-core/src/parser/language.rs` | Trait definition | `LanguageSupport` |
 | `crates/cc-core/src/parser/python.rs` | Python support | `PythonSupport` |
 | `crates/cc-core/src/parser/typescript.rs` | TS/JS support | `TypeScriptSupport`, `JavaScriptSupport` |
@@ -223,6 +224,8 @@ Consolidates extension probing logic used by the import resolver:
 - Each raw reference is attributed to exactly one node: the innermost enclosing block, or the File for top-level constructs. There is no double-counting across a block and its ancestors.
 - Every block's `children` vec lists exactly its direct child blocks (blocks whose `parent` equals that block); the File node's children list only top-level blocks (parent == File).
 - `parse_repo` is idempotent: it strips all CodeBlock nodes, block ids from File children, and edges before re-parsing.
+- Progress events are batched and carry cumulative totals; a batch is a snapshot, never a delta, so dropping one loses nothing but a frame of animation. `ParseEvent` has exactly two variants (`Progress`, `Complete`) — per-file events do not exist.
+- A block's `signature` is extracted and kept in the graph, but never ships in the bulk parse payload (see `server_side_graph_state.md`); it is served per node by `get_node_details`.
 - The `Visibility` enum reuses `Protected` for Rust's `pub(super)` and `Crate` for `pub(crate)`.
 - Python `RawRefKind::Import { module_path }` is always a clean dotted path as
   written in source (no alias clause, no imported symbol names), one ref per

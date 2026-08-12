@@ -6,7 +6,9 @@
 - Storing the full `CodeGraph` (nodes + edges) in Tauri managed state as the
   single owner of edges.
 - `scan_repo` / `parse_repo` returning an edge-less `ParseResult` (node tree +
-  connectivity map) instead of the full graph.
+  connectivity map) instead of the full graph, serialized straight out of the
+  live graph (no node-map copy) and with SLIM nodes (no `signature`).
+- `get_node_details(node_id)` serving the per-node facts the bulk payload omits.
 - `get_subgraph(render_ids, edge_kinds)` computing per-view direct + aggregated
   edges server-side (porting the old client-side `computeAggregatedEdges`).
 - Focused read queries over the same server-side graph:
@@ -18,30 +20,39 @@
 **Not in scope:**
 - Multi-graph support (only one graph at a time).
 - Persistent state across app restarts (graph is in-memory only).
-- Concurrent graph mutations (single Mutex serializes all access).
+- Concurrent graph mutations (the `RwLock`'s write side serializes them; only
+  READS run concurrently).
 
 ## Data/Control Flow
 
 ```
 scan_repo(path)
     -> RepoScanner::scan(&path)
-    -> ParseResult::from_graph(&graph)   (edge-less; node_edge_kinds is empty)
-    -> Lock GraphState mutex, move graph into state (no extra clone)
-    -> Return ParseResult to frontend
+    -> GraphState::store(graph): wrap in Arc, write-lock, install
+    -> Return ParseResponse(Arc<CodeGraph>) -- serialized as an edge-less
+       ParseResult BORROWING the stored graph (node_edge_kinds is empty)
 
 parse_repo(path, on_event)
-    -> Lock GraphState mutex, Option::take() the graph, drop lock
+    -> GraphState::take_for_mutation(): write-lock, Option::take(), unwrap Arc
     -> strip prior parse state (idempotent re-parse)
-    -> parse files in parallel (rayon), merge blocks + children
-    -> resolve references into edges, add to graph
-    -> ParseResult::from_graph(&graph)   (edge-less + node_edge_kinds map)
-    -> Lock mutex, move graph back into state (no extra clone)
-    -> Return ParseResult to frontend
+    -> parse files in parallel (rayon), merge blocks + children,
+       emitting one BATCHED ParseEvent::Progress per ~100 files / ~50ms
+    -> resolve references into edges, add to graph (edges moved, not cloned)
+    -> send ParseEvent::Complete
+    -> GraphState::store(graph) and return ParseResponse(Arc<CodeGraph>)
+       -- serialized as an edge-less ParseResult + node_edge_kinds map,
+          streamed out of the SAME allocation the state holds
+
+get_node_details(node_id)
+    -> GraphState::snapshot() (read-lock, clone Arc, drop lock)
+    -> NodeDetails::from_graph: the block's signature (None for files/dirs)
+    -> Err on unknown id
 
 get_subgraph(render_ids, edge_kinds)
-    -> Lock GraphState mutex, borrow graph
+    -> GraphState::snapshot(); run on the blocking pool with no lock held
     -> SubGraph::from_graph(graph, render_ids, enabled_kinds):
-         build parent map from every node's `children`
+         take the graph's CACHED parent map (built once, invalidated on any
+           node-map mutation)
          for each edge with an enabled kind:
            both endpoints in render_ids -> direct edge
            else lift each endpoint to nearest rendered ancestor:
@@ -50,10 +61,10 @@ get_subgraph(render_ids, edge_kinds)
     -> Return SubGraph { edges, aggregated_edges } to frontend
 
 get_edge_detail(source_id, target_id, edge_kinds)     [inverse of aggregation]
-    -> Lock GraphState mutex, borrow graph
+    -> GraphState::snapshot(); run on the blocking pool with no lock held
     -> CodeGraph::edge_detail(source, target, enabled_kinds):
          None if either id is unknown
-         build parent map from every node's `children`
+         take the graph's CACHED parent map
          keep each edge whose kind is enabled AND whose source endpoint is
            `source`-or-a-descendant AND whose target endpoint is
            `target`-or-a-descendant   (this direction only)
@@ -77,16 +88,33 @@ The frontend holds the node tree once (`CodeGraph` no longer carries `edges`).
 `nodeEdgeKinds` connectivity map for the `hideUnconnectedNodes` feature,
 synchronously and without edges.
 
+Frontend nodes carry no `signature`: the details panel and the hover tooltip
+fetch it for the ONE node they are showing through `useNodeDetails(nodeId)`
+(`api/useNodeDetails.ts`) -- debounced 120ms and stale-guarded by a monotonic
+request token, the same shape as the panel's neighborhood fetch.
+
 ## API Shapes
 
 ```rust
 // crates/cc-core/src/model/graph.rs
-pub struct ParseResult {
-    pub nodes: HashMap<NodeId, CodeNode>,
+pub struct ParseResult<'a> {
+    pub nodes: &'a NodeMap,          // serialized as SlimNode (no `signature`)
     pub root: NodeId,
     pub edge_count: usize,
     pub node_edge_kinds: HashMap<NodeId, Vec<EdgeKind>>, // endpoint -> distinct kinds
 }
+
+// What a command returns: an owned Arc handle serialized as the ParseResult
+// above, since a borrowing response cannot outlive the state it reads.
+pub struct ParseResponse(pub Arc<CodeGraph>);
+
+pub struct NodeDetails {          // get_node_details(node_id)
+    pub id: NodeId,
+    pub signature: Option<String>, // None for files/directories
+}
+
+// The node map plus its lazily-built, self-invalidating child -> parent index.
+pub struct NodeMap { /* Deref -> HashMap<NodeId, CodeNode>; parent_map() */ }
 
 pub struct SubGraph {
     pub edges: Vec<CodeEdge>,             // both endpoints rendered
@@ -105,11 +133,13 @@ pub struct EdgeDetail {
 get_subgraph(render_ids: Vec<String>, edge_kinds: Vec<String>) -> SubGraph
 get_edge_detail(source_id: String, target_id: String, edge_kinds: Vec<String>)
     -> EdgeDetail
+get_node_details(node_id: String) -> NodeDetails
 ```
 
 ```ts
 // packages/app/src/api/types.ts
-interface ParseResult { nodes; root; edge_count; node_edge_kinds }
+interface ParseResult { nodes; root; edge_count; node_edge_kinds }  // slim nodes
+interface NodeDetails { id; signature }
 interface CodeGraph  { nodes; root; edgeCount; nodeEdgeKinds: Map<string, EdgeKind[]> }
 interface SubGraph   { edges; aggregated_edges }
 interface EdgeDetail { source; target; node_ids; edges }
@@ -119,14 +149,15 @@ interface EdgeDetail { source; target; node_ids; edges }
 
 | File | Role | Key exports/interfaces |
 |------|------|----------------------|
-| `crates/cc-tauri/src/lib.rs` | Defines `GraphState` | `GraphState` (pub struct) |
-| `crates/cc-tauri/src/commands/scan.rs` | Scan -> store graph, return `ParseResult` | `scan_repo` |
-| `crates/cc-tauri/src/commands/parse.rs` | Parse -> store graph, return `ParseResult`; `get_subgraph` computes view edges; `get_neighborhood` / `get_edge_detail` serve the focus queries | `parse_repo`, `get_subgraph`, `get_neighborhood`, `get_edge_detail` |
-| `crates/cc-core/src/model/graph.rs` | `SubGraph::from_graph` aggregation, `CodeGraph::neighborhood`, `CodeGraph::edge_detail`, `ParseResult::from_graph`, `build_node_edge_kinds`, `build_parent_map`, `is_ancestor_of` / `is_self_or_descendant` | those items |
+| `crates/cc-tauri/src/lib.rs` | Defines `GraphState` (RwLock over an `Arc<CodeGraph>`) and its access helpers | `GraphState`, `snapshot`, `store`, `take_for_mutation` |
+| `crates/cc-tauri/src/commands/scan.rs` | Scan -> store graph, return `ParseResponse` | `scan_repo` |
+| `crates/cc-tauri/src/commands/parse.rs` | Parse -> store graph, return `ParseResponse`; `get_subgraph` computes view edges; `get_neighborhood` / `get_edge_detail` serve the focus queries; `get_node_details` serves the omitted per-node facts | `parse_repo`, `get_subgraph`, `get_neighborhood`, `get_edge_detail`, `get_node_details` |
+| `crates/cc-core/src/model/graph.rs` | `NodeMap` (nodes + cached parent map), `SubGraph::from_graph` aggregation, `CodeGraph::neighborhood`, `CodeGraph::edge_detail`, `ParseResult::from_graph`, `ParseResponse`, `SlimNode`, `NodeDetails`, `build_node_edge_kinds`, `is_ancestor_of` / `is_self_or_descendant` | those items |
 | `crates/cc-core/src/model/edge.rs` | `EdgeKind::discriminant` for stable ordering | `EdgeKind` |
 | `src-tauri/src/lib.rs` | Registers state + commands | `GraphState::default()` |
-| `packages/app/src/api/commands.ts` | Frontend API | `scanRepo`, `parseRepo`, `getSubgraph(renderIds, edgeKinds)`, `getNeighborhood`, `getEdgeDetail(sourceId, targetId, edgeKinds)` |
-| `packages/app/src/api/types.ts` | Types | `ParseResult`, `CodeGraph`, `SubGraph`, `Neighborhood`, `EdgeDetail` |
+| `packages/app/src/api/commands.ts` | Frontend API | `scanRepo`, `parseRepo`, `getSubgraph(renderIds, edgeKinds)`, `getNeighborhood`, `getEdgeDetail(sourceId, targetId, edgeKinds)`, `getNodeDetails(nodeId)` |
+| `packages/app/src/api/types.ts` | Types | `ParseResult`, `CodeGraph`, `SubGraph`, `Neighborhood`, `EdgeDetail`, `NodeDetails`, `ParseEvent` |
+| `packages/app/src/api/useNodeDetails.ts` | Debounced, stale-guarded per-node details fetch shared by the panel and the tooltip | `useNodeDetails` |
 | `packages/app/src/stores/graphStore.ts` | Converts `ParseResult` -> `CodeGraph` (Map connectivity) | `setGraph` |
 | `packages/app/src/stores/visibilityFilter.ts` | Connectivity filter using `nodeEdgeKinds` | `computeDisplayVisibleNodes` |
 | `packages/app/src/canvas/layout/elkLayout.ts` | Fetches view edges, feeds ELK, layout guard | `layoutGraph` |
@@ -138,7 +169,21 @@ interface EdgeDetail { source; target; node_ids; edges }
 2. `parse_repo` uses `Option::take()` so a concurrent parse sees an empty state
    and errors rather than racing.
 3. The graph in state is the authoritative owner of edges; `ParseResult` and
-   `SubGraph` are derived views. No full-graph clone is made for the response.
+   `SubGraph` are derived views. NOTHING is copied for the response: the graph
+   is shared with the response through an `Arc` and `ParseResult` serializes by
+   borrowing the live node map.
+3a. The bulk payload's nodes are SLIM: every field except `signature` (the whole
+   declaration line of every block, the single largest contributor to the
+   payload). It is the only omitted field, and only two surfaces read it -- the
+   details panel and the hover tooltip -- each for one node at a time, via
+   `get_node_details`. Any field a renderer, the sidebar, the containment tree
+   or the visibility filter reads MUST stay in `SlimNode`.
+3b. The child -> parent map is cached on `NodeMap` and rebuilt lazily. Its
+   correctness rests on `NodeMap::deref_mut` dropping the cache: the nodes
+   cannot be mutated except through `DerefMut`, so no mutation path (add_node,
+   `get_mut(..).children_mut()`, `retain`, `values_mut`, the re-parse strip) can
+   leave it stale. Adding a mutating API that bypasses `DerefMut` would break
+   that invariant.
 4. `SubGraph::from_graph` aggregation ports the former client
    `computeAggregatedEdges` with one deliberate deviation: skip unresolvable,
    self-loop, and ancestor-containment cases; dedup by (source, target, kind)
@@ -149,7 +194,12 @@ interface EdgeDetail { source; target; node_ids; edges }
 5. `node_edge_kinds` records, per endpoint node, the distinct edge kinds
    touching it (sorted by `EdgeKind::discriminant` for determinism). Nodes with
    no edges are absent from the map.
-6. The `Mutex` is `std::sync::Mutex` (short critical sections).
+6. The lock is a `std::sync::RwLock` and is held only long enough to clone the
+   `Arc` (reads) or swap the `Option` (writes) -- never across graph work. The
+   CPU-bound query commands run their bodies on `spawn_blocking` over that
+   snapshot, so readers never block each other or the async workers.
+   `take_for_mutation` unwraps the `Arc` when it is the sole handle (the normal
+   case) and copies only if a reader's snapshot is still alive.
 7. `edge_detail` is the exact inverse of aggregation for one pair: same kind
    filter, both endpoints scoped to their own subtrees ("self or descendant"),
    and direction-sensitive — `target -> source` edges belong to a different
