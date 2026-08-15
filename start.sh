@@ -7,4 +7,6 @@ set -euo pipefail
 #   RUST_LOG=debug ./start.sh
 RUST_LOG="${RUST_LOG:-info}"
 
-distrobox enter tauri-dev -- bash -c "cd /home/nymph/Code/devtools/CodeCartographer && RUST_LOG=$RUST_LOG cargo tauri dev 2>&1"
+# Extra arguments are forwarded to `cargo tauri dev`, e.g.:
+#   ./start.sh --release   # release-profile backend (thin LTO), slower rebuilds
+distrobox enter tauri-dev -- bash -c "cd /home/nymph/Code/devtools/CodeCartographer && RUST_LOG=$RUST_LOG cargo tauri dev $* 2>&1"
