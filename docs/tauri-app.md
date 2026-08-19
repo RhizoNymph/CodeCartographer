@@ -154,6 +154,15 @@ tracing-subscriber = "0.3"
 
 ### Development
 
+The Makefile at the repo root is the front door — `make help` lists everything.
+The common pairs: `make dev` / `make dev-release` (inside the tauri-dev
+distrobox) and `make dev-host` / `make dev-host-release` (host toolchain).
+`make check` runs all tests + typecheck; `make perf REPO=/path` runs the
+end-to-end benchmark harness. `start.sh` remains as a thin distrobox wrapper
+(`./start.sh --release` forwards args to `cargo tauri dev`).
+
+The underlying command either way:
+
 ```bash
 pnpm tauri dev
 ```
