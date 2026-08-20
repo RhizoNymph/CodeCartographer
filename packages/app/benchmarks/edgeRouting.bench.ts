@@ -21,7 +21,7 @@
  *    via `src/canvas/layout/obstacleIndex.ts`. That module only exists on the
  *    perf branch; where it is missing this scenario is reported as `skipped`.
  * 3. `shipped_redraw` -- what the branch under test actually does at this size,
- *    budget gate included. `src/canvas/renderers/edgeRoutingBudget.ts` also only
+ *    budget gate included. `src/canvas/layout/edgeRoutingBudget.ts` also only
  *    exists on the perf branch; without it the scenario falls back to
  *    "route everything, crossing-aware", which is the older shipped behaviour.
  *
@@ -46,7 +46,11 @@ import {
   type Point,
 } from "../src/canvas/layout/edgeGeometry.ts";
 
-/** Mirrors `OBSTACLE_QUERY_MARGIN` in edgeDrawing.ts. */
+/**
+ * Mirrors `OBSTACLE_QUERY_MARGIN` in `src/canvas/layout/routingConstants.ts`.
+ * Deliberately a literal, not an import: this file must stay byte-comparable
+ * across branches where that module does not exist.
+ */
 const OBSTACLE_QUERY_MARGIN = 160;
 
 /** No-reference-polylines sentinel, matching the renderer's shared constant. */
@@ -369,9 +373,12 @@ async function main(): Promise<void> {
   const obstacleMod = await loadOptional<ObstacleIndexModule>(
     "../src/canvas/layout/obstacleIndex.ts"
   );
-  const budgetMod = await loadOptional<BudgetModule>(
-    "../src/canvas/renderers/edgeRoutingBudget.ts"
-  );
+  // The budget module moved renderers/ -> layout/ when the routing pipeline was
+  // consolidated there; both paths are probed so a run on an older branch still
+  // finds it and stays comparable.
+  const budgetMod =
+    (await loadOptional<BudgetModule>("../src/canvas/layout/edgeRoutingBudget.ts")) ??
+    (await loadOptional<BudgetModule>("../src/canvas/renderers/edgeRoutingBudget.ts"));
 
   process.stderr.write(
     `[edgeRouting.bench] label=${label} obstacleIndex=${obstacleMod ? "present" : "absent"} ` +
