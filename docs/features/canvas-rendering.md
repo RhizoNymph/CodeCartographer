@@ -51,9 +51,13 @@ The PixiRenderer (orchestrator) delegates to focused sub-modules:
    - `fitViewportToLayout(layout)`: centre + zoom-to-fit, extracted so a layout
      application can fit BEFORE the edges are built
    - `hitTestEdge(globalPos)`: nearest rendered edge within a screen-space radius
-     (`EDGE_HIT_RADIUS_PX`), via `pointToPolylineDistance` over the routed
-     polylines. Edges are not Pixi interactive objects, so both edge hover and
-     edge double-click resolve through this one hit test.
+     (`EDGE_HIT_RADIUS_PX`), via `pointToPolylineDistance` over the polyline that
+     was ACTUALLY DRAWN (`edgeManager.resolvedPointsFor(index)`, falling back to
+     the layout polyline for an edge no redraw has touched yet). Lane spreading,
+     obstacle detours and node drags all move an edge off its layout route, so
+     testing the layout polyline would hit an invisible line. Edges are not Pixi
+     interactive objects, so both edge hover and edge double-click resolve
+     through this one hit test.
    - Wires up interaction event handlers on node displays, plus viewport-level
      edge interactions: throttled hover, and a `pointertap` pair (two taps on the
      SAME edge within `DOUBLE_TAP_MS`) that drills into an AGGREGATED edge
@@ -61,7 +65,9 @@ The PixiRenderer (orchestrator) delegates to focused sub-modules:
      hover and active drags short-circuit both, so node interactions win.
    - Delegates to EdgeDrawingManager, MinimapRenderer, DragManager
 
-2. **edgeDrawing.ts** (~425 lines) - Edge rendering with two-layer architecture
+2. **edgeDrawing.ts** (~815 lines) - Layer management and stroking
+   - Owns WHAT to draw and HOW it looks. It does not own edge GEOMETRY: every
+     routing decision belongs to `layout/edgeRoutePipeline.ts` (see 2e below).
    - `EdgeDrawingManager` class: manages edgeData array, nodeToEdgeIndices map, highlightedEdgeIndices
    - **Two-layer rendering:**
      - `baseLayer` (Graphics): all edges at normal LOD-based opacity. Rebuilt on layout/visibility/LOD/drag.
@@ -71,19 +77,23 @@ The PixiRenderer (orchestrator) delegates to focused sub-modules:
    - `setHighlightActive(active)`: highlight-only update returning true if handled (no full redraw needed).
      The manager is deliberately ignorant of WHERE the highlight came from -- the caller resolves
      hover vs pinned selection vs induced subgraph, fills `highlightedEdgeIndices`, and passes a flag.
-   - `redrawEdgesWithHighlight(...)`: full base+highlight layer rebuild. Its pipeline is:
+   - `redrawEdgesWithHighlight(...)`: full base+highlight layer rebuild:
      1. `snapshotNodeRefs(visibleNodes, getNodeDisplayRef)` -- ONE `NodeDisplayRef`
         per visible node for the whole redraw (never per edge)
-     2. resolve each visible, LOD-passing edge to a polyline (`resolveEdgeDraw`), which
-        no longer collects obstacles
-     3. `spreadEndpointLanes` (both ends)
-     4. `resolveEdgeRoutingMode(...)` -> optional routing pass: `buildObstacleIndex`
-        once, then `obstaclesForEdge` (an rbush query over the edge's own inflated
-        bbox, `OBSTACLE_QUERY_MARGIN` = 160) + `routePolylineAroundObstacles` per edge
-     5. stroke, and collect "×N" chip specs at the arc-length midpoint of the
-        polyline that was actually drawn
+     2. `edgeRouteInput(idx, edge, refs)` per visible, LOD-passing edge: pairs the
+        layout route + anchors with where the two nodes are on screen right now
+     3. ONE call to `routeEdges(inputs, env)` -- all geometry, budget gate
+        included. `env.obstacles` is a THUNK (`() => buildObstacleIndex(refs)`),
+        so a redraw the gate downgrades to `none` never builds an index it will
+        not query
+     4. stroke, record each drawn polyline in `resolvedPointsByEdgeIndex`, and
+        collect "×N" chip specs at the arc-length midpoint of the polyline that
+        was actually drawn
+   - `resolvedPointsFor(edgeIndex)`: the polyline that was actually drawn, or
+     null before the first redraw. This is what `hitTestEdge` measures against.
    - `buildEdgeData(layout)`: converts LayoutResult edges into EdgeDatum array,
-     pre-parsing each `color` into `colorInt` so no redraw ever re-parses a hex string
+     carrying each edge's layout-time anchors through and pre-parsing each
+     `color` into `colorInt` so no redraw ever re-parses a hex string
    - `scheduleEdgeRedraw()` / `flushEdgeRedraw()`: animation frame throttling
    - LOD helper functions: `getLODEdgeOpacity`, `shouldHideEdgeKindAtLOD`, `getLODEdgeWidthMultiplier`
    - Private drawing primitives: `drawEdgePath`, `drawEdgeStartCap`, `drawEdgeArrowhead`
@@ -108,7 +118,49 @@ The PixiRenderer (orchestrator) delegates to focused sub-modules:
      `Text.tint`, not a cloned style) so importing the module outside a DOM
      never touches Pixi's text machinery.
 
-2c. **edgeRoutingBudget.ts** (~130 lines, pure) - How much routing a view can afford
+2e. **layout/edgeRoutePipeline.ts** (~370 lines) - The single owner of edge geometry
+
+   An edge's polyline used to be mutated by half a dozen loosely-coupled stages
+   across three files, each re-deciding for itself which side of a node the edge
+   attached to. Now there is ONE composition function whose body IS the stage
+   order:
+
+   ```
+   routeEdges(inputs, env)
+     anchorEndpoints      -> put endpoints on their anchors, at current positions
+     [budget gate]           resolveEdgeRoutingMode over the surviving edge count
+     spreadEndpointLanes  -> fan out the edges sharing one node side
+     detourAroundObstacles-> push routes clear of node/label boxes (gated)
+   ```
+
+   - Every stage is a pure `(edges, ctx) -> edges` returning NEW records, so a
+     stage's output is exactly what the next stage sees. Nothing is mutated
+     across a stage boundary.
+   - **The anchor contract.** Stages CONSUME the anchors decided at layout time
+     (see graph-layout.md) and derive endpoints from `(box, anchor)` via
+     `getAnchorPoint`. No stage reads a polyline back to work out which side an
+     edge attached to. A stage that deliberately moves an endpoint (lane
+     spreading) emits an UPDATED anchor with it, so anchors and geometry never
+     disagree — including the two-point case where moving a source lane drags
+     the far end's row with it.
+   - **The one fresh decision.** `anchorEndpoints` has three cases: neither box
+     moved (snap the stored route onto the stored anchors); both moved by the
+     same delta (translate; anchors are box-relative and survive); moved APART
+     (the stored anchors describe geometry that no longer exists, so new ones
+     are decided facing the opposite box and the edge is re-routed).
+   - `RoutedEdge.origin` (`"anchored" | "rerouted" | "reanchored"`) records which
+     branch produced the geometry, making `anchorEdgePolyline`'s escalation
+     observable instead of silent.
+   - The gate sits BETWEEN stages 1 and 2 because it counts the edges that will
+     actually be stroked, which is only known once stage 1 has dropped the
+     undrawable ones.
+   - `obstaclesForEdge` (an rbush query over the edge's own bbox inflated by
+     `OBSTACLE_QUERY_MARGIN`, minus its own endpoints' boxes and any box
+     swallowing an endpoint centre) lives here too.
+   - Runtime imports use `.ts` specifiers and `ObstacleIndex` is imported
+     type-only, so the whole module loads under `node --test`.
+
+2c. **layout/edgeRoutingBudget.ts** (~130 lines, pure) - How much routing a view can afford
    - `EdgeRoutingMode` = `"full" | "obstacles" | "none"`, resolved by
      `resolveEdgeRoutingMode({ renderedEdges, visibleNodes, edgesVisible })`
    - `CROSSING_AWARE_EDGE_LIMIT` (250): above this, detour candidates are no longer
@@ -123,6 +175,24 @@ The PixiRenderer (orchestrator) delegates to focused sub-modules:
      the layout-time (ELK) guard, kept here so every routing threshold lives in one file
      (consumed by `layout/elkLayout.ts` -- see graph-layout.md)
    - Import-free so it loads under `node --test`
+   - Lives in `layout/`, not `renderers/`: `layout/elkLayout.ts` consumes it, and
+     a layout module must not depend on the renderer
+
+2f. **layout/routingConstants.ts** (~95 lines, pure) - Every routing tolerance in one place
+   - `POINT_TOLERANCE` (0.5, point equality) < `BOUNDARY_TOLERANCE` (4, boundary
+     containment) < `NODE_OBSTACLE_MARGIN` (14) < `DETOUR_GUTTER` (28), plus
+     `NODE_MOVED_EPSILON` (1), `MAX_OBSTACLE_REROUTE_PASSES` (32) and the lead
+     distances
+   - `OBSTACLE_QUERY_MARGIN` is DERIVED -- `NODE_OBSTACLE_MARGIN + DETOUR_GUTTER +
+     OBSTACLE_QUERY_ALLOWANCE` = 160 -- so the relationship cannot drift the way
+     the prose comment it replaced could
+   - Two tolerances used to disagree here: the drawing pass had its own 1.5-unit
+     "is this point on that box" test alongside `edgeGeometry`'s 4, which is how
+     one stage could put an edge on a side another stage did not believe in
+   - `edgeGeometry.ts` re-binds the ones in its innermost loops to module-local
+     consts (a measured ~8% of the whole routing pass: V8 constant-folds a
+     module-scope `const` but not a live imported binding). `routingConstants.ts`
+     remains the owner of the values.
 
 2d. **layout/obstacleIndex.ts** (~150 lines) - R-tree over a redraw's obstacle boxes
    - `ObstacleIndex`: bulk-loaded rbush; `query(bounds, excludeA, excludeB)` and
@@ -239,9 +309,11 @@ Three things bound it now:
 1. **Hoisted node scan.** `snapshotNodeRefs` reads each visible node's
    `NodeDisplayRef` exactly once per redraw; every edge shares the snapshot.
 2. **Spatial index.** All obstacle boxes go into one `ObstacleIndex` (rbush) per
-   redraw, and each edge queries only the boxes intersecting its own polyline
-   bbox inflated by `OBSTACLE_QUERY_MARGIN` (160 -- comfortably more than the
-   obstacle inflation of 14 plus the detour gutter of 28). Per-edge cost is
+   redraw -- built LAZILY, so a redraw the gate downgrades to `none` never pays
+   for it -- and each edge queries only the boxes intersecting its own polyline
+   bbox inflated by `OBSTACLE_QUERY_MARGIN` (160, computed as the obstacle
+   inflation of 14 plus the detour gutter of 28 plus an explicit allowance).
+   Per-edge cost is
    O(log N + k) instead of O(N), and the routed result is unchanged: routing the
    query result and routing the full obstacle list produce identical polylines.
 3. **Budget gate.** `resolveEdgeRoutingMode` picks `full` / `obstacles` / `none`
@@ -282,8 +354,10 @@ only the symmetric difference of the endpoint set is touched per hover change.
 | File | Role | Key Exports |
 |------|------|-------------|
 | `packages/app/src/canvas/renderers/PixiRenderer.ts` | Orchestrator | `PixiRenderer` class |
-| `packages/app/src/canvas/renderers/edgeDrawing.ts` | Edge rendering (two-layer) | `EdgeDrawingManager`, `getLODEdgeOpacity`, etc. |
-| `packages/app/src/canvas/renderers/edgeRoutingBudget.ts` | Routing budget/thresholds (pure) | `EdgeRoutingMode`, `resolveEdgeRoutingMode`, `routesAroundObstacles`, `scoresEdgeCrossings`, `shouldSkipLayoutEdgeRouting` |
+| `packages/app/src/canvas/renderers/edgeDrawing.ts` | Edge layers + stroking (two-layer) | `EdgeDrawingManager` (incl. `resolvedPointsFor`), `getLODEdgeOpacity`, etc. |
+| `packages/app/src/canvas/layout/edgeRoutePipeline.ts` | The draw-time route pipeline (single owner of edge geometry) | `routeEdges`, `anchorEndpoints`, `anchorEdgeRoute`, `spreadEndpointLanes`, `detourAroundObstacles`, `obstaclesForEdge`, `laneOffset`, `EdgeRouteInput`, `RoutedEdge`, `EdgeRouteEnv` |
+| `packages/app/src/canvas/layout/routingConstants.ts` | All routing tolerances/margins (pure, derived arithmetic) | `POINT_TOLERANCE`, `BOUNDARY_TOLERANCE`, `NODE_MOVED_EPSILON`, `NODE_OBSTACLE_MARGIN`, `DETOUR_GUTTER`, `OBSTACLE_QUERY_MARGIN` |
+| `packages/app/src/canvas/layout/edgeRoutingBudget.ts` | Routing budget/thresholds (pure) | `EdgeRoutingMode`, `resolveEdgeRoutingMode`, `routesAroundObstacles`, `scoresEdgeCrossings`, `shouldSkipLayoutEdgeRouting` |
 | `packages/app/src/canvas/layout/obstacleIndex.ts` | Per-redraw R-tree of obstacle boxes | `ObstacleIndex`, `obstacleEntry`, `polylineBounds` |
 | `packages/app/src/canvas/renderers/edgeLabels.ts` | Aggregated-edge "×N" count chips | `polylineArcMidpoint`, `shouldShowCountChip`, `chipAlphaForEdge`, `buildEdgeCountChipLayer` |
 | `packages/app/src/canvas/renderers/types.ts` | Shared types | `EdgeDatum`, `NodeDisplayRef`, `EDGE_STYLES`, `NodePadding` |
@@ -304,7 +378,9 @@ only the symmetric difference of the endpoint set is touched per hover change.
 |------|---------------|
 | `packages/app/tests/edgeRenderer.test.ts` | Edge index building, highlight collection, two-layer invariants, EDGE_STYLES |
 | `packages/app/tests/nodeRenderer.test.ts` | Node labels, colors, blockKindPrefix, selected-node state machine, color constants |
-| `packages/app/tests/edgeGeometry.test.ts` | Edge routing geometry (anchorEdgePolyline, rerouteOrthogonalEdge) |
+| `packages/app/tests/edgeGeometry.test.ts` | Edge routing geometry: exact anchor decisions (`edgeAnchorAtBoundary`), the explicit anchored-vs-rerouted result of `anchorEdgePolyline`, `rerouteOrthogonalEdge`, obstacle detours |
+| `packages/app/tests/edgeRoutePipeline.test.ts` | Stage order and hand-off, no cross-stage mutation, the anchor contract (survival, lane-offset updates, fresh anchors after a drag), the anchored/rerouted/reanchored origin, and the budget gate (incl. that `none` never builds an obstacle index) |
+| `packages/app/tests/routingConstants.test.ts` | The DERIVED constant relationship (`OBSTACLE_QUERY_MARGIN`) and the tolerance ordering |
 | `packages/app/tests/edgeGeometryBounds.test.ts` | `boundingBox`: coverage, empty input, and 10k boxes without a spread-argument overflow |
 | `packages/app/tests/obstacleIndex.test.ts` | Query windows, owner exclusion (body + label), locality of results |
 | `packages/app/tests/edgeRoutingBudget.test.ts` | Routing-mode thresholds, monotonicity, layout-time routing guard |
@@ -343,6 +419,25 @@ only the symmetric difference of the endpoint set is touched per hover change.
 - The polyline arrays stored in `resolvedPointsByEdgeIndex` are the same arrays
   the base layer drew (no defensive copy): routing always produces fresh arrays
   and nothing mutates a resolved polyline in place.
+- Edge geometry has exactly ONE owner: `layout/edgeRoutePipeline.ts`.
+  `edgeDrawing.ts` decides what to route and strokes the answer; it computes no
+  route, moves no endpoint and infers no anchor.
+- An edge's anchors are DECIDED once, at layout time, and consumed everywhere
+  else. No draw-time stage re-derives an anchor from a polyline. The single
+  exception is a node dragged away from its laid-out position, where the stored
+  anchor describes geometry that no longer exists.
+- Anchors and geometry never disagree: a stage that moves an endpoint emits the
+  updated anchor with it, and every edge the pipeline emits satisfies
+  `points[0] === getAnchorPoint(sourceBox, sourceAnchor)` and likewise at the
+  target end (with >= 2 points).
+- Every stage returns new records; nothing is mutated across a stage boundary,
+  so a stage's input is exactly its predecessor's output.
+- Hit testing measures the polyline that was DRAWN, never the layout polyline,
+  whenever a resolved one exists. Hover, the tooltip and drill-in therefore
+  always agree with what is on screen.
+- Routing tolerances have one source of truth (`layout/routingConstants.ts`);
+  no stage carries a private tolerance for the same question. `edgeGeometry.ts`
+  re-binds hot ones as module-local consts for V8, but never restates a value.
 - Hover and pin share ONE dim path: both go through `setBaseLayerAlpha()`. No second dimming mechanism exists, so base edges and their count chips can never drift out of lockstep.
 - `EdgeDrawingManager` receives only `highlightActive: boolean` + `highlightedEdgeIndices`; it never learns whether the highlight came from hover, a pin, or an induced subgraph.
 - Count chips are built inside the same pass that strokes the edges, so they are rebuilt exactly when their layer is (including drag redraws) and add no per-frame work. Chips are world-space children of the edge layer, so they scale with zoom.
