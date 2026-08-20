@@ -1,14 +1,32 @@
 // Explicit .ts specifier keeps this module (and everything that imports it)
 // loadable under `node --test` -- see edgeRebuild.ts and its seam test.
 import {
-  BOUNDARY_TOLERANCE,
-  DETOUR_GUTTER,
-  MAX_LEAD_DISTANCE,
-  MAX_OBSTACLE_REROUTE_PASSES,
-  MIN_LEAD_DISTANCE,
-  NODE_OBSTACLE_MARGIN,
-  POINT_TOLERANCE,
+  BOUNDARY_TOLERANCE as SHARED_BOUNDARY_TOLERANCE,
+  DETOUR_GUTTER as SHARED_DETOUR_GUTTER,
+  MAX_LEAD_DISTANCE as SHARED_MAX_LEAD_DISTANCE,
+  MAX_OBSTACLE_REROUTE_PASSES as SHARED_MAX_OBSTACLE_REROUTE_PASSES,
+  MIN_LEAD_DISTANCE as SHARED_MIN_LEAD_DISTANCE,
+  NODE_OBSTACLE_MARGIN as SHARED_NODE_OBSTACLE_MARGIN,
+  POINT_TOLERANCE as SHARED_POINT_TOLERANCE,
 } from "./routingConstants.ts";
+
+/**
+ * The shared routing constants, re-bound as module-local consts.
+ *
+ * `routingConstants.ts` owns the VALUES and their rationale; this is purely a
+ * performance measure and must never diverge from it. These sit in the router's
+ * innermost loops -- `nearlyEqual` alone runs millions of times per redraw --
+ * and V8 constant-folds a module-scope `const` where it will not fold a live
+ * imported binding. Measured on `benchmarks/edgeRouting.bench.ts`: importing
+ * them directly costs ~8% of the entire routing pass.
+ */
+const BOUNDARY_TOLERANCE = SHARED_BOUNDARY_TOLERANCE;
+const POINT_TOLERANCE = SHARED_POINT_TOLERANCE;
+const MIN_LEAD_DISTANCE = SHARED_MIN_LEAD_DISTANCE;
+const MAX_LEAD_DISTANCE = SHARED_MAX_LEAD_DISTANCE;
+const DETOUR_GUTTER = SHARED_DETOUR_GUTTER;
+const NODE_OBSTACLE_MARGIN = SHARED_NODE_OBSTACLE_MARGIN;
+const MAX_OBSTACLE_REROUTE_PASSES = SHARED_MAX_OBSTACLE_REROUTE_PASSES;
 
 export interface Point {
   x: number;
