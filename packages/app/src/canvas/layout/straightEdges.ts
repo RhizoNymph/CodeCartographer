@@ -2,7 +2,7 @@
 // (see edgeRebuild.ts and its seam test).
 import {
   anchorEdgePolyline,
-  inferEdgeAnchor,
+  type EdgeAnchor,
   type Point,
 } from "./edgeGeometry.ts";
 import type { LayoutEdge, LayoutNodePosition } from "./layoutTypes";
@@ -38,6 +38,10 @@ export function straightLineEdge(
 
   let startPoint: Point;
   let endPoint: Point;
+  // The anchors are not read back off the geometry: this function CHOOSES the
+  // facing sides, so it states them outright. Mid-side offsets by construction.
+  let sourceAnchor: EdgeAnchor;
+  let targetAnchor: EdgeAnchor;
 
   if (Math.abs(dx) > Math.abs(dy)) {
     startPoint = {
@@ -48,6 +52,14 @@ export function straightLineEdge(
       x: dx > 0 ? targetPos.x : targetPos.x + targetPos.width,
       y: targetCy,
     };
+    sourceAnchor = {
+      side: dx > 0 ? "right" : "left",
+      offset: sourcePos.height / 2,
+    };
+    targetAnchor = {
+      side: dx > 0 ? "left" : "right",
+      offset: targetPos.height / 2,
+    };
   } else {
     startPoint = {
       x: sourceCx,
@@ -57,10 +69,15 @@ export function straightLineEdge(
       x: targetCx,
       y: dy > 0 ? targetPos.y : targetPos.y + targetPos.height,
     };
+    sourceAnchor = {
+      side: dy > 0 ? "bottom" : "top",
+      offset: sourcePos.width / 2,
+    };
+    targetAnchor = {
+      side: dy > 0 ? "top" : "bottom",
+      offset: targetPos.width / 2,
+    };
   }
-
-  const sourceAnchor = inferEdgeAnchor(sourcePos, startPoint, endPoint);
-  const targetAnchor = inferEdgeAnchor(targetPos, endPoint, startPoint);
 
   return {
     source: edge.source,
@@ -75,7 +92,7 @@ export function straightLineEdge(
       targetPos,
       sourceAnchor,
       targetAnchor
-    ),
+    ).points,
     sourceAnchor,
     targetAnchor,
   };

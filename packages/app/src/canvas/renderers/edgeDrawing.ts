@@ -1,16 +1,12 @@
 import { Container, Graphics } from "pixi.js";
 import type { EdgeKind } from "../../api/types";
+import type { NodeBox, Point } from "../layout/edgeGeometry";
 import {
-  anchorEdgePolyline,
-  inferEdgeAnchor,
-  inferEdgeAnchorFromPoint,
-  rerouteOrthogonalEdge,
-  routePolylineAroundObstacles,
-  translatePolyline,
-  type EdgeAnchor,
-  type NodeBox,
-  type Point,
-} from "../layout/edgeGeometry";
+  anchorEdgeRoute,
+  routeEdges,
+  type EdgeRouteInput,
+  type RoutedEdge,
+} from "../layout/edgeRoutePipeline";
 import {
   ObstacleIndex,
   obstacleEntry,
@@ -25,11 +21,6 @@ import {
   type NodeDisplayRef,
 } from "./types";
 import {
-  resolveEdgeRoutingMode,
-  routesAroundObstacles,
-  scoresEdgeCrossings,
-} from "./edgeRoutingBudget";
-import {
   buildEdgeCountChipLayer,
   polylineArcMidpoint,
   shouldShowCountChip,
@@ -40,54 +31,12 @@ import {
 export type { EdgeDatum, NodeDisplayRef } from "./types";
 
 /**
- * How far beyond an edge's own bounding box obstacles are still considered.
- *
- * The router may leave the corridor between the endpoints: a detour clears an
- * obstacle inflated by `NODE_OBSTACLE_MARGIN` (14) and can be pushed a further
- * `DETOUR_GUTTER` (28) outside the boxes it goes around, on top of a node's own
- * height. 160 layout units covers that with room to spare while keeping each
- * query to a handful of boxes instead of the whole graph.
- */
-const OBSTACLE_QUERY_MARGIN = 160;
-
-/** Shared empty reference list, so the no-scoring path allocates nothing. */
-const NO_REFERENCE_POLYLINES: Point[][] = [];
-
-interface ResolvedEdgeDraw {
-  index: number;
-  edge: EdgeDatum;
-  points: Point[];
-  sourceBox: NodeBox;
-  targetBox: NodeBox;
-}
-
-/**
  * "#64748b" -> 0x64748b. Done once per edge per LAYOUT (in `buildEdgeData`)
  * rather than once per edge per REDRAW, which is where it used to sit.
  */
 function parseEdgeColor(color: string): number {
   const parsed = parseInt(color.replace("#", ""), 16);
   return Number.isNaN(parsed) ? 0x64748b : parsed;
-}
-
-function getBoxCenter(box: NodeBox): Point {
-  return {
-    x: box.x + box.width / 2,
-    y: box.y + box.height / 2,
-  };
-}
-
-function nearlyEqual(a: number, b: number, tolerance = 1.5): boolean {
-  return Math.abs(a - b) <= tolerance;
-}
-
-function boxContainsPoint(box: NodeBox, point: Point): boolean {
-  return (
-    point.x >= box.x &&
-    point.x <= box.x + box.width &&
-    point.y >= box.y &&
-    point.y <= box.y + box.height
-  );
 }
 
 function nodeRefToBox(ref: NodeDisplayRef): NodeBox {
@@ -123,162 +72,6 @@ function nodeRefToLabelObstacle(ref: NodeDisplayRef): NodeBox | null {
     width,
     height,
   };
-}
-
-function inferPointSide(box: NodeBox, point: Point): EdgeAnchor["side"] | null {
-  if (nearlyEqual(point.x, box.x)) return "left";
-  if (nearlyEqual(point.x, box.x + box.width)) return "right";
-  if (nearlyEqual(point.y, box.y)) return "top";
-  if (nearlyEqual(point.y, box.y + box.height)) return "bottom";
-  return null;
-}
-
-function sideLength(box: NodeBox, side: EdgeAnchor["side"]): number {
-  return side === "left" || side === "right" ? box.height : box.width;
-}
-
-function pointOnSide(box: NodeBox, side: EdgeAnchor["side"], offset: number): Point {
-  const clampedOffset = Math.max(0, Math.min(sideLength(box, side), offset));
-
-  switch (side) {
-    case "left":
-      return { x: box.x, y: box.y + clampedOffset };
-    case "right":
-      return { x: box.x + box.width, y: box.y + clampedOffset };
-    case "top":
-      return { x: box.x + clampedOffset, y: box.y };
-    case "bottom":
-      return { x: box.x + clampedOffset, y: box.y + box.height };
-  }
-}
-
-function laneOffset(box: NodeBox, side: EdgeAnchor["side"], index: number, count: number): number {
-  const length = sideLength(box, side);
-  if (count <= 1) {
-    return length / 2;
-  }
-
-  const padding = Math.min(12, Math.max(4, length / 4));
-  const usable = Math.max(1, length - padding * 2);
-  return padding + (usable * (index + 1)) / (count + 1);
-}
-
-function orderValueForSide(box: NodeBox, side: EdgeAnchor["side"]): number {
-  const center = getBoxCenter(box);
-  return side === "left" || side === "right" ? center.y : center.x;
-}
-
-function moveEndpointToLane(
-  points: Point[],
-  box: NodeBox,
-  side: EdgeAnchor["side"],
-  offset: number,
-  atEnd: boolean
-): Point[] {
-  if (points.length < 2) {
-    return points;
-  }
-
-  const nextPoints = points.map((point) => ({ ...point }));
-  const endpoint = pointOnSide(box, side, offset);
-
-  if (atEnd) {
-    const prevIndex = nextPoints.length - 2;
-    nextPoints[nextPoints.length - 1] = endpoint;
-
-    if (side === "left" || side === "right") {
-      nextPoints[prevIndex] = { ...nextPoints[prevIndex], y: endpoint.y };
-    } else {
-      nextPoints[prevIndex] = { ...nextPoints[prevIndex], x: endpoint.x };
-    }
-  } else {
-    nextPoints[0] = endpoint;
-
-    if (side === "left" || side === "right") {
-      nextPoints[1] = { ...nextPoints[1], y: endpoint.y };
-    } else {
-      nextPoints[1] = { ...nextPoints[1], x: endpoint.x };
-    }
-  }
-
-  return routePolylineAroundObstacles(nextPoints, []);
-}
-
-function spreadEndpointLanes(draws: ResolvedEdgeDraw[], atEnd: boolean): void {
-  const groups = new Map<string, ResolvedEdgeDraw[]>();
-
-  for (const draw of draws) {
-    const box = atEnd ? draw.targetBox : draw.sourceBox;
-    const point = atEnd ? draw.points[draw.points.length - 1] : draw.points[0];
-    const side = inferPointSide(box, point);
-
-    if (!side) {
-      continue;
-    }
-
-    const nodeId = atEnd ? draw.edge.target : draw.edge.source;
-    const key = `${nodeId}:${side}`;
-    const group = groups.get(key);
-
-    if (group) {
-      group.push(draw);
-    } else {
-      groups.set(key, [draw]);
-    }
-  }
-
-  for (const group of groups.values()) {
-    if (group.length <= 1) {
-      continue;
-    }
-
-    const side = inferPointSide(
-      atEnd ? group[0].targetBox : group[0].sourceBox,
-      atEnd ? group[0].points[group[0].points.length - 1] : group[0].points[0]
-    );
-    if (!side) {
-      continue;
-    }
-
-    group.sort((a, b) => {
-      const aBox = atEnd ? a.sourceBox : a.targetBox;
-      const bBox = atEnd ? b.sourceBox : b.targetBox;
-      return orderValueForSide(aBox, side) - orderValueForSide(bBox, side);
-    });
-
-    for (let i = 0; i < group.length; i++) {
-      const draw = group[i];
-      const box = atEnd ? draw.targetBox : draw.sourceBox;
-      draw.points = moveEndpointToLane(
-        draw.points,
-        box,
-        side,
-        laneOffset(box, side, i, group.length),
-        atEnd
-      );
-    }
-  }
-}
-
-function inferAnchorsFromPolyline(
-  points: Point[],
-  sourceBox: NodeBox,
-  targetBox: NodeBox
-): { sourceAnchor: EdgeAnchor; targetAnchor: EdgeAnchor } {
-  const sourceAnchor =
-    points.length >= 2
-      ? inferEdgeAnchor(sourceBox, points[0], points[1])
-      : inferEdgeAnchorFromPoint(sourceBox, getBoxCenter(targetBox));
-  const targetAnchor =
-    points.length >= 2
-      ? inferEdgeAnchor(
-          targetBox,
-          points[points.length - 1],
-          points[points.length - 2]
-        )
-      : inferEdgeAnchorFromPoint(targetBox, getBoxCenter(sourceBox));
-
-  return { sourceAnchor, targetAnchor };
 }
 
 /**
@@ -326,115 +119,54 @@ function buildObstacleIndex(refs: ReadonlyMap<string, NodeDisplayRef>): Obstacle
 }
 
 /**
- * Obstacles one edge actually has to care about: the boxes near its polyline,
- * minus its own endpoints' boxes and minus any box that swallows an endpoint
- * centre (a collapsed container holding one of the endpoints -- routing around
- * it is impossible, and trying produces long useless detours).
- */
-function obstaclesForEdge(index: ObstacleIndex, draw: ResolvedEdgeDraw): NodeBox[] {
-  const candidates = index.queryForPolyline(
-    draw.points,
-    OBSTACLE_QUERY_MARGIN,
-    draw.edge.source,
-    draw.edge.target
-  );
-
-  if (candidates.length === 0) {
-    return candidates;
-  }
-
-  const sourceCenter = getBoxCenter(draw.sourceBox);
-  const targetCenter = getBoxCenter(draw.targetBox);
-  const obstacles: NodeBox[] = [];
-
-  for (const box of candidates) {
-    if (boxContainsPoint(box, sourceCenter) || boxContainsPoint(box, targetCenter)) {
-      continue;
-    }
-    obstacles.push(box);
-  }
-
-  return obstacles;
-}
-
-/**
- * Resolves edge routing points for a single edge given current node positions.
- * Extracted so both base and highlight layers can share this logic.
+ * Adapt one edge datum plus the current node refs into a pipeline input.
  *
- * Obstacle avoidance is NOT done here -- it is a separate, budget-gated pass
- * over the resolved draws (see `redrawEdgesWithHighlight`).
+ * All this does is pair the layout-time route and anchors with where the two
+ * nodes are on screen right now. Returns null when either endpoint is not
+ * displayed or the layout gave us nothing drawable -- the pipeline never sees
+ * an edge it could not route.
  */
-function resolveEdgeDraw(
+function edgeRouteInput(
   index: number,
   edge: EdgeDatum,
   refs: ReadonlyMap<string, NodeDisplayRef>
-): ResolvedEdgeDraw | null {
+): EdgeRouteInput | null {
   const sourceRef = refs.get(edge.source);
   const targetRef = refs.get(edge.target);
 
   if (!sourceRef || !targetRef || edge.originalPoints.length < 2) return null;
 
-  const sourceBox = {
-    x: sourceRef.containerX,
-    y: sourceRef.containerY,
-    width: sourceRef.layoutWidth,
-    height: sourceRef.layoutHeight,
+  return {
+    index,
+    sourceId: edge.source,
+    targetId: edge.target,
+    layoutPoints: edge.originalPoints,
+    sourceAnchor: edge.sourceAnchor,
+    targetAnchor: edge.targetAnchor,
+    sourceBox: nodeRefToBox(sourceRef),
+    targetBox: nodeRefToBox(targetRef),
+    sourceDelta: {
+      x: sourceRef.containerX - sourceRef.layoutX,
+      y: sourceRef.containerY - sourceRef.layoutY,
+    },
+    targetDelta: {
+      x: targetRef.containerX - targetRef.layoutX,
+      y: targetRef.containerY - targetRef.layoutY,
+    },
   };
-  const targetBox = {
-    x: targetRef.containerX,
-    y: targetRef.containerY,
-    width: targetRef.layoutWidth,
-    height: targetRef.layoutHeight,
-  };
-  const sourceDx = sourceRef.containerX - sourceRef.layoutX;
-  const sourceDy = sourceRef.containerY - sourceRef.layoutY;
-  const targetDx = targetRef.containerX - targetRef.layoutX;
-  const targetDy = targetRef.containerY - targetRef.layoutY;
-  const sourceMoved = Math.abs(sourceDx) > 1 || Math.abs(sourceDy) > 1;
-  const targetMoved = Math.abs(targetDx) > 1 || Math.abs(targetDy) > 1;
+}
 
-  let points: Point[];
-  if (!sourceMoved && !targetMoved) {
-    const anchors = inferAnchorsFromPolyline(edge.originalPoints, sourceBox, targetBox);
-    points = anchorEdgePolyline(
-      edge.originalPoints,
-      sourceBox,
-      targetBox,
-      anchors.sourceAnchor,
-      anchors.targetAnchor
-    );
-  } else if (
-    Math.abs(sourceDx - targetDx) <= 1 &&
-    Math.abs(sourceDy - targetDy) <= 1
-  ) {
-    const translatedPoints = translatePolyline(
-      edge.originalPoints,
-      (sourceDx + targetDx) / 2,
-      (sourceDy + targetDy) / 2
-    );
-    const anchors = inferAnchorsFromPolyline(translatedPoints, sourceBox, targetBox);
-    points = anchorEdgePolyline(
-      translatedPoints,
-      sourceBox,
-      targetBox,
-      anchors.sourceAnchor,
-      anchors.targetAnchor
-    );
-  } else {
-    const sourceAnchor = inferEdgeAnchorFromPoint(sourceBox, getBoxCenter(targetBox));
-    const targetAnchor = inferEdgeAnchorFromPoint(targetBox, getBoxCenter(sourceBox));
-    points = rerouteOrthogonalEdge(
-      edge.originalPoints,
-      sourceBox,
-      targetBox,
-      sourceAnchor,
-      targetAnchor
-    );
-  }
+/** Stage 1 of the route pipeline for one edge, or null when it is undrawable. */
+function anchorEdgeRouteFor(
+  index: number,
+  edge: EdgeDatum,
+  refs: ReadonlyMap<string, NodeDisplayRef>
+): RoutedEdge | null {
+  const input = edgeRouteInput(index, edge, refs);
+  if (!input) return null;
 
-  return points.length >= 2
-    ? { index, edge, points, sourceBox, targetBox }
-    : null;
+  const routed = anchorEdgeRoute(input);
+  return routed.points.length >= 2 ? routed : null;
 }
 
 /**
@@ -486,7 +218,11 @@ function renderSingleEdge(
 }
 
 /**
- * Manages all edge-related rendering using a two-layer architecture:
+ * Layer management and stroking for edges. Edge GEOMETRY is not decided here:
+ * this class collects what to draw, hands it to `layout/edgeRoutePipeline`, and
+ * strokes whatever comes back.
+ *
+ * Two-layer architecture:
  *
  * - **baseLayer**: contains ALL edges drawn at normal LOD-based opacity.
  *   Rebuilt on layout change, visibility change, LOD change, or drag.
@@ -598,7 +334,7 @@ export class EdgeDrawingManager {
     const nodeRefs = snapshotNodeRefs(currentVisibleNodes, getNodeDisplayRef);
     this._lastNodeRefs = nodeRefs;
 
-    const resolvedDraws: ResolvedEdgeDraw[] = [];
+    const routeInputs: EdgeRouteInput[] = [];
 
     for (const [idx, edge] of this.edgeData.entries()) {
       // Skip edges where either endpoint is not visible
@@ -611,51 +347,35 @@ export class EdgeDrawingManager {
         continue;
       }
 
-      const draw = resolveEdgeDraw(idx, edge, nodeRefs);
-      if (!draw) continue;
+      const input = edgeRouteInput(idx, edge, nodeRefs);
+      if (!input) continue;
 
-      resolvedDraws.push(draw);
+      routeInputs.push(input);
     }
-
-    spreadEndpointLanes(resolvedDraws, true);
-    spreadEndpointLanes(resolvedDraws, false);
 
     const lodOpacityMultiplier = getLODEdgeOpacity(currentLOD);
 
-    // Budget gate: how much routing this redraw can afford. Above the
-    // thresholds the ELK/straight polyline is drawn as-is instead of running an
-    // effectively unbounded detour search per edge.
-    const routingMode = resolveEdgeRoutingMode({
-      renderedEdges: resolvedDraws.length,
-      visibleNodes: nodeRefs.size,
+    // All geometry decisions -- anchoring, lane spreading, obstacle detours,
+    // and the budget gate that decides how much of that runs -- belong to the
+    // route pipeline. This class only decides WHAT to route and then strokes
+    // the answer.
+    const { edges: routedEdges } = routeEdges(routeInputs, {
+      visibleNodeCount: nodeRefs.size,
       edgesVisible: lodOpacityMultiplier > 0,
+      // Indexed lazily: a redraw the budget gate downgrades to "none" never
+      // pays for an obstacle index it will not query.
+      obstacles: () => buildObstacleIndex(nodeRefs),
     });
-
-    if (routesAroundObstacles(routingMode)) {
-      const obstacleIndex = buildObstacleIndex(nodeRefs);
-      const scoreCrossings = scoresEdgeCrossings(routingMode);
-      const routedPolylines: Point[][] = [];
-
-      for (const draw of resolvedDraws) {
-        draw.points = routePolylineAroundObstacles(
-          draw.points,
-          obstaclesForEdge(obstacleIndex, draw),
-          scoreCrossings ? routedPolylines : NO_REFERENCE_POLYLINES
-        );
-        if (scoreCrossings) {
-          routedPolylines.push(draw.points);
-        }
-      }
-    }
 
     const gfx = new Graphics();
     const chipSpecs: EdgeCountChipSpec[] = [];
 
-    for (const draw of resolvedDraws) {
-      const { edge, points } = draw;
-      // `points` is freshly built by the resolve/route pass and never mutated
-      // in place afterwards, so the highlight layer can share the same array.
-      this.resolvedPointsByEdgeIndex.set(draw.index, points);
+    for (const routed of routedEdges) {
+      const edge = this.edgeData[routed.index];
+      const points = routed.points;
+      // `points` is freshly built by the route pipeline and never mutated in
+      // place afterwards, so the highlight layer can share the same array.
+      this.resolvedPointsByEdgeIndex.set(routed.index, points);
 
       const style = edge.kind ? EDGE_STYLES[edge.kind] : DEFAULT_EDGE_STYLE;
       const color = edge.colorInt;
@@ -695,6 +415,19 @@ export class EdgeDrawingManager {
       this.setBaseLayerAlpha(0.15);
       this.rebuildHighlightLayer();
     }
+  }
+
+  /**
+   * The polyline that was actually DRAWN for `edgeIndex`, or null when this
+   * edge has not been through a redraw yet (no layers built, or it was filtered
+   * out by visibility/LOD).
+   *
+   * Hit testing reads this rather than the layout's polyline: after lane
+   * spreading, obstacle detours or a node drag, the two are different lines,
+   * and the user can only point at the one on screen.
+   */
+  resolvedPointsFor(edgeIndex: number): Point[] | null {
+    return this.resolvedPointsByEdgeIndex.get(edgeIndex) ?? null;
   }
 
   /** Keep the base edges and their count chips at the same opacity. */
@@ -761,8 +494,13 @@ export class EdgeDrawingManager {
         continue;
       }
 
-      const points = this.resolvedPointsByEdgeIndex.get(idx) ??
-        resolveEdgeDraw(idx, edge, nodeRefs)?.points;
+      // Normally the base redraw already resolved this edge. The fallback is
+      // for an edge the base pass filtered out (hidden at the current LOD) that
+      // the highlight still wants: anchor it on its own, without the lane and
+      // detour stages, which are group decisions the base pass owns.
+      const points =
+        this.resolvedPointsByEdgeIndex.get(idx) ??
+        anchorEdgeRouteFor(idx, edge, nodeRefs)?.points;
       if (!points) continue;
 
       const style = edge.kind ? EDGE_STYLES[edge.kind] : DEFAULT_EDGE_STYLE;

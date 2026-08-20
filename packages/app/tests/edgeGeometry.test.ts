@@ -3,8 +3,8 @@ import test from "node:test";
 
 import {
   anchorEdgePolyline,
+  edgeAnchorAtBoundary,
   getAnchorPoint,
-  inferEdgeAnchor,
   inferEdgeAnchorFromPoint,
   rerouteOrthogonalEdge,
   routePolylineAroundObstacles,
@@ -162,7 +162,7 @@ test("rerouteOrthogonalEdge detours same-side vertical anchors on the same colum
 });
 
 test("anchorEdgePolyline reroutes when endpoint anchoring would approach from the wrong side", () => {
-  const points = anchorEdgePolyline(
+  const anchored = anchorEdgePolyline(
     [
       { x: 0, y: 20 },
       { x: -80, y: 20 },
@@ -174,13 +174,15 @@ test("anchorEdgePolyline reroutes when endpoint anchoring would approach from th
     anchor("left")
   );
 
-  assertLeavesFromSide(points, "left");
-  assertApproachesFromSide(points, "left");
-  assert.ok(points.some((point) => point.y !== 20));
+  // The escalation is reported, not silent: this route was DISCARDED.
+  assert.equal(anchored.rerouted, true);
+  assertLeavesFromSide(anchored.points, "left");
+  assertApproachesFromSide(anchored.points, "left");
+  assert.ok(anchored.points.some((point) => point.y !== 20));
 });
 
 test("anchorEdgePolyline erases loops from stale bends after a node crosses them", () => {
-  const points = anchorEdgePolyline(
+  const anchored = anchorEdgePolyline(
     [
       { x: 40, y: 20 },
       { x: 160, y: 20 },
@@ -195,7 +197,9 @@ test("anchorEdgePolyline erases loops from stale bends after a node crosses them
     { side: "left", offset: 20 }
   );
 
-  assert.deepEqual(points, [
+  // Salvaged in place, so no reroute was needed.
+  assert.equal(anchored.rerouted, false);
+  assert.deepEqual(anchored.points, [
     { x: 40, y: 20 },
     { x: 200, y: 20 },
   ]);
@@ -301,10 +305,13 @@ test("routePolylineAroundObstacles converts diagonal fallback segments before av
   assertPolylineAvoidsBox(points, obstacle);
 });
 
-test("inferEdgeAnchor prefers top or bottom for vertical approaches at a side boundary", () => {
+// Ported from the deleted tolerance-based `inferEdgeAnchor`: the assertions are
+// unchanged, because the exact rule ("an orthogonal edge leaves through the side
+// its first segment points at") answers these cases the same way.
+test("edgeAnchorAtBoundary prefers top or bottom for vertical departures at a side boundary", () => {
   const box: NodeBox = { x: 100, y: 100, width: 80, height: 40 };
 
-  const fromAbove = inferEdgeAnchor(
+  const fromAbove = edgeAnchorAtBoundary(
     box,
     { x: 100, y: 120 },
     { x: 100, y: 40 }
@@ -312,7 +319,7 @@ test("inferEdgeAnchor prefers top or bottom for vertical approaches at a side bo
   assert.equal(fromAbove.side, "top");
   assert.deepEqual(getAnchorPoint(box, fromAbove), { x: 100, y: 100 });
 
-  const fromBelow = inferEdgeAnchor(
+  const fromBelow = edgeAnchorAtBoundary(
     box,
     { x: 100, y: 120 },
     { x: 100, y: 180 }
@@ -321,10 +328,10 @@ test("inferEdgeAnchor prefers top or bottom for vertical approaches at a side bo
   assert.deepEqual(getAnchorPoint(box, fromBelow), { x: 100, y: 140 });
 });
 
-test("inferEdgeAnchor keeps side anchors for horizontal approaches", () => {
+test("edgeAnchorAtBoundary keeps side anchors for horizontal departures", () => {
   const box: NodeBox = { x: 100, y: 100, width: 80, height: 40 };
 
-  const fromLeft = inferEdgeAnchor(
+  const fromLeft = edgeAnchorAtBoundary(
     box,
     { x: 100, y: 120 },
     { x: 40, y: 120 }
@@ -332,13 +339,38 @@ test("inferEdgeAnchor keeps side anchors for horizontal approaches", () => {
   assert.equal(fromLeft.side, "left");
   assert.deepEqual(getAnchorPoint(box, fromLeft), { x: 100, y: 120 });
 
-  const fromRight = inferEdgeAnchor(
+  const fromRight = edgeAnchorAtBoundary(
     box,
     { x: 180, y: 120 },
     { x: 240, y: 120 }
   );
   assert.equal(fromRight.side, "right");
   assert.deepEqual(getAnchorPoint(box, fromRight), { x: 180, y: 120 });
+});
+
+test("edgeAnchorAtBoundary keeps the side a diagonal departure sits on", () => {
+  const box: NodeBox = { x: 100, y: 100, width: 80, height: 40 };
+
+  // A straight-line connector leaves the right edge heading down-right: no
+  // orthogonal departure to read, but the point unambiguously sits on "right".
+  const diagonal = edgeAnchorAtBoundary(box, { x: 180, y: 120 }, { x: 400, y: 300 });
+  assert.equal(diagonal.side, "right");
+  assert.deepEqual(getAnchorPoint(box, diagonal), { x: 180, y: 120 });
+});
+
+test("edgeAnchorAtBoundary falls back to the dominant axis for a centre-to-centre polyline", () => {
+  const box: NodeBox = { x: 100, y: 100, width: 80, height: 40 };
+  const center = { x: 140, y: 120 };
+
+  // The connector ELK's section-less fallback produces starts at the node
+  // CENTRE, which lies on no side at all.
+  const toTheRight = edgeAnchorAtBoundary(box, center, { x: 600, y: 140 });
+  assert.equal(toTheRight.side, "right");
+  assert.deepEqual(getAnchorPoint(box, toTheRight), { x: 180, y: 120 });
+
+  const below = edgeAnchorAtBoundary(box, center, { x: 150, y: 600 });
+  assert.equal(below.side, "bottom");
+  assert.deepEqual(getAnchorPoint(box, below), { x: 140, y: 140 });
 });
 
 test("inferEdgeAnchorFromPoint chooses vertical anchors when another node is above or below", () => {

@@ -1,3 +1,15 @@
+// Explicit .ts specifier keeps this module (and everything that imports it)
+// loadable under `node --test` -- see edgeRebuild.ts and its seam test.
+import {
+  BOUNDARY_TOLERANCE,
+  DETOUR_GUTTER,
+  MAX_LEAD_DISTANCE,
+  MAX_OBSTACLE_REROUTE_PASSES,
+  MIN_LEAD_DISTANCE,
+  NODE_OBSTACLE_MARGIN,
+  POINT_TOLERANCE,
+} from "./routingConstants.ts";
+
 export interface Point {
   x: number;
   y: number;
@@ -16,14 +28,6 @@ export interface EdgeAnchor {
   side: EdgeAnchorSide;
   offset: number;
 }
-
-const BOUNDARY_TOLERANCE = 4;
-const POINT_TOLERANCE = 0.5;
-const MIN_LEAD_DISTANCE = 18;
-const MAX_LEAD_DISTANCE = 72;
-const DETOUR_GUTTER = 28;
-const NODE_OBSTACLE_MARGIN = 14;
-const MAX_OBSTACLE_REROUTE_PASSES = 32;
 
 function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
@@ -70,89 +74,103 @@ function isVerticalSide(side: EdgeAnchorSide): boolean {
   return side === "top" || side === "bottom";
 }
 
-function inferApproachSide(
+/**
+ * An anchor on `side` whose offset is where `point` sits along that side.
+ *
+ * The offset is a pure projection -- no judgement about whether `point` really
+ * belongs to `side`; the caller has already decided that.
+ */
+export function anchorOnSide(
   nodeBox: NodeBox,
-  boundaryPoint: Point,
-  adjacentPoint: Point
-): EdgeAnchorSide | null {
-  const dx = adjacentPoint.x - boundaryPoint.x;
-  const dy = adjacentPoint.y - boundaryPoint.y;
-  const xWithinNode = withinRange(boundaryPoint.x, nodeBox.x, nodeBox.x + nodeBox.width);
-  const yWithinNode = withinRange(boundaryPoint.y, nodeBox.y, nodeBox.y + nodeBox.height);
-  const verticalApproach =
-    Math.abs(dy) > POINT_TOLERANCE &&
-    (Math.abs(dy) >= Math.abs(dx) || nearlyEqual(boundaryPoint.x, adjacentPoint.x, BOUNDARY_TOLERANCE));
-  const horizontalApproach =
-    Math.abs(dx) > POINT_TOLERANCE &&
-    (Math.abs(dx) > Math.abs(dy) || nearlyEqual(boundaryPoint.y, adjacentPoint.y, BOUNDARY_TOLERANCE));
+  side: EdgeAnchorSide,
+  point: Point
+): EdgeAnchor {
+  return {
+    side,
+    offset: isHorizontalSide(side)
+      ? clamp(point.y - nodeBox.y, 0, nodeBox.height)
+      : clamp(point.x - nodeBox.x, 0, nodeBox.width),
+  };
+}
 
-  if (verticalApproach && xWithinNode) {
-    if (dy < 0 && adjacentPoint.y <= nodeBox.y + BOUNDARY_TOLERANCE) {
-      return "top";
-    }
-    if (dy > 0 && adjacentPoint.y >= nodeBox.y + nodeBox.height - BOUNDARY_TOLERANCE) {
-      return "bottom";
-    }
+/** The box side `point` lies on, or null when it lies on none of them. */
+function sideContainingPoint(box: NodeBox, point: Point): EdgeAnchorSide | null {
+  const onLeftRightSpan = withinRange(point.y, box.y, box.y + box.height);
+  const onTopBottomSpan = withinRange(point.x, box.x, box.x + box.width);
+
+  if (onLeftRightSpan && nearlyEqual(point.x, box.x, BOUNDARY_TOLERANCE)) {
+    return "left";
   }
-
-  if (horizontalApproach && yWithinNode) {
-    if (dx < 0 && adjacentPoint.x <= nodeBox.x + BOUNDARY_TOLERANCE) {
-      return "left";
-    }
-    if (dx > 0 && adjacentPoint.x >= nodeBox.x + nodeBox.width - BOUNDARY_TOLERANCE) {
-      return "right";
-    }
+  if (onLeftRightSpan && nearlyEqual(point.x, box.x + box.width, BOUNDARY_TOLERANCE)) {
+    return "right";
   }
-
+  if (onTopBottomSpan && nearlyEqual(point.y, box.y, BOUNDARY_TOLERANCE)) {
+    return "top";
+  }
+  if (onTopBottomSpan && nearlyEqual(point.y, box.y + box.height, BOUNDARY_TOLERANCE)) {
+    return "bottom";
+  }
   return null;
 }
 
-function inferAnchorSide(
-  nodeBox: NodeBox,
-  boundaryPoint: Point,
-  adjacentPoint: Point
-): EdgeAnchorSide {
-  const approachSide = inferApproachSide(nodeBox, boundaryPoint, adjacentPoint);
-  if (approachSide) {
-    return approachSide;
-  }
-
-  if (Math.abs(boundaryPoint.x - nodeBox.x) <= BOUNDARY_TOLERANCE) {
-    return "left";
-  }
-  if (Math.abs(boundaryPoint.x - (nodeBox.x + nodeBox.width)) <= BOUNDARY_TOLERANCE) {
-    return "right";
-  }
-  if (Math.abs(boundaryPoint.y - nodeBox.y) <= BOUNDARY_TOLERANCE) {
-    return "top";
-  }
-  if (Math.abs(boundaryPoint.y - (nodeBox.y + nodeBox.height)) <= BOUNDARY_TOLERANCE) {
-    return "bottom";
-  }
-
-  const dx = adjacentPoint.x - boundaryPoint.x;
-  const dy = adjacentPoint.y - boundaryPoint.y;
-
-  if (Math.abs(dx) >= Math.abs(dy)) {
-    return dx >= 0 ? "right" : "left";
-  }
-  return dy >= 0 ? "bottom" : "top";
-}
-
-export function inferEdgeAnchor(
+/**
+ * The anchor an edge endpoint attaches to, decided ONCE at layout time from
+ * pristine geometry: the node box, the endpoint the layout put on its boundary,
+ * and the point the polyline heads to next.
+ *
+ * This is an exact reading of the geometry, not a guess about it. An orthogonal
+ * edge can only leave a box through the side its FIRST SEGMENT points at, so
+ * that direction names the side outright (case 1) -- there is no need to
+ * reverse-engineer "which side did the router probably mean" from how close the
+ * next bend happens to be to a box edge.
+ *
+ * Cases 2 and 3 exist for geometry that is not orthogonal at all: the
+ * centre-to-centre polyline `extractLayout` synthesises when ELK hands back an
+ * edge with no routed sections.
+ *
+ * Once decided, the anchor is the DURABLE contract carried on `LayoutEdge` and
+ * `EdgeDatum`; draw-time stages consume it and never re-derive it from geometry.
+ */
+export function edgeAnchorAtBoundary(
   nodeBox: NodeBox,
   boundaryPoint: Point,
   adjacentPoint: Point
 ): EdgeAnchor {
-  const side = inferAnchorSide(nodeBox, boundaryPoint, adjacentPoint);
+  const dx = adjacentPoint.x - boundaryPoint.x;
+  const dy = adjacentPoint.y - boundaryPoint.y;
+  const departsVertically = nearlyEqual(dx, 0) && !nearlyEqual(dy, 0);
+  const departsHorizontally = nearlyEqual(dy, 0) && !nearlyEqual(dx, 0);
 
-  return {
-    side,
-    offset:
-      side === "left" || side === "right"
-        ? clamp(boundaryPoint.y - nodeBox.y, 0, nodeBox.height)
-        : clamp(boundaryPoint.x - nodeBox.x, 0, nodeBox.width),
-  };
+  // 1. Orthogonal departure: the side the segment points through, provided that
+  //    side spans the anchor point at all.
+  if (
+    departsVertically &&
+    withinRange(boundaryPoint.x, nodeBox.x, nodeBox.x + nodeBox.width)
+  ) {
+    return anchorOnSide(nodeBox, dy < 0 ? "top" : "bottom", boundaryPoint);
+  }
+  if (
+    departsHorizontally &&
+    withinRange(boundaryPoint.y, nodeBox.y, nodeBox.y + nodeBox.height)
+  ) {
+    return anchorOnSide(nodeBox, dx < 0 ? "left" : "right", boundaryPoint);
+  }
+
+  // 2. Diagonal departure from a point that IS on the boundary: keep the side
+  //    it sits on. Such a route fails `polylineRespectsAnchorDirections` and is
+  //    rerouted downstream, which is the honest outcome -- relocating the
+  //    endpoint to some other side would be the guess this function avoids.
+  const sideUnderPoint = sideContainingPoint(nodeBox, boundaryPoint);
+  if (sideUnderPoint) {
+    return anchorOnSide(nodeBox, sideUnderPoint, boundaryPoint);
+  }
+
+  // 3. Not on the boundary at all: the dominant axis of the direction the
+  //    polyline heads in.
+  if (Math.abs(dx) >= Math.abs(dy)) {
+    return anchorOnSide(nodeBox, dx >= 0 ? "right" : "left", boundaryPoint);
+  }
+  return anchorOnSide(nodeBox, dy >= 0 ? "bottom" : "top", boundaryPoint);
 }
 
 export function inferEdgeAnchorFromPoint(
@@ -382,7 +400,16 @@ function eraseOrthogonalLoops(points: Point[]): Point[] {
   return simplifyOrthogonalPolyline(result);
 }
 
-function normalizeRoutedPolyline(points: Point[]): Point[] {
+/**
+ * Put a polyline back into the canonical routed form: axis-aligned segments,
+ * no duplicate or collinear vertices, no self-crossing loops.
+ *
+ * Exported because every stage that edits a polyline by hand (endpoint
+ * anchoring, lane spreading) has to re-normalise afterwards, and calling it by
+ * name says so -- routing against an empty obstacle list used to be the idiom,
+ * which read as routing work that was not happening.
+ */
+export function normalizeRoutedPolyline(points: Point[]): Point[] {
   return eraseOrthogonalLoops(orthogonalizePolyline(points));
 }
 
@@ -637,7 +664,7 @@ export function routePolylineAroundObstacles(
  * partner both endpoints coincide. Fall back to the original endpoints so
  * callers can always draw a segment (a zero-length one renders as nothing).
  */
-function ensureDrawablePolyline(routed: Point[], original: Point[]): Point[] {
+export function ensureDrawablePolyline(routed: Point[], original: Point[]): Point[] {
   if (routed.length >= 2 || original.length < 2) {
     return routed;
   }
@@ -725,15 +752,38 @@ function alignEndWithAnchor(points: Point[], endPoint: Point, side: EdgeAnchorSi
   return result;
 }
 
+/**
+ * The outcome of anchoring a polyline, with the escalation made visible.
+ *
+ * `rerouted` is the load-bearing bit: it says the incoming route was DISCARDED
+ * and replaced by a freshly synthesised orthogonal one, rather than nudged onto
+ * its anchors. That used to happen silently inside `anchorEdgePolyline`, so a
+ * caller had no way to tell whether the geometry it got back still resembled
+ * what the layout produced.
+ */
+export interface AnchoredPolyline {
+  points: Point[];
+  rerouted: boolean;
+}
+
+/**
+ * Snap a polyline's endpoints onto the given anchors.
+ *
+ * The happy path aligns the first and last segments onto the anchor points and
+ * re-normalises. When the result would leave or enter a node from a direction
+ * its anchor forbids -- a stale bend, a node dragged past its own edge -- the
+ * route cannot be salvaged by nudging and is replaced wholesale by
+ * `rerouteOrthogonalEdge`. The return value reports which of the two happened.
+ */
 export function anchorEdgePolyline(
   points: Point[],
   sourceBox: NodeBox,
   targetBox: NodeBox,
   sourceAnchor: EdgeAnchor,
   targetAnchor: EdgeAnchor
-): Point[] {
+): AnchoredPolyline {
   if (points.length < 2) {
-    return points.slice();
+    return { points: points.slice(), rerouted: false };
   }
 
   const withStart = alignStartWithAnchor(
@@ -750,16 +800,19 @@ export function anchorEdgePolyline(
 
   const anchored = normalizeRoutedPolyline(withEnd);
   if (polylineRespectsAnchorDirections(anchored, sourceAnchor, targetAnchor)) {
-    return anchored;
+    return { points: anchored, rerouted: false };
   }
 
-  return rerouteOrthogonalEdge(
-    points,
-    sourceBox,
-    targetBox,
-    sourceAnchor,
-    targetAnchor
-  );
+  return {
+    points: rerouteOrthogonalEdge(
+      points,
+      sourceBox,
+      targetBox,
+      sourceAnchor,
+      targetAnchor
+    ),
+    rerouted: true,
+  };
 }
 
 function getSideNormal(side: EdgeAnchorSide): Point {

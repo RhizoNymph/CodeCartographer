@@ -573,14 +573,21 @@ export class PixiRenderer {
    * none is within the hit radius. Shared by edge hover and edge double-click so
    * both resolve to the same edge. The radius is in screen pixels, so it stays
    * constant as the user zooms.
+   *
+   * Measured against the polyline the edge manager actually DREW, not the one
+   * the layout produced: lane spreading, obstacle detours and node drags each
+   * move an edge off its layout route, and testing the invisible line makes
+   * hover, the tooltip and drill-in land on the wrong edge (or on none at all).
+   * Edges not drawn yet fall back to their layout polyline.
    */
   private hitTestEdge(globalPos: { x: number; y: number }): EdgeDatum | null {
     const worldPos = this.viewport.toLocal(globalPos);
     let closestEdge: EdgeDatum | null = null;
     let closestDist = EDGE_HIT_RADIUS_PX / this.viewport.scale.x;
-    for (const edge of this.edgeManager.edgeData) {
-      if (edge.originalPoints.length < 2) continue;
-      const dist = pointToPolylineDistance(worldPos, edge.originalPoints);
+    for (const [idx, edge] of this.edgeManager.edgeData.entries()) {
+      const points = this.edgeManager.resolvedPointsFor(idx) ?? edge.originalPoints;
+      if (points.length < 2) continue;
+      const dist = pointToPolylineDistance(worldPos, points);
       if (dist < closestDist) {
         closestDist = dist;
         closestEdge = edge;
