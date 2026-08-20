@@ -95,18 +95,31 @@ Canvas.tsx
   [displayVisibleNodes]  -> PixiRenderer.updateVisibility(displayVisible)
                             (skipped when a layout request just took that set)
 
-PixiRenderer.layoutQueue  (CoalescingScheduler<LayoutRequest>)
-  schedule(full|edges) -> runs immediately when idle;
-                          otherwise merged into ONE pending rerun
-                          (mergeLayoutRequests: full dominates edges,
-                           adopting the newest edge filters)
+LayoutOrchestrator  (layout/layoutOrchestrator.ts; owns the whole request lifecycle)
+  requestFullLayout / requestEdgePhase / setVisibleNodes
+    -> CoalescingScheduler<LayoutRequest>: runs immediately when idle;
+       otherwise merged into ONE pending rerun
+       (mergeLayoutRequests: full dominates edges, adopting the newest
+        edge filters)
   run:
-    full  -> layoutGraph(...)      -> LayoutResult{nodes, edges, counts, renderIds}
-             -> renderFromLayout   (rebuild node displays, edges, refit viewport)
-    edges -> layoutEdgePhase(lastLayout, kinds, hideAmbiguous)
-             -> rebuildEdgeDisplays (edges only; viewport untouched)
-  both: `_layoutRequestId` guards the result, and edgeKindCounts are published to
-        edgeLegendStore only after that guard.
+    full  -> effects.runFullLayout  = layoutGraph(...)
+             -> LayoutResult{nodes, edges, counts, renderIds}
+             -> effects.applyFullLayout = renderFromLayout
+                (rebuild node displays, edges, refit viewport)
+    edges -> effects.runEdgePhase   = layoutEdgePhase(lastLayout, kinds, hideAmbig)
+             -> effects.applyEdgeLayout = rebuildEdgeDisplays
+                (edges only; viewport untouched)
+  both: the request id guards the result, and edgeKindCounts are published to
+        edgeLegendStore (effects.publishEdgeKindCounts) only after that guard.
+  pending gate: set by requestFullLayout, cleared when the layout is applied OR
+        fails; while set, setVisibleNodes flips the node displays but skips the
+        edge redraw.
+  visible-set reconciliation: the newest visible set is remembered, and re-applied
+        on top of the fresh displays when a layout that predates it lands.
+
+  The renderer supplies every effect (run/apply/publish/report) and keeps only
+  the drawing; the DECISIONS live in the orchestrator, which is dependency-free
+  and unit-tested with fakes.
 
 elkLayout.layoutGraph
   buildElkNode tree from (visible ∩ expanded-ancestors)  -> renderIds
@@ -200,6 +213,15 @@ back on) get a straight connector until the next full layout — the sidebar's
   `mergeLayoutRequests`; PURE, unit-tested.
 - `packages/app/src/canvas/layout/layoutScheduler.ts` — `CoalescingScheduler`,
   the generic run-latest queue; PURE, unit-tested.
+- `packages/app/src/canvas/layout/layoutOrchestrator.ts` — `LayoutOrchestrator`
+  and `LayoutOrchestratorEffects`: the OWNER of layout scheduling and staleness.
+  Holds the coalescing queue, the request-id stale guard, the pending gate and
+  the latest-vs-applied visible-set reconciliation; every side effect (run ELK,
+  touch displays, redraw edges, publish counts, report errors) is injected.
+  Runtime-imports only `layoutScheduler.ts` + `layoutRequest.ts` (explicit `.ts`
+  specifiers), so it loads under `node --test` and is tested with fakes.
+  Public API: `requestFullLayout`, `requestEdgePhase`, `setVisibleNodes`,
+  `destroy`, and the `lastLayout` / `isLayoutPending` / `visibleNodes` getters.
 - `packages/app/src/canvas/layout/elkEdgeId.ts` — encodes/decodes the viewEdges
   index in an ELK edge id (`elkEdgeId`, `elkEdgeIndex`).
 - `packages/app/src/canvas/layout/edgeGeometry.ts` — orthogonal polyline
@@ -210,9 +232,11 @@ back on) get a straight connector until the next full layout — the sidebar's
   `LAYOUT_EDGE_ROUTING_NODE_LIMIT`, `LAYOUT_EDGE_ROUTING_EDGE_LIMIT`).
 - `packages/app/src/canvas/utils/graphUtils.ts` — node sizing / parent map
   shared with the renderer (`getNodeSize`, `buildParentMap`).
-- `packages/app/src/canvas/renderers/PixiRenderer.ts` — owns the queue,
-  `updateGraph` / `updateEdges` / `updateVisibility`, the `_layoutRequestId`
-  stale guard and the edge-legend publish.
+- `packages/app/src/canvas/renderers/PixiRenderer.ts` — `updateGraph` /
+  `updateEdges` / `updateVisibility` delegate straight to the orchestrator; the
+  renderer supplies its effects (ELK + edge phase calls, display rebuilds, edge
+  redraws, the `edgeLegendStore` publish) and reads `lastLayout` /
+  `currentVisibleNodes` back off it for rendering and hit-testing.
 
 ## Test Files
 
@@ -220,6 +244,7 @@ back on) get a straight connector until the next full layout — the sidebar's
 |------|---------------|
 | `packages/app/tests/relayoutPolicy.test.ts` | The trigger policy table |
 | `packages/app/tests/layoutScheduler.test.ts` | Run-latest coalescing, error draining |
+| `packages/app/tests/layoutOrchestrator.test.ts` | The request lifecycle with fake effects: burst coalescing + merge semantics, the edges-phase no-op and render-set reuse, the visibility gate and the late re-apply, the error path releasing the gate, stale-pass discard |
 | `packages/app/tests/edgeRebuild.test.ts` | Edge-phase rebuild: polyline reuse + the drawing pass's anchored-polyline contract (seam test) |
 | `packages/app/tests/elkEdgeId.test.ts` | Edge-id round-tripping and rejection of foreign ids |
 | `packages/app/tests/edgeGeometry.test.ts` | Anchor inference, orthogonal rerouting, obstacle detours |
@@ -235,8 +260,11 @@ back on) get a straight connector until the next full layout — the sidebar's
 - Only one layout runs at a time; requests arriving during a run collapse into a
   single rerun carrying the newest inputs. A queued full layout absorbs any
   queued edge phase.
-- `edgeLegendStore` counts are published only after the `_layoutRequestId` stale
+- `edgeLegendStore` counts are published only after the orchestrator's stale
   check, so a superseded pass can never clobber current counts.
+- The cheap visibility redraw is gated while a full layout is in flight, and the
+  gate is released when the layout is applied OR fails — a failed layout must
+  never leave the visibility path permanently mute.
 - The edges phase never moves the camera; only a full layout refits the viewport.
 - A layout that started before a later visibility change re-applies the newest
   visible set when it lands, so a slow layout cannot resurrect hidden nodes.
@@ -254,4 +282,5 @@ back on) get a straight connector until the next full layout — the sidebar's
   failure yields `fallbackLayout`.
 - `relayoutPolicy.ts`, `layoutScheduler.ts` and `layoutRequest.ts` must stay free
   of runtime imports from other `src` modules (type-only imports are fine) so the
-  node:test runner can load them.
+  node:test runner can load them. `layoutOrchestrator.ts` may runtime-import only
+  those last two, and only through explicit `.ts` specifiers.

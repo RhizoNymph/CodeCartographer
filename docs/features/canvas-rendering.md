@@ -32,13 +32,16 @@ The PixiRenderer (orchestrator) delegates to focused sub-modules:
 
 ### Module Structure
 
-1. **PixiRenderer.ts** (~565 lines) - Orchestrator
+1. **PixiRenderer.ts** (~900 lines) - Renderer shell
    - Owns the Pixi Application, Viewport, and layer containers
    - Constructor, init, destroy lifecycle
    - `updateGraph()` (full layout), `updateEdges()` (edge-only phase),
-     `renderFromLayout()`, `rebuildEdgeDisplays()`, `updateVisibility()`
-   - `layoutQueue`: a `CoalescingScheduler<LayoutRequest>` that serialises layout
-     work and collapses a burst of requests into ONE rerun (see graph-layout.md)
+     `updateVisibility()` — all three delegate straight to `layoutOrchestrator`;
+     `renderFromLayout()` / `rebuildEdgeDisplays()` are the apply effects it calls
+   - `layoutOrchestrator`: the `LayoutOrchestrator` owning the coalescing queue,
+     the stale-result guard, the pending gate and the visible-set reconciliation
+     (see graph-layout.md). The renderer supplies its effects and reads
+     `lastLayout` / `currentVisibleNodes` back off it.
    - `setHoveredNode()`, `setSelection(nodeIds, primaryId)`, `zoomToNode()`
    - `applyHighlight()` / `rebuildHighlightedEdgeIndices(source)`: resolve and apply
      the hover-or-pin highlight (connected vs induced subgraph)
@@ -168,12 +171,6 @@ The PixiRenderer (orchestrator) delegates to focused sub-modules:
    - Import-free so it loads under `node --test`; the pixi side
      (`redrawNodeBg`, `createNodeDisplay`) reads the style table
 
-8. **Re-export shims** (replace dead code):
-   - `EdgeRenderer.ts`: re-exports EdgeDrawingManager and related types from edgeDrawing.ts
-   - `NodeRenderer.ts`: re-exports from nodeCreation.ts and dragManager.ts
-   - `LabelRenderer.ts`: re-exports updateNodeLabelWrap from dragManager.ts
-   - `interaction/interactionManager.ts`: re-exports DragManager from dragManager.ts
-
 ### Shared Utilities
 
 - **canvas/utils/graphUtils.ts** (~30 lines)
@@ -207,9 +204,11 @@ The PixiRenderer (orchestrator) delegates to focused sub-modules:
 5. On viewport move, `onViewportChanged()` syncs the viewport state and updates the
    minimap; it rebuilds edges ONLY when the LOD actually changed (user zooming
    across an LOD boundary must restyle edges; panning must not).
-5b. `updateVisibility(visibleNodes)` skips its edge rebuild while a layout request
-   is in flight (`_layoutPending`): that rebuild would route the new visible set
-   against the stale layout and be discarded moments later anyway.
+5b. `updateVisibility(visibleNodes)` hands the set to the orchestrator, which
+   flips the node displays but skips the edge rebuild while a layout request is in
+   flight: that rebuild would route the new visible set against the stale layout
+   and be discarded moments later anyway. The set is re-applied on top of the
+   fresh displays once the layout lands.
 6. On hover or selection change, `setHoveredNode()` / `setSelection()` both call `applyHighlight()`, which resolves the highlight source (hover > pinned selection > none; induced at 2+ selected), rebuilds the highlighted edge indices, and calls `edgeManager.setHighlightActive()` -- only the highlight layer is rebuilt, not the base layer
 7. On drag, globalpointermove updates node positions, resizes ancestors, schedules edge redraw
 
@@ -291,10 +290,6 @@ only the symmetric difference of the endpoint set is touched per hover change.
 | `packages/app/src/canvas/renderers/dragManager.ts` | Drag + resize | `DragManager`, `redrawNodeBg`, `syncDisplayBounds` |
 | `packages/app/src/canvas/renderers/nodeCreation.ts` | Node factory | `createNodeDisplay`, `NodeDisplay`, `getNodeLayer` |
 | `packages/app/src/canvas/renderers/nodeEmphasis.ts` | Node border emphasis (pure) | `NodeEmphasis`, `NODE_EMPHASIS_STYLES`, `resolveNodeEmphasis`, `edgeEndpointIds`, `emphasisRedrawIds` |
-| `packages/app/src/canvas/renderers/EdgeRenderer.ts` | Re-export shim | Re-exports from edgeDrawing.ts |
-| `packages/app/src/canvas/renderers/NodeRenderer.ts` | Re-export shim | Re-exports from nodeCreation.ts + dragManager.ts |
-| `packages/app/src/canvas/renderers/LabelRenderer.ts` | Re-export shim | Re-exports from dragManager.ts |
-| `packages/app/src/canvas/interaction/interactionManager.ts` | Re-export shim | Re-exports DragManager |
 | `packages/app/src/canvas/utils/graphUtils.ts` | Shared utils | `buildParentMap`, `getNodeSize` |
 | `packages/app/src/canvas/Canvas.tsx` | React component | Canvas mount/unmount, store subscriptions |
 
