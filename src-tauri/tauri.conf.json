@@ -5,7 +5,7 @@
   "version": "0.1.0",
   "build": {
     "frontendDist": "../packages/app/dist",
-    "devUrl": "http://localhost:5173",
+    "devUrl": "http://127.0.0.1:5173",
     "beforeDevCommand": "pnpm --filter app dev",
     "beforeBuildCommand": "pnpm --filter app build"
   },
