@@ -6,26 +6,17 @@ import {
   unknownEdgeKindCounts,
   type EdgeKindCounts,
 } from "../legend/edgeLegendModel";
-import { elkEdgeId, elkEdgeIndex } from "./elkEdgeId";
-import {
-  anchorEdgePolyline,
-  dedupePolylinePoints,
-  inferEdgeAnchor,
-  type Point,
-} from "./edgeGeometry";
+import { elkEdgeId } from "./elkEdgeId";
+import { extractNodePositions, extractRoutedEdges } from "./elkExtract";
 import { getNodeSize } from "../utils/graphUtils";
 import { fetchViewEdges, type ViewEdge } from "./viewEdges";
 import { straightLineEdges } from "./straightEdges";
-import type {
-  LayoutEdge,
-  LayoutNodePosition,
-  LayoutResult,
-} from "./layoutTypes";
+import type { LayoutNodePosition, LayoutResult } from "./layoutTypes";
 import {
   LAYOUT_EDGE_ROUTING_EDGE_LIMIT,
   LAYOUT_EDGE_ROUTING_NODE_LIMIT,
   shouldSkipLayoutEdgeRouting,
-} from "../renderers/edgeRoutingBudget";
+} from "./edgeRoutingBudget";
 
 /**
  * The POSITIONS phase of the layout pipeline: build the ELK containment tree for
@@ -40,6 +31,16 @@ import {
  */
 
 const elk = new ELK({ workerFactory: () => new ElkWorker() });
+
+/**
+ * One DEV-only debug line. Funnels what used to be a dozen copies of
+ * `if (import.meta.env.DEV) useDebugStore.getState().addLog(...)`.
+ */
+function debugLog(message: string): void {
+  if (import.meta.env.DEV) {
+    useDebugStore.getState().addLog(message);
+  }
+}
 
 export type { LayoutEdge, LayoutNodePosition, LayoutResult } from "./layoutTypes";
 
@@ -150,8 +151,8 @@ export async function layoutGraph(
   // by EDGES as much as nodes, so both counts gate it -- a 1400-node view
   // carrying 20k edges is just as unroutable as a 5000-node one.
   const skipEdgeRouting = shouldSkipLayoutEdgeRouting(elkNodeIds.size, viewEdges.length);
-  if (skipEdgeRouting && import.meta.env.DEV) {
-    useDebugStore.getState().addLog(
+  if (skipEdgeRouting) {
+    debugLog(
       `Large view (${elkNodeIds.size} nodes / ${viewEdges.length} edges exceeds ` +
         `${LAYOUT_EDGE_ROUTING_NODE_LIMIT} nodes or ${LAYOUT_EDGE_ROUTING_EDGE_LIMIT} edges): ` +
         `skipping edge routing. ` +
@@ -159,11 +160,9 @@ export async function layoutGraph(
     );
   }
 
-  if (import.meta.env.DEV) {
-    useDebugStore.getState().addLog(
-      `View edges: total=${viewEdges.length}, elkNodes=${elkNodeIds.size}, routing=${!skipEdgeRouting}`
-    );
-  }
+  debugLog(
+    `View edges: total=${viewEdges.length}, elkNodes=${elkNodeIds.size}, routing=${!skipEdgeRouting}`
+  );
 
   // Build ELK edge inputs (omitted entirely when skipping routing). The id
   // encodes the viewEdges index so extraction can map each routed edge back to
@@ -194,18 +193,15 @@ export async function layoutGraph(
   };
 
   try {
-    if (import.meta.env.DEV) {
-      useDebugStore.getState().addLog(`ELK layout starting...`);
-    }
+    debugLog(`ELK layout starting...`);
     const laidOut = await elk.layout(elkGraph);
-    if (import.meta.env.DEV) {
-      useDebugStore.getState().addLog(`ELK layout done, extracting...`);
-    }
+    debugLog(`ELK layout done, extracting...`);
     const result = extractLayout(laidOut, viewEdges, edgeKindCounts, renderIds);
     if (import.meta.env.DEV) {
-      useDebugStore.getState().addLog(`ELK extracted ${result.edges.length} edges`);
+      debugLog(`ELK extracted ${result.edges.length} edges`);
 
-      // Update debug store
+      // Update debug store (kept inline: these scans are too expensive to run
+      // outside a DEV guard).
       const codeBlocksInGraph = Object.values(graph.nodes).filter(n => n.type === "CodeBlock").length;
       const filesWithChildren = Object.values(graph.nodes).filter(n => n.type === "File" && n.children.length > 0).length;
       const expandedFiles = Array.from(expandedNodes).filter(id => graph.nodes[id]?.type === "File").length;
@@ -229,9 +225,7 @@ export async function layoutGraph(
     return result;
   } catch (err) {
     console.error("ELK layout failed:", err);
-    if (import.meta.env.DEV) {
-      useDebugStore.getState().addLog(`ELK FAILED: ${err}`);
-    }
+    debugLog(`ELK FAILED: ${err}`);
     return fallbackLayout(graph, visibleNodes, edgeKindCounts, renderIds);
   }
 }
@@ -245,159 +239,41 @@ function emptyLayout(): LayoutResult {
   };
 }
 
+/**
+ * ELK's answer, turned into a `LayoutResult`.
+ *
+ * Composition only: positions, then routed edges, then the straight-line
+ * fallback for when ELK routed nothing. Each step is a pure function in
+ * `elkExtract.ts`; what stays here is the DEV logging and the fallback policy.
+ */
 function extractLayout(
   elkNode: ElkNode,
   viewEdges: ViewEdge[],
   edgeKindCounts: EdgeKindCounts,
   renderIds: string[]
 ): LayoutResult {
-  const result: LayoutResult = { nodes: {}, edges: [], edgeKindCounts, renderIds };
+  const nodes = extractNodePositions(elkNode);
+  const { edges, stats } = extractRoutedEdges(elkNode, nodes, viewEdges);
 
-  let edgesWithSections = 0;
-  let edgesWithoutSections = 0;
-  let totalEdgesFound = 0;
-
-  function processNode(node: ElkNode, offsetX: number, offsetY: number) {
-    if (node.id !== "root") {
-      result.nodes[node.id] = {
-        x: offsetX + (node.x || 0),
-        y: offsetY + (node.y || 0),
-        width: node.width || 100,
-        height: node.height || 40,
-      };
-    }
-
-    const nx = offsetX + (node.x || 0);
-    const ny = offsetY + (node.y || 0);
-
-    if (node.children) {
-      for (const child of node.children) {
-        processNode(child, nx, ny);
-      }
-    }
-
-    if (node.edges) {
-      if (import.meta.env.DEV) { totalEdgesFound += node.edges.length; }
-      for (const edge of node.edges) {
-        const sourceId = edge.sources[0];
-        const targetId = edge.targets[0];
-
-        // Resolve by the index encoded in the edge id, not by endpoint pair:
-        // parallel edges between the same pair (e.g. per-kind aggregates) must
-        // each keep their own kind/color/count.
-        const index = elkEdgeIndex(edge.id);
-        const info = index !== null ? viewEdges[index] : undefined;
-        const color = info?.color ?? "#64748b";
-        const kind = info?.kind ?? null;
-        const count = info?.count ?? 1;
-        const resolution = info?.resolution ?? null;
-
-        const points: Point[] = [];
-        if (edge.sections) {
-          if (import.meta.env.DEV) { edgesWithSections++; }
-          for (const section of edge.sections) {
-            points.push({
-              x: nx + section.startPoint.x,
-              y: ny + section.startPoint.y,
-            });
-            if (section.bendPoints) {
-              for (const bp of section.bendPoints) {
-                points.push({ x: nx + bp.x, y: ny + bp.y });
-              }
-            }
-            points.push({
-              x: nx + section.endPoint.x,
-              y: ny + section.endPoint.y,
-            });
-          }
-        } else {
-          if (import.meta.env.DEV) { edgesWithoutSections++; }
-          // Fallback: draw straight line between node centers
-          const sourcePos = result.nodes[sourceId];
-          const targetPos = result.nodes[targetId];
-          if (sourcePos && targetPos) {
-            points.push({
-              x: sourcePos.x + sourcePos.width / 2,
-              y: sourcePos.y + sourcePos.height / 2,
-            });
-            points.push({
-              x: targetPos.x + targetPos.width / 2,
-              y: targetPos.y + targetPos.height / 2,
-            });
-          }
-        }
-
-        if (points.length >= 2) {
-          const sourcePos = result.nodes[sourceId];
-          const targetPos = result.nodes[targetId];
-          if (!sourcePos || !targetPos) {
-            continue;
-          }
-
-          const normalizedPoints = dedupePolylinePoints(points);
-          if (normalizedPoints.length < 2) {
-            continue;
-          }
-
-          const sourceAnchor = inferEdgeAnchor(
-            sourcePos,
-            normalizedPoints[0],
-            normalizedPoints[1]
-          );
-          const targetAnchor = inferEdgeAnchor(
-            targetPos,
-            normalizedPoints[normalizedPoints.length - 1],
-            normalizedPoints[normalizedPoints.length - 2]
-          );
-
-          result.edges.push({
-            source: sourceId,
-            target: targetId,
-            color,
-            kind,
-            count,
-            resolution,
-            points: anchorEdgePolyline(
-              normalizedPoints,
-              sourcePos,
-              targetPos,
-              sourceAnchor,
-              targetAnchor
-            ),
-            sourceAnchor,
-            targetAnchor,
-          });
-        }
-      }
-    }
-  }
-
-  processNode(elkNode, 0, 0);
-
-  if (import.meta.env.DEV) {
-    useDebugStore.getState().addLog(
-      `extractLayout: found=${totalEdgesFound}, withSections=${edgesWithSections}, withoutSections=${edgesWithoutSections}, result=${result.edges.length}`
-    );
-  }
+  debugLog(
+    `extractLayout: found=${stats.totalEdgesFound}, withSections=${stats.edgesWithSections}, ` +
+      `withoutSections=${stats.edgesWithoutSections}, result=${edges.length}`
+  );
 
   // If ELK didn't route edges (either it produced none, or routing was skipped
   // for a large view), generate straight-line fallback edges from the view edges.
-  if (result.edges.length === 0 && viewEdges.length > 0) {
-    if (import.meta.env.DEV) {
-      useDebugStore.getState().addLog("ELK provided no routed edges, generating straight-line fallback edges");
+  if (edges.length === 0 && viewEdges.length > 0) {
+    debugLog("ELK provided no routed edges, generating straight-line fallback edges");
+    // Appended one at a time: this path exists for the very views that skipped
+    // ELK routing, and a spread of tens of thousands of edges overflows the
+    // call stack.
+    for (const edge of straightLineEdges(nodes, viewEdges)) {
+      edges.push(edge);
     }
-
-    const fallbackEdges: LayoutEdge[] = straightLineEdges(result.nodes, viewEdges);
-    for (const edge of fallbackEdges) {
-      result.edges.push(edge);
-    }
-
-    if (import.meta.env.DEV) {
-      useDebugStore.getState().addLog(`Generated ${result.edges.length} fallback edges`);
-    }
+    debugLog(`Generated ${edges.length} fallback edges`);
   }
 
-  return result;
+  return { nodes, edges, edgeKindCounts, renderIds };
 }
 
 function fallbackLayout(

@@ -12,7 +12,7 @@ import {
   scoresEdgeCrossings,
   shouldSkipLayoutEdgeRouting,
   type EdgeRoutingMode,
-} from "../src/canvas/renderers/edgeRoutingBudget.ts";
+} from "../src/canvas/layout/edgeRoutingBudget.ts";
 
 /** Cheapest first; used to assert the mode never gets MORE expensive as work grows. */
 const MODE_COST: Record<EdgeRoutingMode, number> = {

@@ -162,8 +162,16 @@ Three scenarios per size:
 The script degrades gracefully: `obstacleIndex.ts` and `edgeRoutingBudget.ts` are
 loaded through a `try`/`catch` dynamic import, and their absence turns
 `shipped_redraw` into "route everything, crossing-aware", which is the older
-shipped behaviour. Runtime imports use explicit `.ts` specifiers so the module
-chain loads under plain `node` (tsconfig sets `allowImportingTsExtensions`).
+shipped behaviour. `edgeRoutingBudget.ts` is probed at BOTH
+`src/canvas/layout/` (where it lives) and `src/canvas/renderers/` (where it lived
+before the routing pipeline was consolidated), so a run on an older branch still
+finds it and stays comparable. Runtime imports use explicit `.ts` specifiers so
+the module chain loads under plain `node` (tsconfig sets
+`allowImportingTsExtensions`).
+
+`OBSTACLE_QUERY_MARGIN` is deliberately a LITERAL in the bench rather than an
+import from `layout/routingConstants.ts`: the file has to stay byte-comparable
+across branches where that module does not exist.
 
 ### 5. Runner -- `benchmarks/run_all.sh`
 
